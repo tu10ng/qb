@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { openDb } from '../src/db.ts'
-import { Store, type NewStep } from '../src/store.ts'
+import { RevConflict, Store, type NewStep } from '../src/store.ts'
 
 let store: Store
 let me: string
@@ -279,6 +279,232 @@ describe('事件', () => {
     const e = store.listEvents(t.id)[0]!
     expect(e.payload.reason).toBe('审批人请假了')
     expect(e.payload.affectedSteps).toEqual(['s1', 's2'])
+  })
+})
+
+describe('编辑：原地修改', () => {
+  /** 两个章节、各两步的 runbook。 */
+  function seed() {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { runbook, steps } = store.createRunbook({
+      taskId: t.id,
+      createdBy: me,
+      origin: 'qb',
+      steps: [
+        {
+          kind: 'note',
+          title: '1 准备',
+          children: [
+            { kind: 'command', title: 'a', command: 'echo a' },
+            { kind: 'command', title: 'b', command: 'echo b' },
+          ],
+        },
+        {
+          kind: 'note',
+          title: '2 启动',
+          children: [
+            { kind: 'command', title: 'c', command: 'echo c' },
+            { kind: 'command', title: 'd', command: 'echo d' },
+          ],
+        },
+      ],
+    })
+    const by = (title: string) => steps.find((s) => s.title === title)!
+    const titles = () => store.listSteps(runbook.id).map((s) => s.title)
+    return { runbook, by, titles }
+  }
+
+  it('新步骤带血缘、rev 从 0 开始、记录来源', () => {
+    const { by } = seed()
+    const a = by('a')
+    expect(a.rev).toBe(0)
+    expect(a.origin).toBe('qb')
+    expect(a.lineageKey).toMatch(/^lin_/)
+    expect(a.editedBy).toBeNull()
+    expect(by('b').lineageKey).not.toBe(a.lineageKey)
+  })
+
+  it('改内容：rev +1、记下是谁改的、返回改前改后', () => {
+    const { by } = seed()
+    const a = by('a')
+    const { step, changes } = store.updateStep(
+      a.id,
+      { command: 'echo A', title: 'a' /* 没变的字段不算改动 */ },
+      { expectedRev: 0, actorId: me },
+    )
+    expect(step.command).toBe('echo A')
+    expect(step.rev).toBe(1)
+    expect(step.editedBy).toBe(me)
+    // 血缘不因编辑而变：改过的仍是"同一步"，坑还挂得上
+    expect(step.lineageKey).toBe(a.lineageKey)
+    expect(changes).toEqual([{ field: 'command', before: 'echo a', after: 'echo A' }])
+  })
+
+  it('没有实际变化时不动 rev', () => {
+    const { by } = seed()
+    const { step, changes } = store.updateStep(by('a').id, { command: 'echo a' }, { expectedRev: 0, actorId: me })
+    expect(changes).toEqual([])
+    expect(step.rev).toBe(0)
+  })
+
+  it('rev 过期时拒绝并带回最新内容，不静默覆盖', () => {
+    const { by } = seed()
+    const a = by('a')
+    store.updateStep(a.id, { command: 'echo 1' }, { expectedRev: 0, actorId: me })
+
+    try {
+      store.updateStep(a.id, { command: 'echo 2' }, { expectedRev: 0, actorId: me })
+      expect.unreachable('应当冲突')
+    } catch (e) {
+      expect(e).toBeInstanceOf(RevConflict)
+      expect((e as RevConflict).current.command).toBe('echo 1')
+    }
+    expect(store.getStep(a.id)!.command).toBe('echo 1')
+  })
+
+  it('插入：放在某一步之后、放在最前、放进另一个章节', () => {
+    const { runbook, by, titles } = seed()
+    const section1 = by('1 准备')
+    const section2 = by('2 启动')
+
+    const x = store.insertStep({
+      runbookId: runbook.id,
+      parentId: section1.id,
+      afterId: by('a').id,
+      step: { kind: 'command', title: 'x', command: 'echo x' },
+    })
+    expect(x.origin).toBe('human')
+    store.insertStep({ runbookId: runbook.id, parentId: section2.id, afterId: null, step: { kind: 'check', title: 'first' } })
+    store.insertStep({ runbookId: runbook.id, parentId: null, afterId: section2.id, step: { kind: 'note', title: '3 验证' } })
+
+    expect(titles()).toEqual(['1 准备', 'a', 'x', 'b', '2 启动', 'first', 'c', 'd', '3 验证'])
+  })
+
+  it('插入位置的兄弟不在同一层时报错', () => {
+    const { runbook, by } = seed()
+    expect(() =>
+      store.insertStep({
+        runbookId: runbook.id,
+        parentId: by('1 准备').id,
+        afterId: by('c').id, // c 在第 2 章
+        step: { kind: 'command', title: 'x' },
+      }),
+    ).toThrow(/同一层/)
+  })
+
+  it('移动：同层重排、跨章节移动', () => {
+    const { by, titles } = seed()
+    const b = by('b')
+    // b 移到 a 前面
+    store.moveStep(b.id, { parentId: by('1 准备').id, afterId: null }, { expectedRev: 0 })
+    expect(titles()).toEqual(['1 准备', 'b', 'a', '2 启动', 'c', 'd'])
+
+    // a 移到第 2 章的 c 后面
+    const { step, from } = store.moveStep(by('a').id, { parentId: by('2 启动').id, afterId: by('c').id }, { expectedRev: 0 })
+    expect(from.parentId).toBe(by('1 准备').id)
+    expect(step.parentId).toBe(by('2 启动').id)
+    expect(step.rev).toBe(1)
+    expect(titles()).toEqual(['1 准备', 'b', '2 启动', 'c', 'a', 'd'])
+  })
+
+  it('不能把章节移进它自己的子步骤下面', () => {
+    const { by } = seed()
+    expect(() =>
+      store.moveStep(by('1 准备').id, { parentId: by('a').id, afterId: null }, { expectedRev: 0 }),
+    ).toThrow(/子步骤/)
+  })
+
+  it('删除章节连同子步骤一起隐藏；撤销整批恢复', () => {
+    const { by, titles } = seed()
+    const { ids } = store.deleteStep(by('1 准备').id)
+    expect(ids).toHaveLength(3)
+    expect(titles()).toEqual(['2 启动', 'c', 'd'])
+    // 删掉的步骤取不到，也就不能运行、不能编辑
+    expect(store.getStep(by('a').id)).toBeNull()
+    expect(store.getStep(by('a').id, { includeDeleted: true })!.title).toBe('a')
+
+    store.restoreStep(by('1 准备').id)
+    expect(titles()).toEqual(['1 准备', 'a', 'b', '2 启动', 'c', 'd'])
+  })
+
+  it('撤销删除章节时，不把之前单独删掉的子步骤带回来', () => {
+    const { by, titles } = seed()
+    store.deleteStep(by('b').id)
+    store.deleteStep(by('1 准备').id)
+    store.restoreStep(by('1 准备').id)
+    expect(titles()).toEqual(['1 准备', 'a', '2 启动', 'c', 'd'])
+  })
+
+  it('删除后在原位置插入新步骤，撤销删除时顺序不乱', () => {
+    const { runbook, by, titles } = seed()
+    const section1 = by('1 准备')
+    store.deleteStep(by('b').id)
+    store.insertStep({ runbookId: runbook.id, parentId: section1.id, afterId: by('a').id, step: { kind: 'command', title: 'new' } })
+    store.restoreStep(by('b').id)
+
+    const inSection = titles().slice(1, 4)
+    expect(inSection).toContain('new')
+    expect(inSection).toContain('b')
+    // 所有兄弟的键仍然两两不同
+    const keys = store.listSteps(runbook.id).filter((s) => s.parentId === section1.id).map((s) => s.orderKey)
+    expect(new Set(keys).size).toBe(keys.length)
+  })
+
+  it('跳过/失败的原因写进 statusNote；自动判定不会抹掉它', () => {
+    const { by } = seed()
+    const a = by('a')
+    store.updateStepStatus(a.id, 'skipped', { note: '这台机器已经装过了' })
+    expect(store.getStep(a.id)!.statusNote).toBe('这台机器已经装过了')
+    store.updateStepStatus(a.id, 'ok', { endedAt: 1 })
+    expect(store.getStep(a.id)!.statusNote).toBe('这台机器已经装过了')
+  })
+
+  it('大改前的快照', () => {
+    const { runbook, titles } = seed()
+    store.snapshotRunbook(runbook.id, '导入前', me)
+    const [snap] = store.listSnapshots(runbook.id)
+    expect(snap!.reason).toBe('导入前')
+    expect(snap!.steps.map((s) => s.title)).toEqual(titles())
+  })
+
+  it('最近一次编辑事件', () => {
+    const { runbook, by } = seed()
+    const a = by('a')
+    store.appendEvent({ taskId: runbook.taskId, stepId: a.id, kind: 'edit', payload: { changes: [1] } })
+    store.appendEvent({ taskId: runbook.taskId, stepId: a.id, kind: 'edit', payload: { changes: [2] } })
+    expect(store.lastEditOf(a.id)!.payload.changes).toEqual([2])
+  })
+})
+
+describe('本机设置', () => {
+  it('模型档案：新建、覆盖、删除', () => {
+    const p = store.saveModelProfile({
+      name: 'DeepSeek flash',
+      preset: 'deepseek',
+      wire: 'anthropic',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'sk-test',
+      model: 'deepseek-flash',
+      options: { thinking: false },
+      capabilities: null,
+    })
+    expect(store.listModelProfiles()).toHaveLength(1)
+
+    const updated = store.saveModelProfile({ ...p, model: 'deepseek-v4-pro', capabilities: { ok: true } })
+    expect(updated.id).toBe(p.id)
+    expect(updated.createdAt).toBe(p.createdAt)
+    expect(store.getModelProfile(p.id)!.model).toBe('deepseek-v4-pro')
+    expect(store.getModelProfile(p.id)!.capabilities).toEqual({ ok: true })
+
+    store.deleteModelProfile(p.id)
+    expect(store.listModelProfiles()).toHaveLength(0)
+  })
+
+  it('键值设置', () => {
+    expect(store.getSetting('llm.purposes')).toBeNull()
+    store.setSetting('llm.purposes', { structure: 'mdl_1' })
+    store.setSetting('llm.purposes', { structure: 'mdl_2' })
+    expect(store.getSetting('llm.purposes')).toEqual({ structure: 'mdl_2' })
   })
 })
 

@@ -1,11 +1,15 @@
 import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openDb, Store } from '@qb/server'
 import { createDshHostPort, type DshContext } from './dsh/host-port.ts'
 import { collectEnvironment } from './agent/environment.ts'
-import type { ProviderConfig } from './dsh/provider.ts'
+import { createLlm } from './llm/index.ts'
+import { LlmSettings } from './settings/llm-settings.ts'
 import { buildApi } from './web/api.ts'
+import { Attachments } from './web/attachments.ts'
+import { createLocalGuard } from './web/local-guard.ts'
 import { createWsHandler } from './web/ws.ts'
 import { createSpaHandler } from './web/spa.ts'
 
@@ -23,23 +27,29 @@ export interface Config {
   mountPath?: string
   /** 单人 dogfood 阶段的用户名；多人阶段换成令牌鉴权。 */
   userName?: string
-  /**
-   * 模型端点。不配的话 QB 的起草等能力会明确报错而不是静默失效。
-   * wire=openai 可直接指向公司内网的 vLLM。
-   */
-  llm?: ProviderConfig
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 export function apply(ctx: DshContext, config: Config): void {
   const mount = config.mountPath ?? '/qb'
-  const host = createDshHostPort(ctx, config.llm)
-  const ws = createWsHandler()
+  const host = createDshHostPort(ctx)
+  // 本机引擎能执行命令：只接受来自本机页面的请求（见 local-guard.ts）
+  const guard = createLocalGuard(() => [ctx.webServer.host])
+  const ws = createWsHandler({ guard: (req) => guard.upgrade(req) })
 
   const store = new Store(openDb({ path: config.dbPath }))
   // 单人阶段不做注册流程：本地用户直接就是当前用户。
   const me = store.ensureUser(config.userName ?? 'me')
+
+  // 模型档案：本机保存的 + 环境变量（.env.local）里的。key 不经过 dsh 的配置文件。
+  const settings = new LlmSettings(store, process.env)
+  const llm = createLlm(settings)
+
+  // 截图与数据库放在一起；内存库（冒烟测试）用临时目录
+  const attachments = new Attachments(
+    config.dbPath === ':memory:' ? join(tmpdir(), 'qb-attachments') : join(dirname(config.dbPath), 'attachments'),
+  )
 
   // 提示词是 QB 的核心资产，与代码同版本管理
   const prompts = {
@@ -48,7 +58,18 @@ export function apply(ctx: DshContext, config: Config): void {
     diagnose: readPrompt('diagnose.md'),
   }
 
-  const api = buildApi({ host, store, ws, mount, currentUserId: () => me.id, prompts })
+  const api = buildApi({
+    host,
+    store,
+    ws,
+    mount,
+    currentUserId: () => me.id,
+    prompts,
+    llm,
+    settings,
+    attachments,
+    guard,
+  })
 
   ctx.webServer.register({ kind: 'prefix', path: `${mount}/api`, handler: api.handle })
   ctx.webServer.registerUpgrade({ path: `${mount}/ws`, handler: ws.handler })
@@ -60,7 +81,8 @@ export function apply(ctx: DshContext, config: Config): void {
 
   // 这条日志是"插件真的加载了"的唯一凭证：dsh 会静默跳过
   // peer 版本不匹配的 bundle，启动自检据此判断。
-  const llmNote = config.llm === undefined ? '未配置模型' : `模型 ${config.llm.model}`
+  const status = llm.status('structure')
+  const llmNote = status.ok ? `模型 ${status.profileName}` : '未配置模型'
   console.log(`[qb] 已挂载 http://${ctx.webServer.host}:${ctx.webServer.port}${mount}（${llmNote}）`)
 
   // 后台采集本机环境事实，供起草时渲染命令用。失败不影响启动。

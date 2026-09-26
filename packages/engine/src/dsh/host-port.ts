@@ -1,15 +1,5 @@
 import { sanitizeText } from '@qb/core'
-import { createProvider, type ProviderConfig } from './provider.ts'
-import type {
-  Completion,
-  CompletionRequest,
-  Disposable,
-  HostPort,
-  OutputChunk,
-  RunRequest,
-  RunResult,
-  StreamingRun,
-} from './port.ts'
+import type { Disposable, HostPort, OutputChunk, RunRequest, RunResult, StreamingRun } from './port.ts'
 
 /**
  * dsh 的 HostPort 实现。
@@ -103,11 +93,7 @@ export interface DshContext {
 /** 流式输出的轮询间隔。够快到像实时，又不至于空转。 */
 const POLL_INTERVAL_MS = 120
 
-export function createDshHostPort(ctx: DshContext, llm?: ProviderConfig): HostPort {
-  // 没配 provider 时 complete() 明确抛错，不返回假数据——
-  // 静默的空实现会让上层以为模型在工作。
-  const provider = llm === undefined ? null : createProvider(llm)
-
+export function createDshHostPort(ctx: DshContext): HostPort {
   function startCommand(req: RunRequest): StreamingRun {
     const startedAt = Date.now()
     const spec = ctx.shell.resolve(toShellRequest(req))
@@ -198,15 +184,6 @@ export function createDshHostPort(ctx: DshContext, llm?: ProviderConfig): HostPo
     },
 
     startCommand,
-
-    async complete(req: CompletionRequest): Promise<Completion> {
-      if (provider === null) {
-        throw new Error(
-          'QB 没有配置模型端点。在 profile 的 config.llm 里填 wire/baseUrl/apiKey/model。',
-        )
-      }
-      return provider.complete(req)
-    },
 
     schedule(delayMs: number, fn: () => void): Disposable {
       const cancel = ctx.setTimeout(fn, delayMs)

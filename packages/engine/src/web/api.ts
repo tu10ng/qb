@@ -1,12 +1,19 @@
+import { z } from 'zod'
 import { NeedsConfirmation, runStep, type StepRunHandle } from '../runner/run-step.ts'
-import { draftRunbook } from '../agent/draft.ts'
+import { draftRunbook, partialSteps } from '../agent/draft.ts'
 import { diagnoseFailure } from '../agent/diagnose.ts'
+import type { Llm } from '../llm/port.ts'
+import type { LlmSettings } from '../settings/llm-settings.ts'
 import { Router, sendJson, errMessage } from './router.ts'
 import { Jobs } from './jobs.ts'
+import { registerEditRoutes } from './api-edit.ts'
+import { registerSettingsRoutes } from './api-settings.ts'
+import { AttachmentError, type Attachments } from './attachments.ts'
+import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/server'
-import type { Expectation, StepStatus, Verdict } from '@qb/core'
+import type { Expectation, Step, StepStatus, Verdict } from '@qb/core'
 import { checkExpectation, redact, sanitizeText } from '@qb/core'
 
 export interface ApiDeps {
@@ -18,18 +25,25 @@ export interface ApiDeps {
   currentUserId: () => string
   /** QB 的提示词资产。 */
   prompts: { persona: string; draft: string; diagnose: string }
+  llm: Llm
+  settings: LlmSettings
+  attachments: Attachments
+  guard: LocalGuard
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
 
+/** 草稿部分结果的推送间隔：够跟手，又不至于淹掉 WS。 */
+const PARTIAL_PUSH_MS = 250
+
 export function buildApi(deps: ApiDeps): Router {
-  const { host, store, ws, mount, currentUserId, prompts } = deps
-  const router = new Router(`${mount}/api`)
+  const { host, store, ws, mount, currentUserId, prompts, llm, settings, attachments } = deps
+  const router = new Router(`${mount}/api`, (req) => deps.guard.http(req))
 
   // 正在执行的步骤：用于取消、防重复启动
   const running = new Map<string, StepRunHandle>()
 
-  // 后台任务（起草、诊断）：模型调用慢且耗时不可预测，不占 HTTP 连接
+  // 后台任务（起草、诊断、看图、测试连接）：模型调用慢且耗时不可预测，不占 HTTP 连接
   const jobs = new Jobs({
     onUpdate: (job) => ws.broadcast({ type: 'job.update', job }),
   })
@@ -120,14 +134,16 @@ export function buildApi(deps: ApiDeps): Router {
       events: store.listEvents(taskId),
       // 历史输出按步骤分组带上：刷新页面后还能看到上次跑出了什么
       evidence: latest === null ? {} : store.evidenceByRunbook(latest.runbook.id),
+      // 进行中的后台任务：刷新后能接回"QB 正在起草/看截图"
+      jobs: [taskId, ...(latest?.steps ?? []).map((s) => s.id)].flatMap((id) => jobs.activeFor(id)),
     })
   })
 
   /**
-   * 写入一个新版本的 runbook。
+   * 整份替换：写入一个新版本的 runbook。
    *
-   * QB 起草、用户编辑结构、重规划都走这里——每次都是新版本，
-   * 旧版本连同事件保留，这是"为什么上次分解得不对"能被回答的前提。
+   * 只用于"推倒重来"（重新起草）和外部导入。日常编辑走 PATCH /steps/:id
+   * 等原地修改的接口，不再每改一次就新建一个版本。
    */
   router.post('/tasks/:id/runbook', (_req, res, ctx) => {
     const taskId = ctx.params.id!
@@ -182,11 +198,10 @@ export function buildApi(deps: ApiDeps): Router {
   })
 
   /**
-   * 让 QB 起草 runbook。
+   * 让 QB 空白起草（兜底路径，整份标为 QB 写的）。
    *
-   * 立刻返回任务 id，起草在后台跑，进度经 WS 推送。
-   * 推理型模型的思考量波动很大（实测 40 秒到 4 分钟），占着 HTTP
-   * 连接让用户干等会让他以为卡死了，刷新还会重复触发。
+   * 立刻返回任务 id，起草在后台跑。步骤边生成边经 WS 推送（job.partial），
+   * 首步通常 2–5 秒就出现，不让用户对着转圈干等。
    */
   router.post('/tasks/:id/draft', (_req, res, ctx) => {
     const taskId = ctx.params.id!
@@ -197,8 +212,9 @@ export function buildApi(deps: ApiDeps): Router {
     }
 
     const { job, existing } = jobs.start('draft', taskId, async (report) => {
+      let lastPush = 0
       const draft = await draftRunbook(
-        host,
+        llm,
         prompts.persona,
         prompts.draft,
         {
@@ -207,18 +223,23 @@ export function buildApi(deps: ApiDeps): Router {
           skills: store.listSkills(),
           lessons: store.searchLessons(`${task.title} ${task.briefMd}`, 12),
         },
-        undefined,
-        (p) =>
-          report(
-            p.kind === 'thinking'
-              ? `思考中（${Math.round(p.chars / 100) / 10}k 字）`
-              : `正在写 runbook（${Math.round(p.chars / 100) / 10}k 字）`,
-          ),
+        {
+          onPartial: (partial) => {
+            const steps = partialSteps(partial)
+            report(steps.length === 0 ? '开始写了' : `正在写第 ${steps.length} 步`)
+            const now = Date.now()
+            if (now - lastPush >= PARTIAL_PUSH_MS) {
+              lastPush = now
+              ws.broadcast({ type: 'job.partial', kind: 'draft', subjectId: taskId, steps })
+            }
+          },
+        },
       )
 
       const result = store.createRunbook({
         taskId,
         createdBy: currentUserId(),
+        origin: 'qb',
         assumptions: draft.assumptions,
         steps: draft.steps as Parameters<Store['createRunbook']>[0]['steps'],
       })
@@ -383,12 +404,13 @@ export function buildApi(deps: ApiDeps): Router {
   })
 
   /**
-   * 手动提交证据：用户自己跑完命令，把输出贴回来。
+   * 手动提交证据：用户自己跑完命令，把输出或截图贴回来。
    *
    * 这是"相信用户不当保姆"的落点——QB 不强求你用它的运行按钮。
-   * 贴回来的内容同样过脱敏，并触发预期判定。
+   * 贴回来的文本同样过脱敏并判定预期；截图存盘，有能看图的模型且这步
+   * 有预期时，交给 QB 在后台看一眼。
    */
-  router.post('/steps/:id/evidence', (_req, res, ctx) => {
+  router.post('/steps/:id/evidence', async (_req, res, ctx) => {
     const stepId = ctx.params.id!
     const step = store.getStep(stepId)
     if (step === null) {
@@ -399,13 +421,26 @@ export function buildApi(deps: ApiDeps): Router {
     const body = (ctx.body ?? {}) as {
       text?: string
       imageBase64?: string
+      mediaType?: string
       markDone?: boolean
     }
 
     const hasText = typeof body.text === 'string' && body.text.trim() !== ''
-    if (!hasText && body.imageBase64 === undefined && body.markDone !== true) {
+    const hasImage = typeof body.imageBase64 === 'string' && body.imageBase64 !== ''
+    if (!hasText && !hasImage && body.markDone !== true) {
       sendJson(res, 400, { error: 'bad_request', message: '没有内容' })
       return
+    }
+
+    // 先存图：格式或大小不对要在写任何东西之前就拒绝
+    let imageName: string | null = null
+    if (hasImage) {
+      try {
+        imageName = await attachments.saveImage(body.imageBase64!, body.mediaType ?? 'image/png')
+      } catch (e) {
+        sendJson(res, e instanceof AttachmentError ? 400 : 500, { error: 'bad_image', message: errMessage(e) })
+        return
+      }
     }
 
     const taskId = store.taskIdOfStep(stepId)
@@ -439,8 +474,19 @@ export function buildApi(deps: ApiDeps): Router {
       }
     }
 
+    let judging = false
+    if (imageName !== null) {
+      const evidence = store.addEvidence({ stepId, source: 'image', imagePath: imageName })
+      // 能看图、这步有预期、且文本没有给出结论时，才劳烦模型
+      if (verdict === null && body.markDone !== true && step.expectation !== null && llm.status('vision').ok) {
+        judging = true
+        startImageJudge(step, evidence.id, imageName, taskId)
+      }
+    }
+
     // 状态推导：用户点"完成"最优先——人的判断不被机器否决。
-    // 其次看预期判定。都没有时，贴了输出本身就说明这步做过了。
+    // 其次看预期判定。都没有时，贴了证据本身就说明这步做过了；
+    // 正在看截图的，等看完再定。
     const status: StepStatus =
       body.markDone === true
         ? 'ok'
@@ -448,9 +494,11 @@ export function buildApi(deps: ApiDeps): Router {
           ? 'failed'
           : verdict === 'pass'
             ? 'ok'
-            : hasText
-              ? 'ok'
-              : step.status
+            : judging
+              ? step.status
+              : hasText || imageName !== null
+                ? 'ok'
+                : step.status
 
     if (status !== step.status) {
       store.updateStepStatus(stepId, status, { endedAt: Date.now() })
@@ -458,24 +506,90 @@ export function buildApi(deps: ApiDeps): Router {
 
     if (taskId !== null) {
       store.markTaskStarted(taskId, currentUserId())
-      store.appendEvent({
-        taskId,
-        stepId,
-        actorId: currentUserId(),
-        kind: status === 'failed' ? 'step_failed' : 'step_ok',
-        payload: { source: 'manual', verdict, reason },
-      })
+      if (!judging || status !== step.status) {
+        store.appendEvent({
+          taskId,
+          stepId,
+          actorId: currentUserId(),
+          kind: status === 'failed' ? 'step_failed' : 'step_ok',
+          payload: { source: imageName !== null && !hasText ? 'image' : 'manual', verdict, reason },
+        })
+      }
+      ws.broadcast({ type: 'runbook.changed', taskId, stepId })
     }
 
     ws.broadcast({ type: 'step.status', stepId, status })
-    sendJson(res, 201, { stepId, status, verdict, reason })
+    sendJson(res, 201, { stepId, status, verdict, reason, judging })
   })
+
+  /** 截图文件。文件名由我们生成并按白名单校验，不接受任意路径。 */
+  router.get('/evidence/:id/image', async (_req, res, ctx) => {
+    const evidence = store.getEvidence(ctx.params.id!)
+    const file = evidence?.imagePath != null ? await attachments.read(evidence.imagePath) : null
+    if (file === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+    res.writeHead(200, {
+      'content-type': file.mediaType,
+      'content-length': file.data.length,
+      // 内容寻址，文件名即哈希，可以放心长缓存
+      'cache-control': 'private, max-age=31536000, immutable',
+    })
+    res.end(file.data)
+  })
+
+  /** 后台看截图：判定这一步达没达到预期，并把读到的内容记下来。 */
+  function startImageJudge(step: Step, evidenceId: string, imageName: string, taskId: string | null): void {
+    jobs.start('judge', step.id, async (report) => {
+      report('QB 在看截图')
+      const image = await attachments.read(imageName)
+      if (image === null) throw new Error('截图文件不见了')
+
+      const result = await llm.structured({
+        purpose: 'vision',
+        name: 'judgement',
+        system:
+          '你是 QB。用户执行完一步后贴回了截图。只依据图里看得到的内容，判断这一步是否达到了预期。看不出来就说看不出来，不要猜。',
+        prompt: [
+          `这一步：${step.title}`,
+          step.command !== null ? `命令：${step.command}` : '',
+          `预期：${describeExpectation(step.expectation as Expectation)}`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        images: [{ data: image.data, mediaType: image.mediaType }],
+        schema: JudgeSchema,
+      })
+
+      const { verdict, reason, seen } = result.output
+      if (seen.trim() !== '') store.setEvidenceText(evidenceId, `QB 看到：${seen.trim()}`)
+
+      const current = store.getStep(step.id)
+      if (current !== null && verdict !== 'unclear' && current.status !== 'running') {
+        store.updateStepStatus(step.id, verdict === 'pass' ? 'ok' : 'failed', { endedAt: Date.now() })
+        ws.broadcast({ type: 'step.status', stepId: step.id, status: verdict === 'pass' ? 'ok' : 'failed' })
+      }
+      if (taskId !== null) {
+        store.appendEvent({
+          taskId,
+          stepId: step.id,
+          actorId: null,
+          kind: verdict === 'fail' ? 'step_failed' : 'step_ok',
+          payload: { source: 'image', by: 'qb', verdict, reason, model: result.model },
+        })
+        ws.broadcast({ type: 'runbook.changed', taskId, stepId: step.id })
+      }
+      return { verdict, reason, seen }
+    })
+  }
 
   /**
    * 让 QB 诊断一步的失败。
    *
    * 先检索坑（本地 FTS，零成本），再交给模型判断哪条真的匹配。
-   * 团队踩过的坑比模型的推测可信，所以检索在前。
+   * 团队踩过的坑比模型的推测可信，所以检索在前。有截图时一并交给
+   * 能看图的档案——报错可能只在图里。
    */
   router.post('/steps/:id/diagnose', async (_req, res, ctx) => {
     const stepId = ctx.params.id!
@@ -486,8 +600,9 @@ export function buildApi(deps: ApiDeps): Router {
     }
 
     const evidence = store.listEvidence(stepId)
-    const last = evidence.length > 0 ? evidence[evidence.length - 1]! : null
-    if (last === null) {
+    const lastText = [...evidence].reverse().find((e) => e.text !== null && e.imagePath === null) ?? null
+    const lastImage = [...evidence].reverse().find((e) => e.imagePath !== null) ?? null
+    if (lastText === null && lastImage === null) {
       sendJson(res, 400, {
         error: 'no_evidence',
         message: '这一步还没有执行记录，没什么可诊断的',
@@ -497,22 +612,26 @@ export function buildApi(deps: ApiDeps): Router {
 
     // 检索关键词：命令 + 输出尾部。报错通常在尾部，
     // 前面的进度输出会污染检索。
-    const output = last.text ?? ''
+    const output = lastText?.text ?? lastImage?.text ?? ''
     const query = [step.title, step.command ?? '', output.slice(-800)].join(' ')
 
+    const image =
+      lastImage !== null && llm.status('vision').ok ? await attachments.read(lastImage.imagePath!) : null
+
     try {
-      const diagnosis = await diagnoseFailure(host, prompts.persona, prompts.diagnose, {
+      const diagnosis = await diagnoseFailure(llm, prompts.persona, prompts.diagnose, {
         step,
         outcome: {
-          exitCode: last.exitCode,
-          timedOut: last.timedOut,
-          durationMs: last.durationMs ?? 0,
+          exitCode: lastText?.exitCode ?? null,
+          timedOut: lastText?.timedOut ?? false,
+          durationMs: lastText?.durationMs ?? 0,
           output,
           verdict: step.status === 'failed' ? 'fail' : step.status,
           reason: step.status === 'failed' ? '与预期不符' : '',
         },
         lessons: store.searchLessons(query, 8),
         environmentNote: renderEnvNote(store),
+        ...(image !== null ? { image: { data: image.data, mediaType: image.mediaType } } : {}),
       })
 
       const taskId = store.taskIdOfStep(stepId)
@@ -547,7 +666,35 @@ export function buildApi(deps: ApiDeps): Router {
     sendJson(res, 200, { stepId, killed: handle.cancel() })
   })
 
+  registerEditRoutes(router, { store, ws, currentUserId, isRunning: (id) => running.has(id) })
+  registerSettingsRoutes(router, { settings, llm, jobs })
+
   return router
+}
+
+const JudgeSchema = z.object({
+  seen: z.string().describe('图里与这一步相关的关键内容，一两句话；有报错就照抄报错').catch(''),
+  verdict: z
+    .enum(['pass', 'fail', 'unclear'])
+    .describe('pass=图里能看出达到了预期；fail=明显没达到（比如有报错）；unclear=看不出来')
+    .catch('unclear'),
+  reason: z.string().describe('一句话理由').catch(''),
+})
+
+function describeExpectation(e: Expectation | null): string {
+  if (e === null) return '（没有写明）'
+  switch (e.kind) {
+    case 'exitCode':
+      return `退出码 ${e.code}`
+    case 'contains':
+      return `输出包含 "${e.text}"`
+    case 'notContains':
+      return `输出不含 "${e.text}"`
+    case 'regex':
+      return `输出匹配 /${e.pattern}/`
+    case 'manual':
+      return e.description
+  }
 }
 
 /** 把环境事实压成一段话，供诊断时判断坑的条件是否匹配。 */

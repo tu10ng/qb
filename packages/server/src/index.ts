@@ -1,2 +1,2 @@
 export { openDb, type Db, type OpenOptions } from './db.ts'
-export { Store, type NewStep } from './store.ts'
+export { Store, RevConflict, type NewStep, type FieldChange, type StoredModelProfile } from './store.ts'

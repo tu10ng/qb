@@ -47,6 +47,8 @@ async function main() {
   )
 
   console.log('启动 dsh...')
+  // 冒烟不连真实模型：去掉 QB_LLM_*，结果才可重复（也验证"没配模型"时的报错）
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('QB_LLM_')))
   child = spawn(
     process.execPath,
     [
@@ -58,7 +60,7 @@ async function main() {
       '--port',
       String(PORT),
     ],
-    { env: { ...process.env, DSH_HOME: dshHome }, stdio: ['ignore', 'pipe', 'pipe'] },
+    { env: { ...env, DSH_HOME: dshHome }, stdio: ['ignore', 'pipe', 'pipe'] },
   )
 
   let log = ''
@@ -243,6 +245,121 @@ async function main() {
     body: JSON.stringify({ confirmed: true }),
   })
   check('确认后放行', allowed.status === 202, `status ${allowed.status}`)
+
+  // ── M6：原地编辑 ────────────────────────────────────────
+  const json = (method, path, body) =>
+    fetch(`${API}${path}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    })
+  const detailOf = async () => (await fetch(`${API}/tasks/${task.id}/runbook`)).json()
+
+  const edited = await json('PATCH', `/steps/${okStep.id}`, { rev: 0, command: 'echo QB_EDITED' })
+  const editedBody = await edited.json()
+  check(
+    '编辑：原地修改，rev +1，记下是谁改的',
+    edited.status === 200 && editedBody.step?.command === 'echo QB_EDITED' && editedBody.step?.rev === 1 && editedBody.step?.editedBy === me.id,
+    JSON.stringify(editedBody).slice(0, 200),
+  )
+  const stale = await json('PATCH', `/steps/${okStep.id}`, { rev: 0, command: 'echo stale' })
+  const staleBody = await stale.json()
+  check('编辑：rev 过期时 409 并带回最新内容', stale.status === 409 && staleBody.step?.command === 'echo QB_EDITED', JSON.stringify(staleBody).slice(0, 200))
+
+  const afterEdit = await detailOf()
+  check(
+    '编辑：时间线里有改前改后',
+    afterEdit.events.some(
+      (e) => e.kind === 'edit' && e.payload.changes?.some((c) => c.field === 'command' && c.after === 'echo QB_EDITED'),
+    ),
+  )
+
+  const inserted = await json('POST', `/runbooks/${rb.runbook.id}/steps`, {
+    parentId: null,
+    afterId: okStep.id,
+    step: { kind: 'command', title: '插入的步骤', command: 'echo inserted' },
+  })
+  const insertedStep = (await inserted.json()).step
+  let titles = (await detailOf()).steps.map((s) => s.title)
+  check('插入：落在指定位置', inserted.status === 201 && titles[1] === '插入的步骤', JSON.stringify(titles))
+
+  const moved = await json('POST', `/steps/${insertedStep.id}/move`, { rev: 0, parentId: null, afterId: null })
+  titles = (await detailOf()).steps.map((s) => s.title)
+  check('移动：挪到最前', moved.status === 200 && titles[0] === '插入的步骤', JSON.stringify(titles))
+
+  const deleted = await json('DELETE', `/steps/${insertedStep.id}`)
+  titles = (await detailOf()).steps.map((s) => s.title)
+  check('删除：从文档里消失', deleted.status === 200 && !titles.includes('插入的步骤'), JSON.stringify(titles))
+  const restored = await json('POST', `/steps/${insertedStep.id}/restore`)
+  titles = (await detailOf()).steps.map((s) => s.title)
+  check('撤销删除：回到原位', restored.status === 200 && titles[0] === '插入的步骤', JSON.stringify(titles))
+
+  const skipped = await json('POST', `/steps/${timeoutStep.id}/status`, { status: 'skipped', note: '这台机器上不需要' })
+  const afterSkip = (await detailOf()).steps.find((s) => s.id === timeoutStep.id)
+  check('跳过：带一句原因', skipped.status === 200 && afterSkip?.status === 'skipped' && afterSkip?.statusNote === '这台机器上不需要', JSON.stringify(afterSkip))
+
+  // ── M6：截图证据 ─────────────────────────────────────────
+  const RED_PNG =
+    'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGO4IydHU8QwasGoBaMWjFowasGoBaMWjFowasGoBaMWDBULAJI2YD1ZaHIvAAAAAElFTkSuQmCC'
+  const shot = await json('POST', `/steps/${insertedStep.id}/evidence`, { imageBase64: `data:image/png;base64,${RED_PNG}`, mediaType: 'image/png' })
+  const shotBody = await shot.json()
+  const withShot = await detailOf()
+  const imageEvidence = (withShot.evidence[insertedStep.id] ?? []).find((e) => e.imagePath !== null)
+  check('截图：存盘并记为证据', shot.status === 201 && imageEvidence !== undefined, JSON.stringify(shotBody))
+  if (imageEvidence !== undefined) {
+    const img = await fetch(`${API}/evidence/${imageEvidence.id}/image`)
+    const bytes = Buffer.from(await img.arrayBuffer())
+    check(
+      '截图：刷新后还能取回原图',
+      img.status === 200 && img.headers.get('content-type') === 'image/png' && bytes.equals(Buffer.from(RED_PNG, 'base64')),
+      `status ${img.status} ${img.headers.get('content-type')} ${bytes.length}B`,
+    )
+  }
+  const badShot = await json('POST', `/steps/${insertedStep.id}/evidence`, { imageBase64: 'AAAA', mediaType: 'image/tiff' })
+  check('截图：不支持的格式明确拒绝', badShot.status === 400)
+
+  // ── M6：本机守卫（挡跨站请求与 DNS rebinding）───────────────
+  const plain = await fetch(`${API}/tasks`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: JSON.stringify({ title: 'csrf' }) })
+  check('守卫：text/plain 的写请求被拒（跨站"简单请求"）', plain.status === 403, `status ${plain.status}`)
+  const cross = await fetch(`${API}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: 'https://evil.example.com' },
+    body: JSON.stringify({ title: 'csrf' }),
+  })
+  check('守卫：跨站 Origin 被拒', cross.status === 403, `status ${cross.status}`)
+
+  // ── M6：模型设置 ─────────────────────────────────────────
+  const settings0 = await (await fetch(`${API}/settings/llm`)).json()
+  check('设置：没配模型时如实说明', settings0.status?.structure?.ok === false && settings0.presets?.length >= 6, JSON.stringify(settings0.status))
+  const savedProfile = await json('POST', '/settings/llm/profiles', {
+    preset: 'custom-openai',
+    wire: 'openai-compatible',
+    baseUrl: 'http://127.0.0.1:9/v1',
+    model: 'fake-model',
+    apiKey: 'sk-smoke-secret-0000',
+  })
+  const savedBody = await savedProfile.json()
+  check(
+    '设置：保存档案，key 只回打码后的样子',
+    savedProfile.status === 201 && savedBody.profile?.keyHint !== '' && !JSON.stringify(savedBody).includes('sk-smoke-secret-0000'),
+    JSON.stringify(savedBody.profile),
+  )
+  check('设置：第一个档案自动成为各用途的默认', savedBody.purposes?.structure === savedBody.profile?.id)
+  const onePurpose = await json('POST', '/settings/llm/purposes', { diagnose: null })
+  const onePurposeBody = await onePurpose.json()
+  check(
+    '设置：只改一个用途，其余不动',
+    onePurpose.status === 200 && onePurposeBody.purposes?.diagnose === undefined && onePurposeBody.purposes?.structure === savedBody.profile?.id,
+    JSON.stringify(onePurposeBody.purposes ?? onePurposeBody),
+  )
+  const removed = await json('DELETE', `/settings/llm/profiles/${savedBody.profile?.id}`)
+  check('设置：删除档案', removed.status === 200)
+
+  // 没有模型时起草：明确说"还没有配置模型"，不静默失败
+  await json('POST', `/tasks/${task.id}/draft`)
+  await waitFor(() => wsEvents.some((e) => e.type === 'job.update' && e.job.kind === 'draft' && e.job.status === 'failed'), 15_000)
+  const draftFail = wsEvents.find((e) => e.type === 'job.update' && e.job.kind === 'draft' && e.job.status === 'failed')
+  check('起草：没配模型时报错说清楚', /还没有配置模型/.test(draftFail?.job?.error ?? ''), JSON.stringify(draftFail ?? null))
 
   // 5) 重规划产生新版本
   const replan = await fetch(`${API}/tasks/${task.id}/runbook`, {

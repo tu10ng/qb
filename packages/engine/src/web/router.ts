@@ -34,9 +34,16 @@ interface Route {
 export class Router {
   private routes: Route[] = []
   private readonly mountPath: string
+  private readonly guard: ((req: IncomingMessage) => string | null) | null
 
-  constructor(mountPath: string) {
+  /**
+   * @param guard 每个请求先过一遍；返回非 null 即拒绝（403）并附上原因。
+   *   用来挡跨站请求与 DNS rebinding——本机引擎能执行命令，不能让任意
+   *   网页替用户调它。
+   */
+  constructor(mountPath: string, guard: ((req: IncomingMessage) => string | null) | null = null) {
     this.mountPath = mountPath
+    this.guard = guard
   }
 
   add(method: string, pattern: string, handler: Handler): this {
@@ -58,6 +65,9 @@ export class Router {
   patch(p: string, h: Handler): this {
     return this.add('PATCH', p, h)
   }
+  delete(p: string, h: Handler): this {
+    return this.add('DELETE', p, h)
+  }
 
   /** 交给 dsh 的 webServer.register 的处理函数。 */
   readonly handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -69,6 +79,12 @@ export class Router {
 
       const segments = path.split('/').filter(Boolean)
       const method = req.method ?? 'GET'
+
+      const denied = this.guard?.(req) ?? null
+      if (denied !== null) {
+        sendJson(res, 403, { error: 'forbidden', message: denied })
+        return
+      }
 
       for (const route of this.routes) {
         if (route.method !== method) continue

@@ -21,7 +21,7 @@ QB 的执行层需要：本地 GUI、能调本地工具、带超时地执行命�
 | 端口信息 | `ctx.webServer.port` / `.host` | 启动器打印 URL |
 | 命令执行 | `ctx.shell.resolve(req) → spec`；`ctx.shell.run(spec) → ShellRunResult` | `command` / `check` 步骤 |
 | 长任务 | `ctx.shell.start(spec) → ShellProcess { status, done, readOutput(), kill() }` | `wait` 步骤（起服务、下模型） |
-| 模型 | `ctx.llm`（经 `dsh-llm-pi-ai`，OpenAI/Anthropic 兼容） | QB 的 6 种 agent 行为 |
+| ~~模型~~ | ~~`ctx.llm`~~ **已被 ADR 0002 取代**：GenerateOptions 没有 toolChoice，QB 改走 Vercel AI SDK | — |
 | 后台任务 | `ctx.jobs` | `wait` 步骤的就绪轮询 |
 | 定时 | `ctx.schedule` | 回访、卡住检测、摘要 |
 | 会话事件 | `session/event` 订阅 | 旁观模式读 `command/run`、`tool/result` |
@@ -90,7 +90,7 @@ peer 版本不匹配的 bundle 会被 dsh **静默跳过**（记入 `skippedBund
 - insert:
     - id: qb-engine
       name: '@qb/engine'
-      inject: [webServer, shell, llm, jobs, schedule]
+      inject: [webServer, shell, timer]   # 实际使用的；llm 见 ADR 0002
 ```
 
 发布期改为 bundle（`package.json` 的 `dsh.bundle.patch`）+ `dsh plugin --profile qb add @qb/engine`。

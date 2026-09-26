@@ -33,22 +33,8 @@ async function main() {
     process.exit(1)
   }
 
-  // 模型端点从环境变量读。wire=openai 可直接指向公司内网 vLLM。
-  // 不配的话 QB 的起草会明确报错，而不是静默失效。
-  const llm =
-    process.env.QB_LLM_BASE_URL !== undefined
-      ? [
-          '        llm:',
-          `          wire: '${process.env.QB_LLM_WIRE ?? 'openai'}'`,
-          `          baseUrl: '${process.env.QB_LLM_BASE_URL}'`,
-          `          apiKey: '${process.env.QB_LLM_API_KEY ?? ''}'`,
-          `          model: '${process.env.QB_LLM_MODEL ?? 'deepseek-chat'}'`,
-          // 推理型模型（GLM、带 thinking 的 Claude）会先花掉一大截预算
-          // 在思考上，预算不足会导致工具调用被截断。
-          `          maxTokens: ${process.env.QB_LLM_MAX_TOKENS ?? 65536}`,
-        ]
-      : []
-
+  // 模型配置（QB_LLM_*）不写进 patch：密钥不该落进任何生成的配置文件。
+  // dsh 子进程继承环境变量，引擎运行时直接读；也可以在界面「设置 · 模型」里配。
   const patch = join(runDir, 'patch.yml')
   await writeFile(
     patch,
@@ -62,7 +48,6 @@ async function main() {
       `        dbPath: '${posix(join(runDir, 'qb.db'))}'`,
       `        mountPath: '${MOUNT}'`,
       `        userName: '${process.env.QB_USER ?? 'me'}'`,
-      ...llm,
       '',
     ].join('\n'),
     'utf8',

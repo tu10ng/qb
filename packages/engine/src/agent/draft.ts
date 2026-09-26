@@ -1,104 +1,60 @@
 /**
- * QB 的起草能力：把一句模糊的目标展开成可执行的 runbook。
+ * QB 的空白起草：没有底稿也没有素材时，把一句目标展开成 runbook。
  *
- * 结构化输出走工具调用（见 provider.ts），schema 与 @qb/core 的领域
- * 模型对齐。模型返回后仍要过一遍 zod 校验——工具调用不保证语义正确，
- * 只保证形状大致正确。
+ * 这是兜底路径（宪法 13）：产出整份标为"QB 写的"。结构化输出经
+ * Llm 端口（AI SDK），zod schema 一份两用——给模型的是严格契约，
+ * 校验时宽容，一步坏了不废掉整份。
  */
 
 import { z } from 'zod'
 import type { Environment, Lesson, Skill, Task } from '@qb/core'
-import type { HostPort } from '../dsh/port.ts'
+import type { Llm } from '../llm/port.ts'
 
 // ── 模型输出的 schema ────────────────────────────────────────
 
 /**
- * 模型输出的 schema。
- *
  * 设计取舍（都有实测依据）：
  *
  * 1. **结构扁平**。递归的 children 会让推理型模型的思考量明显上升；
  *    章节改用 section 字段表达，写库时还原成树。
- * 2. **字段尽量少**。每个可选字段模型都要权衡"这步要不要填"。
- *    expect 是一个自由文本字段，由代码推断它是"输出包含某字样"、
- *    "人工判断"还是"就绪 URL"——这个判断机械且确定，不该占模型的预算。
+ * 2. **字段尽量少**。expect 是一个自由文本字段，由代码推断它是"输出
+ *    包含某字样"、"人工判断"还是"就绪 URL"——这个判断机械且确定。
  * 3. **超时不让模型算**。由 minutes 推导，它算出来的经常不合理。
- *
- * 即便如此，GLM-5.3 这类推理模型在这个任务上的思考量仍会在
- * 7k~52k 字符之间大幅波动（实测），耗时从 40 秒到 4 分钟。
- * 所以起草在 API 层做成异步任务，不让用户干等。
+ * 4. **宽容校验**。兼容端点上的模型会编出枚举外的 kind、漏掉可选字段
+ *    （实测），所以非关键字段 .catch() 兜底，坏的单步置 null 后丢弃。
  */
-export const DRAFT_SCHEMA = {
-  name: 'propose_runbook',
-  description: '提交起草好的 runbook',
-  parameters: {
-    type: 'object',
-    properties: {
-      assumptions: {
-        type: 'array',
-        description: '信息不全时你做出的假设。用户会在文档顶部看到并可修改。',
-        items: {
-          type: 'object',
-          properties: {
-            key: { type: 'string', description: '假设的维度，如集群、模型版本' },
-            value: { type: 'string', description: '你假设的取值' },
-          },
-          required: ['key', 'value'],
-        },
-      },
-      steps: {
-        type: 'array',
-        description: '有序的步骤列表，8-20 步。用 section 标注所属章节，同章节的步骤要连续。',
-        items: {
-          type: 'object',
-          properties: {
-            section: {
-              type: 'string',
-              description: '所属章节，如 1 准备 / 2 启动 / 3 验证 / 4 交接',
-            },
-            kind: {
-              type: 'string',
-              enum: ['command', 'check', 'wait', 'manual', 'decision'],
-              description:
-                'command=可直接跑的命令；check=验证状态；wait=长任务需等就绪；manual=只有人能做；decision=需要拍板',
-            },
-            title: { type: 'string', description: '简短标题' },
-            why: { type: 'string', description: '一句话：这步为何存在、为何是这个顺序' },
-            command: { type: 'string', description: '精确到可直接复制运行的命令' },
-            expect: {
-              type: 'string',
-              description:
-                '怎么知道这步成了。输出里会出现的关键字样（如 Started server），或人工判断标准。wait 步骤填要探测的 URL。',
-            },
-            minutes: { type: 'number', description: '预计耗时，分钟，可以是小数' },
-          },
-          required: ['section', 'kind', 'title'],
-        },
-      },
-    },
-    required: ['assumptions', 'steps'],
-  },
-} as const
+export const KINDS = ['command', 'check', 'wait', 'manual', 'decision'] as const
 
-// ── 校验 ─────────────────────────────────────────────────────
-
-/** 模型返回的扁平步骤。 */
 const FlatStep = z.object({
-  section: z.string().default(''),
-  kind: z.enum(['command', 'check', 'wait', 'manual', 'decision']),
-  title: z.string().min(1),
-  why: z.string().optional(),
-  command: z.string().optional(),
-  expect: z.string().optional(),
-  minutes: z.number().positive().optional(),
+  section: z.string().describe('所属章节，如 1 准备 / 2 启动 / 3 验证 / 4 交接').catch(''),
+  kind: z
+    .enum(KINDS)
+    .describe('command=可直接跑的命令；check=验证状态；wait=长任务需等就绪；manual=只有人能做；decision=需要拍板')
+    .catch('manual'),
+  title: z.string().min(1).describe('简短标题'),
+  why: z.string().optional().describe('一句话：这步为何存在、为何是这个顺序').catch(undefined),
+  command: z.string().optional().describe('精确到可直接复制运行的命令').catch(undefined),
+  expect: z
+    .string()
+    .optional()
+    .describe('怎么知道这步成了。输出里会出现的关键字样（如 Started server），或人工判断标准。wait 步骤填要探测的 URL。')
+    .catch(undefined),
+  minutes: z.number().positive().optional().describe('预计耗时，分钟，可以是小数').catch(undefined),
 })
 
-const DraftOutput = z.object({
-  assumptions: z.array(z.object({ key: z.string(), value: z.string() })).default([]),
-  // 单个步骤不合格就丢掉它，不因此废掉整份 runbook
+export const DraftSchema = z.object({
+  assumptions: z
+    .array(
+      z.object({
+        key: z.string().describe('假设的维度，如集群、模型版本'),
+        value: z.string().describe('你假设的取值'),
+      }),
+    )
+    .describe('信息不全时你做出的假设。用户会在文档顶部看到并可修改。')
+    .catch([]),
   steps: z
-    .array(FlatStep.catch(() => null as never))
-    .transform((arr) => arr.filter((s) => s !== null)),
+    .array(FlatStep.nullable().catch(null))
+    .describe('有序的步骤列表，8-20 步。用 section 标注所属章节，同章节的步骤要连续。'),
 })
 
 type Flat = z.infer<typeof FlatStep>
@@ -117,7 +73,7 @@ interface StepOut {
 }
 
 /** 按 section 把扁平列表还原成两层树。 */
-function toTree(flat: Flat[]): StepOut[] {
+export function toTree(flat: Flat[]): StepOut[] {
   const out: StepOut[] = []
   let currentSection: string | null = null
   let currentNode: StepOut | null = null
@@ -202,6 +158,25 @@ function isHumanJudgement(kind: Flat['kind']): boolean {
   return kind === 'manual' || kind === 'decision'
 }
 
+/** 流式部分结果里已经成形的步骤：有标题的才算，给界面预览用。 */
+export function partialSteps(partial: unknown): Array<{ section: string; kind: string; title: string; command?: string }> {
+  const steps = (partial as { steps?: unknown } | null)?.steps
+  if (!Array.isArray(steps)) return []
+  const out: Array<{ section: string; kind: string; title: string; command?: string }> = []
+  for (const s of steps) {
+    if (s === null || typeof s !== 'object') continue
+    const r = s as Record<string, unknown>
+    if (typeof r.title !== 'string' || r.title === '') continue
+    out.push({
+      section: typeof r.section === 'string' ? r.section : '',
+      kind: typeof r.kind === 'string' ? r.kind : '',
+      title: r.title,
+      ...(typeof r.command === 'string' ? { command: r.command } : {}),
+    })
+  }
+  return out
+}
+
 // ── 起草 ─────────────────────────────────────────────────────
 
 export interface DraftContext {
@@ -218,12 +193,11 @@ export interface DraftResult {
 }
 
 export async function draftRunbook(
-  host: HostPort,
+  llm: Llm,
   persona: string,
   template: string,
   ctx: DraftContext,
-  signal?: AbortSignal,
-  onProgress?: (p: { kind: 'thinking' | 'writing'; chars: number }) => void,
+  opts: { signal?: AbortSignal; onPartial?: (partial: unknown) => void } = {},
 ): Promise<DraftResult> {
   const prompt = renderTemplate(template, {
     title: ctx.task.title,
@@ -233,32 +207,26 @@ export async function draftRunbook(
     knowledge: renderKnowledge(ctx.skills, ctx.lessons),
   })
 
-  const completion = await host.complete({
-    messages: [
-      { role: 'system', content: persona },
-      { role: 'user', content: prompt },
-    ],
-    schema: DRAFT_SCHEMA,
-    // 不在这里定上限：起草是最重的调用，推理型模型光思考就可能花掉
-    // 三万字符。预算由 provider 配置决定（config.llm.maxTokens）。
-    ...(signal !== undefined ? { signal } : {}),
-    ...(onProgress !== undefined ? { onProgress } : {}),
+  const result = await llm.structured({
+    purpose: 'structure',
+    name: 'runbook',
+    system: persona,
+    prompt,
+    schema: DraftSchema,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    ...(opts.onPartial !== undefined ? { onPartial: opts.onPartial } : {}),
   })
 
-  if (completion.structured === undefined) {
-    throw new Error(`模型没有返回结构化结果。它说：${completion.text.slice(0, 300)}`)
-  }
-
-  const parsed = DraftOutput.parse(completion.structured)
-  if (parsed.steps.length === 0) {
+  const steps = result.output.steps.filter((s): s is Flat => s !== null)
+  if (steps.length === 0) {
     throw new Error('模型返回的步骤全部不合格式')
   }
 
   return {
-    assumptions: parsed.assumptions.map((a) => ({ ...a, editedByUser: false })),
+    assumptions: result.output.assumptions.map((a) => ({ ...a, editedByUser: false })),
     // 扁平列表按 section 还原成树
-    steps: toTree(parsed.steps),
-    model: completion.model,
+    steps: toTree(steps),
+    model: result.model,
   }
 }
 

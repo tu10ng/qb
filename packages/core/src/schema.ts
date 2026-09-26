@@ -91,6 +91,22 @@ export type StepKind = z.infer<typeof StepKind>
 export const StepStatus = z.enum(['pending', 'running', 'ok', 'failed', 'skipped', 'blocked'])
 export type StepStatus = z.infer<typeof StepStatus>
 
+/**
+ * 步骤内容从哪来。宪法 12：人写内容，QB 管结构——所以界面上要能一眼
+ * 看出哪些命令是人写的、哪些是 QB 猜的。
+ */
+export const StepOrigin = z.enum([
+  /** 人在界面上新加的。 */
+  'human',
+  /** 从用户贴进来的素材里整理出来的，命令逐字来自原文。 */
+  'import',
+  /** 从底稿（上次的执行、同事的 runbook）复制来的。 */
+  'base',
+  /** QB 自己写的（空白起草）。 */
+  'qb',
+])
+export type StepOrigin = z.infer<typeof StepOrigin>
+
 /** 预期检查方式。确定性的先判，unclear 才唤醒模型。 */
 export const Expectation = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('exitCode'), code: z.number().int() }),
@@ -135,8 +151,35 @@ export const Step = z.object({
   actualMs: z.number().int().nonnegative().nullable(),
   /** kind=delegate 时指向子任务。 */
   delegateTaskId: Id.nullable(),
+  /** 乐观并发：每次编辑 +1，保存时带上读到的值，不一致说明别处改过。 */
+  rev: z.number().int().nonnegative(),
+  /**
+   * 步骤血缘：创建时生成，复制底稿时保留。坑挂在血缘上，所以别人在
+   * 同一份底稿里记的坑，会出现在所有复制品的同一步上。
+   */
+  lineageKey: z.string().nullable(),
+  origin: StepOrigin,
+  /** 人改过内容时记下是谁；界面据此显示"我改的"。 */
+  editedBy: Id.nullable(),
+  /** 出处：素材 id + 片段。 */
+  sourceRef: z.string().nullable(),
+  /** 跳过或标记失败时写的一句原因。 */
+  statusNote: z.string().nullable(),
 })
 export type Step = z.infer<typeof Step>
+
+/** 允许人直接编辑的步骤字段。 */
+export const StepPatch = z.object({
+  kind: StepKind.optional(),
+  title: z.string().min(1).optional(),
+  whyMd: z.string().nullable().optional(),
+  command: z.string().nullable().optional(),
+  expectation: Expectation.nullable().optional(),
+  probe: ReadinessProbe.nullable().optional(),
+  timeoutMs: z.number().int().positive().nullable().optional(),
+  expectedMinutes: z.number().positive().nullable().optional(),
+})
+export type StepPatch = z.infer<typeof StepPatch>
 
 // ── 证据 ───────────────────────────────────────────────────────────
 
@@ -169,6 +212,8 @@ export const EventKind = z.enum([
   'edit',
   'reorder',
   'insert',
+  'step_deleted',
+  'step_restored',
   'situation_changed',
   'question_asked',
   'question_answered',

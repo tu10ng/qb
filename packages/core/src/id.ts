@@ -22,4 +22,7 @@ export const ids = {
   environment: () => newId('env'),
   question: () => newId('qst'),
   user: () => newId('usr'),
+  lineage: () => newId('lin'),
+  snapshot: () => newId('snp'),
+  modelProfile: () => newId('mdl'),
 }

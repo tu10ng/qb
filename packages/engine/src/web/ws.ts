@@ -26,12 +26,19 @@ export interface WsClient {
 export interface WsServerOptions {
   onConnect?: (client: WsClient, req: IncomingMessage) => void
   onClose?: (client: WsClient) => void
+  /** 握手前的检查；返回非 null 即拒绝。挡跨站网页来读广播。 */
+  guard?: (req: IncomingMessage) => string | null
 }
 
 export function createWsHandler(opts: WsServerOptions = {}) {
   const clients = new Set<WsClient>()
 
   const handler = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    if (opts.guard !== undefined && opts.guard(req) !== null) {
+      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n')
+      return
+    }
+
     const key = req.headers['sec-websocket-key']
     if (typeof key !== 'string') {
       socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')

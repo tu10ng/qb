@@ -52,36 +52,15 @@ export interface StreamingRun {
   kill(): boolean
 }
 
-export interface CompletionMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string
-}
-
-export interface CompletionRequest {
-  messages: CompletionMessage[]
-  /** 要求模型以该 JSON Schema 结构化输出（通过工具调用实现）。 */
-  schema?: { name: string; description: string; parameters: unknown }
-  maxTokens?: number
-  signal?: AbortSignal
-  /** 进度回调：模型思考/写入了多少字符。用于让用户知道它还活着。 */
-  onProgress?: (p: { kind: 'thinking' | 'writing'; chars: number }) => void
-}
-
-export interface Completion {
-  text: string
-  /** schema 存在时的结构化结果。 */
-  structured?: unknown
-  /** 推理型模型的思考过程。不展示给用户，用于诊断起草质量。 */
-  thinking?: string
-  model: string
-}
-
 export interface Disposable {
   dispose(): void
 }
 
 /**
- * 宿主能力端口。
+ * 宿主能力端口：执行与定时。
+ *
+ * 模型调用不在这里——dsh 的 ctx.llm 强制不了结构化输出，QB 改走
+ * AI SDK（见 ../llm/port.ts 与 docs/adr/0002-llm-via-ai-sdk.md）。
  */
 export interface HostPort {
   /** 一次性执行，等结果。用于 command / check 步骤。 */
@@ -89,9 +68,6 @@ export interface HostPort {
 
   /** 启动并返回句柄，可流式读输出。用于 wait 步骤和需要实时回显的场景。 */
   startCommand(req: RunRequest): StreamingRun
-
-  /** 调模型。 */
-  complete(req: CompletionRequest): Promise<Completion>
 
   /** 定时回调。用于就绪轮询、卡住检测、摘要。 */
   schedule(delayMs: number, fn: () => void): Disposable

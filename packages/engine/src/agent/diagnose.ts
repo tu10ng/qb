@@ -10,51 +10,30 @@
 
 import { z } from 'zod'
 import type { Lesson, Step } from '@qb/core'
-import type { HostPort } from '../dsh/port.ts'
+import type { ImageInput, Llm } from '../llm/port.ts'
 
-export const DIAGNOSE_SCHEMA = {
-  name: 'diagnose',
-  description: '给出诊断和可选路径',
-  parameters: {
-    type: 'object',
-    properties: {
-      summary: { type: 'string', description: '一句话说清问题，不超过 40 字' },
-      fromLesson: { type: 'string', description: '命中的坑 id。没有命中就省略。' },
-      options: {
-        type: 'array',
-        description: '可选路径，按可能性排序，2-3 条',
-        items: {
-          type: 'object',
-          properties: {
-            label: { type: 'string', description: '按钮上的字，不超过 12 字' },
-            detail: { type: 'string', description: '做什么、为什么、代价' },
-            command: { type: 'string', description: '要改成或补跑的命令。没有就省略。' },
-          },
-          required: ['label', 'detail'],
-        },
-      },
-      askInstead: {
-        type: 'string',
-        description: '如果最该做的是问人，填建议问谁、问什么。否则省略。',
-      },
-    },
-    required: ['summary', 'options'],
-  },
-} as const
-
-const DiagnoseOutput = z.object({
-  summary: z.string().min(1),
-  fromLesson: z.string().optional(),
+/** 诊断输出。给模型的契约严格，校验宽容：一条路径坏了只丢这一条。 */
+export const DiagnoseSchema = z.object({
+  summary: z.string().min(1).describe('一句话说清问题，不超过 40 字'),
+  fromLesson: z.string().optional().describe('命中的坑 id。没有命中就省略。').catch(undefined),
   options: z
     .array(
-      z.object({
-        label: z.string().min(1),
-        detail: z.string().default(''),
-        command: z.string().optional(),
-      }),
+      z
+        .object({
+          label: z.string().min(1).describe('按钮上的字，不超过 12 字'),
+          detail: z.string().describe('做什么、为什么、代价').catch(''),
+          command: z.string().optional().describe('要改成或补跑的命令。没有就省略。').catch(undefined),
+        })
+        .nullable()
+        .catch(null),
     )
-    .default([]),
-  askInstead: z.string().optional(),
+    .describe('可选路径，按可能性排序，2-3 条')
+    .catch([]),
+  askInstead: z
+    .string()
+    .optional()
+    .describe('如果最该做的是问人，填建议问谁、问什么。否则省略。')
+    .catch(undefined),
 })
 
 export interface DiagnoseInput {
@@ -72,6 +51,8 @@ export interface DiagnoseInput {
   lessons: Lesson[]
   /** 环境事实，用于判断坑的条件是否匹配。 */
   environmentNote: string
+  /** 用户贴回来的最近一张截图（有的话）。 */
+  image?: ImageInput
 }
 
 export interface Diagnosis {
@@ -86,26 +67,24 @@ export interface Diagnosis {
 const OUTPUT_TAIL_CHARS = 3000
 
 export async function diagnoseFailure(
-  host: HostPort,
+  llm: Llm,
   persona: string,
   diagnosePrompt: string,
   input: DiagnoseInput,
   signal?: AbortSignal,
 ): Promise<Diagnosis> {
-  const completion = await host.complete({
-    messages: [
-      { role: 'system', content: `${persona}\n\n---\n\n${diagnosePrompt}` },
-      { role: 'user', content: renderSituation(input) },
-    ],
-    schema: DIAGNOSE_SCHEMA,
+  // 有截图时交给能看图的档案；没有就用诊断档案
+  const result = await llm.structured({
+    purpose: input.image !== undefined ? 'vision' : 'diagnose',
+    name: 'diagnosis',
+    system: `${persona}\n\n---\n\n${diagnosePrompt}`,
+    prompt: renderSituation(input),
+    schema: DiagnoseSchema,
+    ...(input.image !== undefined ? { images: [input.image] } : {}),
     ...(signal !== undefined ? { signal } : {}),
   })
 
-  if (completion.structured === undefined) {
-    throw new Error(`模型没有返回结构化诊断。它说：${completion.text.slice(0, 200)}`)
-  }
-
-  const parsed = DiagnoseOutput.parse(completion.structured)
+  const parsed = result.output
 
   // 模型可能引用一个不存在的坑 id（幻觉）。校验后再采信，
   // 否则 UI 上会出现点不开的"出处"链接。
@@ -117,9 +96,11 @@ export async function diagnoseFailure(
   return {
     summary: parsed.summary,
     fromLessonId: validLessonId,
-    options: parsed.options,
+    options: parsed.options
+      .filter((o): o is NonNullable<typeof o> => o !== null)
+      .map((o) => ({ label: o.label, detail: o.detail, ...(o.command !== undefined ? { command: o.command } : {}) })),
     askInstead: parsed.askInstead ?? null,
-    model: completion.model,
+    model: result.model,
   }
 }
 
@@ -160,6 +141,10 @@ function renderSituation(input: DiagnoseInput): string {
         ? `……（前 ${output.length - OUTPUT_TAIL_CHARS} 字符省略）\n${output.slice(-OUTPUT_TAIL_CHARS)}`
         : output
     parts.push('', '输出：', '```', tail, '```')
+  }
+
+  if (input.image !== undefined) {
+    parts.push('', '（附图是用户贴回来的截图，报错可能只在图里。）')
   }
 
   parts.push('', '# 执行环境', '', environmentNote)

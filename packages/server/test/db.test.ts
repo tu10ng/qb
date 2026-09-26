@@ -1,5 +1,10 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { describe, expect, it } from 'vitest'
 import { openDb } from '../src/db.ts'
+import { MIGRATIONS } from '../src/schema.sql.ts'
 
 describe('数据库 schema', () => {
   it('能建起全部表', () => {
@@ -128,6 +133,45 @@ describe('数据库 schema', () => {
       ).toHaveLength(1)
       db.close()
     })
+  })
+
+  it('v1 的老库升级到最新：存量步骤补上血缘、rev 与来源，数据不丢', () => {
+    // 用户本机已经有 M1–M5 时期的库，升级不能要求删库重来
+    const dir = mkdtempSync(join(tmpdir(), 'qb-migrate-'))
+    const path = join(dir, 'old.db')
+    try {
+      const old = new Database(path)
+      old.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+      old.exec(MIGRATIONS[0]!.sql)
+      old.prepare('INSERT INTO schema_migrations VALUES (1, ?, 1)').run(MIGRATIONS[0]!.name)
+      old.exec(`
+        INSERT INTO users (id, name, display_name, created_at) VALUES ('u1','a','A',1);
+        INSERT INTO tasks (id, title, initiator_id, assignee_id, status, created_at)
+          VALUES ('t1','x','u1','u1','active',1);
+        INSERT INTO runbooks (id, task_id, version, created_by, created_at) VALUES ('r1','t1',1,'u1',1);
+        INSERT INTO steps (id, runbook_id, order_key, kind, title, command)
+          VALUES ('s1','r1','V','command','老步骤','nvidia-smi'), ('s2','r1','k','command','另一步','ls');
+      `)
+      old.close()
+
+      const db = openDb({ path })
+      const rows = db
+        .prepare('SELECT id, title, command, rev, origin, lineage_key, deleted_at FROM steps ORDER BY id')
+        .all() as Array<{ id: string; title: string; command: string; rev: number; origin: string; lineage_key: string | null; deleted_at: number | null }>
+      expect(rows.map((r) => r.title)).toEqual(['老步骤', '另一步'])
+      expect(rows[0]!.command).toBe('nvidia-smi')
+      for (const r of rows) {
+        expect(r.rev).toBe(0)
+        expect(r.origin).toBe('qb')
+        expect(r.deleted_at).toBeNull()
+        expect(r.lineage_key).toMatch(/^lin_[0-9a-f]{16}$/)
+      }
+      // 每一步的血缘各不相同
+      expect(new Set(rows.map((r) => r.lineage_key)).size).toBe(2)
+      db.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('任务可以指向父步骤（递归委派）', () => {

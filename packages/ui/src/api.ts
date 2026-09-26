@@ -1,10 +1,11 @@
-import type { Event, Evidence, Runbook, Step, Task, User } from '@qb/core'
+import type { Event, Evidence, Expectation, Runbook, Step, StepKind, Task, User } from '@qb/core'
 
 const BASE = '/qb/api'
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
+    // 引擎只接受 application/json 的写请求（挡跨站请求，见 local-guard.ts）
     headers: { 'content-type': 'application/json', ...init?.headers },
   })
 
@@ -30,6 +31,11 @@ export class ApiError extends Error {
   /** 破坏性命令等待用户点"确认运行"。 */
   get needsConfirmation(): boolean {
     return this.status === 409 && this.body.error === 'needs_confirmation'
+  }
+
+  /** 别的标签页先改了这一步；body.step 是最新内容。 */
+  get conflict(): Step | null {
+    return this.status === 409 && this.body.error === 'conflict' ? (this.body.step as Step) : null
   }
 
   get matched(): string[] {
@@ -66,6 +72,103 @@ export interface TaskDetail {
   events: Event[]
   /** 按步骤分组的历史证据——刷新后还能看到上次跑出了什么。 */
   evidence: Record<string, Evidence[]>
+  /** 进行中的后台任务（起草、看截图），刷新后接回进度。 */
+  jobs: Job[]
+}
+
+/** 起草时流式到达的步骤预览（还没落库）。 */
+export interface PartialStep {
+  section: string
+  kind: string
+  title: string
+  command?: string
+}
+
+export interface NewStepInput {
+  kind: StepKind
+  title: string
+  whyMd?: string | null
+  command?: string | null
+  expectation?: Expectation | null
+  expectedMinutes?: number | null
+}
+
+export type StepPatchInput = Partial<Pick<Step, 'kind' | 'title' | 'whyMd' | 'command' | 'expectation' | 'expectedMinutes' | 'timeoutMs'>>
+
+// ── 模型设置 ─────────────────────────────────────────────────
+
+export type Purpose = 'structure' | 'diagnose' | 'vision'
+export type Wire = 'anthropic' | 'openai-compatible' | 'deepseek'
+
+export interface CheckResult {
+  ok: boolean
+  ms?: number
+  detail?: string
+}
+
+export interface Capabilities {
+  testedAt: number
+  connect: CheckResult
+  structured: CheckResult & { firstPartialMs?: number; partials?: number; jsonMode?: string }
+  vision: CheckResult
+}
+
+export interface ProfileOptions {
+  thinking: boolean
+  effort?: 'low' | 'high' | 'max'
+  maxOutputTokens: number
+  timeoutMs: number
+  jsonMode?: 'json_schema' | 'json_object'
+  extraBody?: Record<string, unknown>
+}
+
+export interface PublicProfile {
+  id: string
+  name: string
+  preset: string
+  wire: Wire
+  baseUrl: string
+  model: string
+  keyHint: string
+  options: ProfileOptions
+  capabilities: Capabilities | null
+  source: 'local' | 'env'
+  updatedAt: number
+}
+
+export interface Preset {
+  id: string
+  label: string
+  wire: Wire
+  baseUrl: string
+  model: string
+  note: string
+  options: Partial<ProfileOptions>
+}
+
+export interface PurposeStatus {
+  ok: boolean
+  profileId: string | null
+  profileName: string | null
+  reason: string | null
+}
+
+export interface LlmSettingsView {
+  profiles: PublicProfile[]
+  purposes: Partial<Record<Purpose, string>>
+  status: Record<Purpose, PurposeStatus>
+  presets: Preset[]
+}
+
+export interface ProfileInput {
+  id?: string
+  name: string
+  preset: string
+  wire: Wire
+  baseUrl: string
+  model: string
+  apiKey?: string
+  options?: Partial<ProfileOptions>
 }
 
 export const api = {
@@ -90,15 +193,6 @@ export const api = {
 
   job: (jobId: string) => req<Job>(`/jobs/${jobId}`),
 
-  writeRunbook: (
-    taskId: string,
-    input: { steps: unknown[]; assumptions?: unknown[]; reason?: string },
-  ) =>
-    req<{ runbook: Runbook; steps: Step[] }>(`/tasks/${taskId}/runbook`, {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
-
   runStep: (stepId: string, opts: { confirmed?: boolean } = {}) =>
     req<{ stepId: string; status: string }>(`/steps/${stepId}/run`, {
       method: 'POST',
@@ -109,18 +203,73 @@ export const api = {
   diagnose: (stepId: string) =>
     req<Diagnosis>(`/steps/${stepId}/diagnose`, { method: 'POST' }),
 
-  /** 手动提交证据：自己跑完把输出贴回来，或直接标记完成。 */
+  /** 手动提交证据：自己跑完把输出或截图贴回来，或直接标记完成。 */
   submitEvidence: (
     stepId: string,
-    input: { text?: string; imageBase64?: string; markDone?: boolean },
+    input: { text?: string; imageBase64?: string; mediaType?: string; markDone?: boolean },
   ) =>
-    req<{ stepId: string; status: string; verdict: string | null; reason: string }>(
+    req<{ stepId: string; status: string; verdict: string | null; reason: string; judging: boolean }>(
       `/steps/${stepId}/evidence`,
       { method: 'POST', body: JSON.stringify(input) },
     ),
 
   cancelStep: (stepId: string) =>
     req<{ stepId: string; killed: boolean }>(`/steps/${stepId}/cancel`, { method: 'POST' }),
+
+  // ── 编辑（原地修改）─────────────────────────────────────────
+
+  updateStep: (stepId: string, rev: number, patch: StepPatchInput) =>
+    req<{ step: Step }>(`/steps/${stepId}`, { method: 'PATCH', body: JSON.stringify({ rev, ...patch }) }).then(
+      (r) => r.step,
+    ),
+
+  insertStep: (runbookId: string, input: { parentId: string | null; afterId: string | null; step: NewStepInput }) =>
+    req<{ step: Step }>(`/runbooks/${runbookId}/steps`, { method: 'POST', body: JSON.stringify(input) }).then(
+      (r) => r.step,
+    ),
+
+  moveStep: (stepId: string, rev: number, to: { parentId: string | null; afterId: string | null }) =>
+    req<{ step: Step }>(`/steps/${stepId}/move`, { method: 'POST', body: JSON.stringify({ rev, ...to }) }).then(
+      (r) => r.step,
+    ),
+
+  deleteStep: (stepId: string) => req<{ ids: string[] }>(`/steps/${stepId}`, { method: 'DELETE' }),
+
+  restoreStep: (stepId: string) => req<{ ids: string[] }>(`/steps/${stepId}/restore`, { method: 'POST' }),
+
+  setStepStatus: (stepId: string, status: 'pending' | 'ok' | 'failed' | 'skipped', note?: string) =>
+    req<{ stepId: string; status: string }>(`/steps/${stepId}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status, ...(note !== undefined ? { note } : {}) }),
+    }),
+
+  // ── 设置 · 模型 ─────────────────────────────────────────────
+
+  llmSettings: () => req<LlmSettingsView>('/settings/llm'),
+
+  saveProfile: (input: ProfileInput) =>
+    req<LlmSettingsView & { profile: PublicProfile }>('/settings/llm/profiles', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  deleteProfile: (id: string) => req<LlmSettingsView>(`/settings/llm/profiles/${id}`, { method: 'DELETE' }),
+
+  setPurposes: (map: Partial<Record<Purpose, string | null>>) =>
+    req<LlmSettingsView>('/settings/llm/purposes', { method: 'POST', body: JSON.stringify(map) }),
+
+  testProfile: (id: string) =>
+    req<{ jobId: string; existing: boolean }>(`/settings/llm/profiles/${id}/test`, { method: 'POST' }),
+
+  listModels: (input: { profileId?: string; wire?: Wire; baseUrl?: string; apiKey?: string }) =>
+    req<{ models: string[] }>('/settings/llm/models', { method: 'POST', body: JSON.stringify(input) }).then(
+      (r) => r.models,
+    ),
+}
+
+/** 截图证据的地址。 */
+export function evidenceImageUrl(evidenceId: string): string {
+  return `${BASE}/evidence/${evidenceId}/image`
 }
 
 // ── WebSocket ────────────────────────────────────────────────
@@ -141,7 +290,9 @@ export type ServerEvent =
     }
   | { type: 'step.error'; stepId: string; message: string }
   | { type: 'runbook.updated'; taskId: string; version: number }
+  | { type: 'runbook.changed'; taskId: string; stepId: string | null }
   | { type: 'job.update'; job: Job }
+  | { type: 'job.partial'; kind: string; subjectId: string; steps: PartialStep[] }
 
 /**
  * 连接事件流，断线自动重连。

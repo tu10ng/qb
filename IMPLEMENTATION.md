@@ -18,6 +18,11 @@
 
 **生态增量**（选 dsh 的实际理由）：自带 `dsh-skill`（skill 注册表 seam）、`dsh-goal`、`dsh-workflow`、`dsh-terminal`（持久 PTY）、`dsh-schedule`（cron/间隔，恢复原会话投递）、`dsh-subagent`、`dsh-mcp-client`、`dsh-llm-pi-ai`（通用 OpenAI/Anthropic 兼容适配）、`dsh-user-questions`、`dsh-jobs-local`。Web UI 自身由约 20 个 `dsh-client-ui-*` 插件组合而成——第三方扩 UI 是设计内的用法。
 
+**v2 追加（2026-09-27）**：
+- dsh `ctx.llm` 没有 toolChoice，强制不了结构化输出。
+- DeepSeek 默认开 thinking，此时强制工具调用返回 400。
+- 因此模型调用改走 Vercel AI SDK v7，删掉手写的 SSE 解析。证据与决策见 `docs/adr/0002-llm-via-ai-sdk.md`。
+
 **已知风险与对策**：
 - npm 子包版本落后 monorepo；peer 版本不匹配的 bundle 会被**静默跳过**（`skippedBundles`）→ 锁定 `0.1.5-rc.3`，启动时主动断言 QB 插件已加载，未加载就报错而非静默降级。
 - 官方 `AGENTS.md` 声明 *"Public APIs are pre-stable"*，无弃用政策 → 所有 dsh 调用收敛到 `packages/engine/src/dsh/` 一层适配（`HostPort` 接口），换 harness 只改这层。
@@ -137,6 +142,28 @@ questions(id, task_id, step_id, asker_id, target_id,
 
 **检索**：`lessons`、`skills`、`events` 建 FTS5 虚表；`@qb/server` 的 `search.ts` 统一出口，后续换 embeddings 只改这一个文件。
 
+**v2 变更**（迁移 v2 起，全部增量，不破坏现有数据）：
+
+```
+steps      + rev                     -- 乐观并发；每次编辑 +1
+           + lineage_key             -- 步骤血缘：复制底稿时保留；坑挂在这上面（存量步骤迁移时补上）
+           + origin                  -- human|import|base|qb
+           + source_ref              -- 素材 id + 片段（出处）
+           + deleted_at              -- 软删除（撤销用）
+           + status_note             -- 跳过/失败的原因
+runbooks   assumptions_json → params_json   -- [{name,value,description,source,secret}]；旧假设迁成 source='qb_guess'
+           + base_runbook_id, origin -- import|adapt|draft|copy
+runbook_snapshots(id, runbook_id, reason, steps_json, params_json, created_by, created_at)  -- 大改前的快照
+materials(id, task_id, kind, text, filename, created_by, created_at)                      -- 贴进来的原文
+tasks_fts                            -- 标题 + 描述，用于找底稿
+evidence.image_path                  -- 真正启用：图片存数据目录，按哈希命名
+lessons    + condition_json, fix_steps_json, status；anchor_kind 新增 step_lineage
+model_profiles(本机)                 -- key 只存本机
+outbox(本机)                         -- M8 发件箱
+```
+
+runbook 改为**原地修改**：编辑是 `edit` 事件（改前/改后），不再每次保存都新建版本；QB 的大改以 diff 原地应用，应用前写快照。
+
 **`order_key` 用分数索引**（LexoRank 简化版）：拖拽只改被移动节点一行，避免重排整棵树。
 
 ---
@@ -231,7 +258,17 @@ GET  /skills  /lessons  /environments  /inbox
 | observe | 旁观模式 | 订阅 dsh `session/event` 的 `command/run`·`tool/result` → `qb_runbook_patch` |
 | oversee | 定时/事件 | 卡住检测 + 发起人摘要 |
 
-**模型接入**：走 dsh 的 `llm` seam，默认 `dsh-llm-pi-ai`（OpenAI/Anthropic 兼容）。配置里填 base_url / api_type / credentials 即可指向公司内网 vLLM 或官方 API，不写任何手工解析。
+**模型接入**（v2 修订，ADR 0002）：
+- 模型调用只经 `packages/engine/src/llm/`（Vercel AI SDK v7），统一用 `streamText + Output.object(zod)`。
+- `partialOutputStream` 推给 UI；schema 是给模型的严格契约，校验时宽容（`.catch`，坏项丢弃）；结构性失败重试一次。
+- 结构化调用默认关 thinking，并且必须显式给 `maxOutputTokens`。
+- 端点由"模型档案"决定（设置页 + 测试连接 + 能力档案），环境变量可覆盖。公司内网 vLLM 走 OpenAI 兼容 + `json_schema`。
+
+**v2 新增的行为**：
+- `import`：忠实结构化 + 参数提取 + 坑 + 缺口，之后跑确定性保真/覆盖校验。
+- `adapt`：以底稿为基础，把这次的说明变成差异。
+- `ask`：代拟求助。
+- 空白起草 `draft` 降为兜底。
 
 **起草提示词要点**（决定第一印象）：模糊之处**不追问**，写成顶部可编辑的"假设"；每步必须有可验证的预期和预计耗时；"为什么"一句话并注明出处；命令按目标环境事实渲染。
 
@@ -263,6 +300,92 @@ src/
 
 ## 8. 里程碑
 
+### 8.0 实际进度与 v2 里程碑（2026-09-27）
+
+**已完成（见 git 历史）**
+
+| 里程碑 | 内容 |
+|---|---|
+| M1 | core 纯逻辑 + engine 的 dsh 插件地基 |
+| M2 | 数据真源 + 端到端执行闭环（运行、超时、取消、预期判定、证据落库） |
+| M3 | Runbook 活文档界面（大纲、单元、QB 面板、专注模式） |
+| M4 | 模型起草 runbook、环境感知、证据持久化 |
+| M5 | GLM-5.3 真实起草、流式、异步任务、失败诊断 |
+
+**待做（按顺序）**。设计见 AGENTS.md §12；每个里程碑完成后跑两路审查，并把场景写进 `测试手册.md`。
+
+**M6 · 可编辑的活文档 + 换模型层**
+
+要做的：
+- 在 dsh 进程里加载 AI SDK 的冒烟测试。
+- `packages/engine/src/llm/` 替换 `provider.ts`：宽容 schema + 重试；起草时步骤流式出现。
+- 默认改用 DeepSeek；密钥不再写进 `.run/patch.yml`。
+- 编辑全套：内联编辑、插入、删除（可撤销）、重排、进出章节、跳过/失败带原因、来源标记、`edit` 事件与 `rev`、大改先留快照。
+- 截图证据：粘贴或拖入 → 存盘 → 可见 → 可交给看图模型。
+- 模型设置页：预设、测试连接、能力档案、热切换。
+- 空按钮："问发起人"改成临时的复制到 IM（界面上标注）；"情况变了"在 M7 前先隐藏。
+
+验收：
+- 改命令后复制得到新命令，刷新后仍在；时间线有改前改后，撤销能恢复。
+- 贴图后刷新仍可见。
+- DeepSeek 测试连接全绿；切到 GLM 不用重启。
+- 起草的首步在 5 秒内出现。
+
+**M7 · 从已有的开始 + 参数**
+
+要做的：
+- 新任务单输入框 + 底稿推荐；导入 / 调整 / 终端日志 / 空白四条路。
+- 保真、覆盖、出处校验；模型列出的缺口变成问题。
+- 参数面板：就地改值、同值联动、提取建议、缺参数、secret。
+- "情况变了"复用差异机制；"与上次不同"高亮。
+- L0.5：一次贴一大段终端输出，自动分到各步。
+- 导入出的坑按第二层折叠显示。
+- 评测集第一版。
+
+验收：
+- 贴 PD wiki，15 秒内出完整 runbook，命令全部逐字或被标注。
+- 改一个参数后所有命令同步，并提示同值参数。
+- 贴 PL 的一段话，得到正确的差异和要问的问题。
+- 贴一段跨三步的终端输出，三步各自取证并判定。
+
+**M8 · 实时同步给 PL**
+
+要做的：
+- `@qb/team`（Hono + SQLite + `ws`）：邀请链接登录；发件箱同步、离线续传；脱敏。
+- 远程模式 UI；派任务、委派行。
+- 告警规则、信件栈、IM webhook、免打扰、日报。
+- 问发起人、评论、建议修改。
+- `@qb/server` 改名为 `@qb/store`。
+
+验收：
+- PL 用第二个浏览器能实时看到进度。
+- 同一步失败 3 次后 PL 收到 🔴，webhook 也收到。
+- 评论 2 秒内到达执行者。
+- 断网期间的事件在重连后补齐。
+
+**M9 · 坑的闭环**
+
+要做的：
+- 七个捕获时机、三层显示、[按这个修]。
+- 共享与确认、按血缘实时推送、疑似过期。
+- 复盘清单、底稿更新提议。
+
+验收：
+- 失败 → 修好后弹出预填好的"记成坑？"。
+- 同一底稿复制出的别人的 runbook，在那一步看到预警。
+- 两次"不是这个"后标为疑似过期。
+
+**M10 · 终端接入**
+
+- L1 会话日志跟随（`@xterm/headless`）、OSC 133、执行报告导出、ssh 目标。
+- L2 桥接脚本（实验）。
+
+**到时要问的**（不阻塞现在）：
+- M8 之前：公司用哪个 IM？团队服务放在哪台机器？
+- M10 之前：能直连 GPU 机器，还是只能走堡垒机？用 SecureCRT 还是 Xshell，什么版本？
+
+### 8.1 v1 原始里程碑（已被 8.0 取代，保留作对照）
+
 **M1 — 骨架可跑（可见的第一屏）**
 workspace 脚手架 · `@qb/core` schema 与纯函数 + 单测 · `@qb/server` 建表与 CRUD · `@qb/engine` 挂 `/qb` 路由 · `@qb/ui` 渲染一个硬编码 runbook · `qb` 启动器。
 **验收**：`pnpm qb` 打开浏览器看到 Runbook 页面；`/qb/api/health` 返回版本；dsh 内置 UI 在 `/` 仍正常。
@@ -291,9 +414,11 @@ M1–M4 是单人 dogfood 的完整闭环，用你真实的 vLLM PD 分离部署
 - **测试**：`@qb/core` 的纯函数必须有单测（expectation / danger / redact / order_key / runbook diff）；engine 与 server 用 vitest 做集成测试（真起 `ctx.shell`、真建 SQLite 临时库）；UI 先不做 e2e。
 - **类型**：`strict: true`，禁止 `any`；跨包只经 `@qb/core` 的导出类型。
 - **dsh 边界**：除 `packages/engine/src/dsh/` 外，任何文件不得 import `@deepseek-ai/*`。ADR 记录用到的每个 API，越界先补 ADR。
+- **模型边界**：除 `packages/engine/src/llm/` 外，任何文件不得 import `ai` / `@ai-sdk/*`；不手写任何模型协议解析（ADR 0002）。
+- **密钥**：不进仓库、日志、终端回显，也不进任何生成的配置文件。
 - **版本锁**：`@deepseek-ai/dsh` 锁 `0.1.5-rc.3`（不用 `^`）；启动时断言 QB 插件已加载，未加载直接报错。
 - **提示词**：`packages/engine/prompts/*.md` 带版本号；每次模型调用记录提示词版本与模型 id 到 `events`；M4 后建金标准 runbook 回归集。
-- **中文**：界面与提示词中文，代码标识符与注释英文。
+- **中文**：界面、提示词与代码注释用中文（与现有代码一致），代码标识符用英文。
 
 ---
 

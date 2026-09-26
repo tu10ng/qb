@@ -17,12 +17,47 @@ import {
   type Skill,
   type Step,
   type StepKind,
+  type StepOrigin,
+  type StepPatch,
   type StepStatus,
   type Task,
   type TaskStatus,
   type User,
 } from '@qb/core'
 import type { Db } from './db.ts'
+
+/** 保存时带的 rev 与库里不一致：别的标签页或别人先改了。 */
+export class RevConflict extends Error {
+  readonly current: Step
+
+  constructor(current: Step) {
+    super('这一步已经在别处被改过，已为你载入最新内容')
+    this.name = 'RevConflict'
+    this.current = current
+  }
+}
+
+/** 一处字段改动，写进 edit 事件供复盘与撤销。 */
+export interface FieldChange {
+  field: keyof StepPatch
+  before: unknown
+  after: unknown
+}
+
+/** 本机保存的模型档案（原样的行数据；业务含义由 engine 解释）。 */
+export interface StoredModelProfile {
+  id: string
+  name: string
+  preset: string
+  wire: string
+  baseUrl: string
+  apiKey: string
+  model: string
+  options: Record<string, unknown>
+  capabilities: unknown
+  createdAt: number
+  updatedAt: number
+}
 
 /**
  * FTS5 查询分词。
@@ -200,6 +235,8 @@ export class Store {
     assumptions?: Assumption[]
     sourceSkillId?: string | null
     sourceSkillVersion?: number | null
+    /** 这批步骤的来源；单个步骤可在 NewStep 里覆盖。默认 human。 */
+    origin?: StepOrigin
     steps: NewStep[]
   }): { runbook: Runbook; steps: Step[] } {
     const run = this.db.transaction(() => {
@@ -237,7 +274,7 @@ export class Store {
           runbook.sourceSkillVersion,
         )
 
-      const steps = this.insertStepTree(runbook.id, null, input.steps)
+      const steps = this.insertStepTree(runbook.id, null, input.steps, input.origin ?? 'human')
       return { runbook, steps }
     })
 
@@ -245,57 +282,86 @@ export class Store {
   }
 
   /** 递归写入步骤树，自动生成 orderKey。 */
-  private insertStepTree(runbookId: string, parentId: string | null, nodes: NewStep[]): Step[] {
+  private insertStepTree(
+    runbookId: string,
+    parentId: string | null,
+    nodes: NewStep[],
+    origin: StepOrigin,
+  ): Step[] {
     const out: Step[] = []
     let prevKey: string | null = null
-
-    const stmt = this.db.prepare(
-      `INSERT INTO steps
-       (id, runbook_id, parent_id, order_key, kind, title, why_md, why_source,
-        command, env_id, expectation_json, probe_json, timeout_ms, expected_minutes, status)
-       VALUES (@id, @runbookId, @parentId, @orderKey, @kind, @title, @whyMd, @whySource,
-               @command, @envId, @expectationJson, @probeJson, @timeoutMs, @expectedMinutes, @status)`,
-    )
 
     for (const node of nodes) {
       const orderKey = orderKeyBetween(prevKey, null)
       prevKey = orderKey
 
-      const step: Step = {
-        id: ids.step(),
-        runbookId,
-        parentId,
-        orderKey,
-        kind: node.kind,
-        title: node.title,
-        whyMd: node.whyMd ?? null,
-        whySource: node.whySource ?? null,
-        command: node.command ?? null,
-        envId: node.envId ?? null,
-        expectation: node.expectation ?? null,
-        probe: node.probe ?? null,
-        timeoutMs: node.timeoutMs ?? null,
-        expectedMinutes: node.expectedMinutes ?? null,
-        status: 'pending',
-        startedAt: null,
-        endedAt: null,
-        actualMs: null,
-        delegateTaskId: null,
+      const step = this.insertStepRow(runbookId, parentId, orderKey, node, origin)
+      out.push(step)
+      if (node.children !== undefined && node.children.length > 0) {
+        out.push(...this.insertStepTree(runbookId, step.id, node.children, origin))
       }
+    }
 
-      stmt.run({
+    return out
+  }
+
+  private insertStepRow(
+    runbookId: string,
+    parentId: string | null,
+    orderKey: string,
+    node: NewStep,
+    origin: StepOrigin,
+  ): Step {
+    const step: Step = {
+      id: ids.step(),
+      runbookId,
+      parentId,
+      orderKey,
+      kind: node.kind,
+      title: node.title,
+      whyMd: node.whyMd ?? null,
+      whySource: node.whySource ?? null,
+      command: node.command ?? null,
+      envId: node.envId ?? null,
+      expectation: node.expectation ?? null,
+      probe: node.probe ?? null,
+      timeoutMs: node.timeoutMs ?? null,
+      expectedMinutes: node.expectedMinutes ?? null,
+      status: 'pending',
+      startedAt: null,
+      endedAt: null,
+      actualMs: null,
+      delegateTaskId: null,
+      rev: 0,
+      lineageKey: node.lineageKey ?? ids.lineage(),
+      origin: node.origin ?? origin,
+      editedBy: null,
+      sourceRef: node.sourceRef ?? null,
+      statusNote: null,
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO steps
+         (id, runbook_id, parent_id, order_key, kind, title, why_md, why_source,
+          command, env_id, expectation_json, probe_json, timeout_ms, expected_minutes, status,
+          rev, lineage_key, origin, source_ref)
+         VALUES (@id, @runbookId, @parentId, @orderKey, @kind, @title, @whyMd, @whySource,
+                 @command, @envId, @expectationJson, @probeJson, @timeoutMs, @expectedMinutes, @status,
+                 @rev, @lineageKey, @origin, @sourceRef)`,
+      )
+      .run({
         ...step,
         expectationJson: step.expectation === null ? null : JSON.stringify(step.expectation),
         probeJson: step.probe === null ? null : JSON.stringify(step.probe),
       })
 
-      out.push(step)
-      if (node.children !== undefined && node.children.length > 0) {
-        out.push(...this.insertStepTree(runbookId, step.id, node.children))
-      }
-    }
+    return step
+  }
 
-    return out
+  getRunbook(id: string): Runbook | null {
+    const row = this.db.prepare('SELECT * FROM runbooks WHERE id = ?').get(id) as RunbookRow | undefined
+    return row === undefined ? null : toRunbook(row)
   }
 
   getLatestRunbook(taskId: string): { runbook: Runbook; steps: Step[] } | null {
@@ -329,10 +395,11 @@ export class Store {
         `WITH RECURSIVE tree AS (
            SELECT s.*, s.order_key AS path, 0 AS depth
            FROM steps s
-           WHERE s.runbook_id = ? AND s.parent_id IS NULL
+           WHERE s.runbook_id = ? AND s.parent_id IS NULL AND s.deleted_at IS NULL
            UNION ALL
            SELECT s.*, t.path || char(31) || s.order_key, t.depth + 1
            FROM steps s JOIN tree t ON s.parent_id = t.id
+           WHERE s.deleted_at IS NULL
          )
          SELECT * FROM tree ORDER BY path`,
       )
@@ -340,8 +407,15 @@ export class Store {
     return rows.map(toStep)
   }
 
-  getStep(id: string): Step | null {
-    const row = this.db.prepare('SELECT * FROM steps WHERE id = ?').get(id) as StepRow | undefined
+  /** 已删除的步骤默认取不到：不能运行、不能编辑，只能撤销删除。 */
+  getStep(id: string, opts: { includeDeleted?: boolean } = {}): Step | null {
+    const row = this.db
+      .prepare(
+        opts.includeDeleted === true
+          ? 'SELECT * FROM steps WHERE id = ?'
+          : 'SELECT * FROM steps WHERE id = ? AND deleted_at IS NULL',
+      )
+      .get(id) as StepRow | undefined
     return row === undefined ? null : toStep(row)
   }
 
@@ -360,17 +434,290 @@ export class Store {
   updateStepStatus(
     stepId: string,
     status: StepStatus,
-    extra: { startedAt?: number; endedAt?: number; actualMs?: number } = {},
+    extra: { startedAt?: number; endedAt?: number; actualMs?: number; note?: string | null } = {},
   ): void {
+    // note 只在显式给出时覆盖：自动判定的状态变化不该抹掉人写的原因
+    const setNote = extra.note !== undefined
     this.db
       .prepare(
         `UPDATE steps SET status = ?,
-           started_at = COALESCE(?, started_at),
-           ended_at   = COALESCE(?, ended_at),
-           actual_ms  = COALESCE(?, actual_ms)
+           started_at  = COALESCE(?, started_at),
+           ended_at    = COALESCE(?, ended_at),
+           actual_ms   = COALESCE(?, actual_ms),
+           status_note = CASE WHEN ? THEN ? ELSE status_note END
          WHERE id = ?`,
       )
-      .run(status, extra.startedAt ?? null, extra.endedAt ?? null, extra.actualMs ?? null, stepId)
+      .run(
+        status,
+        extra.startedAt ?? null,
+        extra.endedAt ?? null,
+        extra.actualMs ?? null,
+        setNote ? 1 : 0,
+        extra.note ?? null,
+        stepId,
+      )
+  }
+
+  // ── 编辑：原地修改，每次编辑由调用方记一条 edit 事件 ──────────
+
+  /**
+   * 改一步的内容。
+   *
+   * 带上读到的 rev：不一致说明别的标签页先改了，抛 RevConflict 并附上
+   * 最新内容，而不是静默覆盖别人的修改。没有实际变化时不动 rev。
+   */
+  updateStep(
+    stepId: string,
+    patch: StepPatch,
+    opts: { expectedRev: number; actorId: string },
+  ): { step: Step; changes: FieldChange[] } {
+    const run = this.db.transaction(() => {
+      const current = this.getStep(stepId)
+      if (current === null) throw new Error('步骤不存在或已删除')
+      if (current.rev !== opts.expectedRev) throw new RevConflict(current)
+
+      const changes: FieldChange[] = []
+      for (const field of Object.keys(patch) as Array<keyof StepPatch>) {
+        const after = patch[field]
+        if (after === undefined) continue
+        const before = current[field]
+        if (JSON.stringify(before) === JSON.stringify(after)) continue
+        changes.push({ field, before, after })
+      }
+      if (changes.length === 0) return { step: current, changes }
+
+      const next: Step = { ...current }
+      for (const c of changes) {
+        ;(next as Record<string, unknown>)[c.field] = c.after
+      }
+
+      this.db
+        .prepare(
+          `UPDATE steps SET
+             kind = @kind, title = @title, why_md = @whyMd, command = @command,
+             expectation_json = @expectationJson, probe_json = @probeJson,
+             timeout_ms = @timeoutMs, expected_minutes = @expectedMinutes,
+             rev = rev + 1, edited_by = @editedBy
+           WHERE id = @id`,
+        )
+        .run({
+          id: stepId,
+          kind: next.kind,
+          title: next.title,
+          whyMd: next.whyMd,
+          command: next.command,
+          expectationJson: next.expectation === null ? null : JSON.stringify(next.expectation),
+          probeJson: next.probe === null ? null : JSON.stringify(next.probe),
+          timeoutMs: next.timeoutMs,
+          expectedMinutes: next.expectedMinutes,
+          editedBy: opts.actorId,
+        })
+
+      return { step: this.getStep(stepId)!, changes }
+    })
+    return run()
+  }
+
+  /**
+   * 在某个位置插入一步。
+   *
+   * afterId 为 null 表示放在该父节点下的最前面。算位置时把已删除的兄弟
+   * 也算进去：新键严格落在相邻两个键之间，撤销删除时不会撞键。
+   */
+  insertStep(input: {
+    runbookId: string
+    parentId: string | null
+    afterId: string | null
+    step: NewStep
+    origin?: StepOrigin
+  }): Step {
+    const run = this.db.transaction(() => {
+      if (input.parentId !== null) this.assertStepInRunbook(input.parentId, input.runbookId)
+      const orderKey = this.keyAfter(input.runbookId, input.parentId, input.afterId, null)
+      const step = this.insertStepRow(
+        input.runbookId,
+        input.parentId,
+        orderKey,
+        input.step,
+        input.origin ?? 'human',
+      )
+      if (input.step.children !== undefined && input.step.children.length > 0) {
+        this.insertStepTree(input.runbookId, step.id, input.step.children, input.origin ?? 'human')
+      }
+      return step
+    })
+    return run()
+  }
+
+  /** 移动一步到新的父节点下、某个兄弟之后（afterId=null 表示最前面）。 */
+  moveStep(
+    stepId: string,
+    to: { parentId: string | null; afterId: string | null },
+    opts: { expectedRev: number },
+  ): { step: Step; from: { parentId: string | null; orderKey: string } } {
+    const run = this.db.transaction(() => {
+      const current = this.getStep(stepId)
+      if (current === null) throw new Error('步骤不存在或已删除')
+      if (current.rev !== opts.expectedRev) throw new RevConflict(current)
+      if (to.afterId === stepId) throw new Error('不能把步骤移到它自己后面')
+
+      if (to.parentId !== null) {
+        this.assertStepInRunbook(to.parentId, current.runbookId)
+        // 不能移进自己的子树，否则整棵子树会从文档里消失
+        if (this.isSelfOrDescendant(stepId, to.parentId)) {
+          throw new Error('不能把步骤移到它自己的子步骤下面')
+        }
+      }
+
+      const orderKey = this.keyAfter(current.runbookId, to.parentId, to.afterId, stepId)
+      this.db
+        .prepare('UPDATE steps SET parent_id = ?, order_key = ?, rev = rev + 1 WHERE id = ?')
+        .run(to.parentId, orderKey, stepId)
+
+      return {
+        step: this.getStep(stepId)!,
+        from: { parentId: current.parentId, orderKey: current.orderKey },
+      }
+    })
+    return run()
+  }
+
+  /**
+   * 删除一步及其子步骤（软删除，可撤销）。
+   *
+   * 同一次删除的所有行打同一个时间戳，撤销时按它整批恢复，不会把之前
+   * 单独删掉的子步骤也一并带回来。
+   */
+  deleteStep(stepId: string): { ids: string[]; deletedAt: number } {
+    const run = this.db.transaction(() => {
+      const current = this.getStep(stepId)
+      if (current === null) throw new Error('步骤不存在或已删除')
+
+      // 时间戳兼作批次号，必须严格递增：同一毫秒内的两次删除若共用一个
+      // 值，撤销其中一次会把另一次也带回来
+      const last = this.db.prepare('SELECT MAX(deleted_at) m FROM steps').get() as { m: number | null }
+      const deletedAt = Math.max(Date.now(), (last.m ?? 0) + 1)
+      const rows = this.db
+        .prepare(
+          `WITH RECURSIVE sub AS (
+             SELECT id FROM steps WHERE id = ?
+             UNION ALL
+             SELECT s.id FROM steps s JOIN sub ON s.parent_id = sub.id WHERE s.deleted_at IS NULL
+           )
+           SELECT id FROM sub`,
+        )
+        .all(stepId) as Array<{ id: string }>
+      const ids = rows.map((r) => r.id)
+
+      const stmt = this.db.prepare('UPDATE steps SET deleted_at = ? WHERE id = ?')
+      for (const id of ids) stmt.run(deletedAt, id)
+      return { ids, deletedAt }
+    })
+    return run()
+  }
+
+  /** 撤销删除：恢复这一步和同一次被删掉的子步骤。 */
+  restoreStep(stepId: string): { ids: string[] } {
+    const run = this.db.transaction(() => {
+      const row = this.db.prepare('SELECT deleted_at FROM steps WHERE id = ?').get(stepId) as
+        | { deleted_at: number | null }
+        | undefined
+      if (row === undefined) throw new Error('步骤不存在')
+      if (row.deleted_at === null) return { ids: [] }
+
+      const rows = this.db
+        .prepare(
+          `WITH RECURSIVE sub AS (
+             SELECT id FROM steps WHERE id = ?
+             UNION ALL
+             SELECT s.id FROM steps s JOIN sub ON s.parent_id = sub.id WHERE s.deleted_at = ?
+           )
+           SELECT id FROM sub`,
+        )
+        .all(stepId, row.deleted_at) as Array<{ id: string }>
+      const ids = rows.map((r) => r.id)
+
+      const stmt = this.db.prepare('UPDATE steps SET deleted_at = NULL WHERE id = ?')
+      for (const id of ids) stmt.run(id)
+      return { ids }
+    })
+    return run()
+  }
+
+  /** QB 大改之前留快照：导入、调整差异、重规划都原地应用，快照是回退与对比的依据。 */
+  snapshotRunbook(runbookId: string, reason: string, actorId: string | null): string {
+    const id = ids.snapshot()
+    this.db
+      .prepare(
+        `INSERT INTO runbook_snapshots (id, runbook_id, reason, steps_json, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, runbookId, reason, JSON.stringify(this.listSteps(runbookId)), actorId, Date.now())
+    return id
+  }
+
+  listSnapshots(runbookId: string): Array<{ id: string; reason: string; createdAt: number; steps: Step[] }> {
+    const rows = this.db
+      .prepare(
+        'SELECT id, reason, steps_json, created_at FROM runbook_snapshots WHERE runbook_id = ? ORDER BY created_at DESC',
+      )
+      .all(runbookId) as Array<{ id: string; reason: string; steps_json: string; created_at: number }>
+    return rows.map((r) => ({
+      id: r.id,
+      reason: r.reason,
+      createdAt: r.created_at,
+      steps: JSON.parse(r.steps_json) as Step[],
+    }))
+  }
+
+  /** 父节点下 afterId 之后的位置键。excludeId：移动时排除自己。 */
+  private keyAfter(
+    runbookId: string,
+    parentId: string | null,
+    afterId: string | null,
+    excludeId: string | null,
+  ): string {
+    // 已删除的兄弟也要算：新键必须避开它们，撤销删除后顺序才不会乱
+    const siblings = (
+      this.db
+        .prepare(
+          `SELECT id, order_key FROM steps
+           WHERE runbook_id = ? AND parent_id IS ?
+           ORDER BY order_key`,
+        )
+        .all(runbookId, parentId) as Array<{ id: string; order_key: string }>
+    ).filter((s) => s.id !== excludeId)
+
+    if (afterId === null) {
+      return orderKeyBetween(null, siblings[0]?.order_key ?? null)
+    }
+
+    const idx = siblings.findIndex((s) => s.id === afterId)
+    if (idx < 0) throw new Error('要插在它后面的那一步不在同一层')
+    return orderKeyBetween(siblings[idx]!.order_key, siblings[idx + 1]?.order_key ?? null)
+  }
+
+  private assertStepInRunbook(stepId: string, runbookId: string): void {
+    const row = this.db
+      .prepare('SELECT runbook_id FROM steps WHERE id = ? AND deleted_at IS NULL')
+      .get(stepId) as { runbook_id: string } | undefined
+    if (row === undefined || row.runbook_id !== runbookId) {
+      throw new Error('父步骤不存在或不在这份 runbook 里')
+    }
+  }
+
+  private isSelfOrDescendant(rootId: string, candidateId: string): boolean {
+    const row = this.db
+      .prepare(
+        `WITH RECURSIVE sub AS (
+           SELECT id FROM steps WHERE id = ?
+           UNION ALL
+           SELECT s.id FROM steps s JOIN sub ON s.parent_id = sub.id
+         )
+         SELECT 1 AS hit FROM sub WHERE id = ? LIMIT 1`,
+      )
+      .get(rootId, candidateId) as { hit: number } | undefined
+    return row !== undefined
   }
 
   // ── 证据 ─────────────────────────────────────────────────────
@@ -416,6 +763,16 @@ export class Store {
       })
 
     return evidence
+  }
+
+  getEvidence(id: string): Evidence | null {
+    const row = this.db.prepare('SELECT * FROM evidence WHERE id = ?').get(id) as EvidenceRow | undefined
+    return row === undefined ? null : toEvidence(row)
+  }
+
+  /** 给截图补上 QB 读到的内容：之后检索坑、诊断时，图里的报错也能被用上。 */
+  setEvidenceText(id: string, text: string): void {
+    this.db.prepare('UPDATE evidence SET text = ? WHERE id = ?').run(text, id)
   }
 
   listEvidence(stepId: string): Evidence[] {
@@ -619,6 +976,82 @@ export class Store {
       .all(taskId, limit) as EventRow[]
     return rows.map(toEvent)
   }
+
+  /** 某一步最近的一次内容编辑，界面悬停"我改的"时显示改前改后。 */
+  lastEditOf(stepId: string): Event | null {
+    const row = this.db
+      .prepare("SELECT * FROM events WHERE step_id = ? AND kind = 'edit' ORDER BY seq DESC LIMIT 1")
+      .get(stepId) as EventRow | undefined
+    return row === undefined ? null : toEvent(row)
+  }
+
+  // ── 本机设置：模型档案 ───────────────────────────────────────
+
+  listModelProfiles(): StoredModelProfile[] {
+    const rows = this.db
+      .prepare('SELECT * FROM model_profiles ORDER BY created_at')
+      .all() as ModelProfileRow[]
+    return rows.map(toModelProfile)
+  }
+
+  getModelProfile(id: string): StoredModelProfile | null {
+    const row = this.db.prepare('SELECT * FROM model_profiles WHERE id = ?').get(id) as
+      | ModelProfileRow
+      | undefined
+    return row === undefined ? null : toModelProfile(row)
+  }
+
+  /** 新建或整体覆盖一个档案。id 为空时新建。 */
+  saveModelProfile(
+    input: Omit<StoredModelProfile, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+  ): StoredModelProfile {
+    const now = Date.now()
+    const existing = input.id !== undefined ? this.getModelProfile(input.id) : null
+    const profile: StoredModelProfile = {
+      ...input,
+      id: existing?.id ?? input.id ?? ids.modelProfile(),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO model_profiles
+         (id, name, preset, wire, base_url, api_key, model, options_json, capabilities_json, created_at, updated_at)
+         VALUES (@id, @name, @preset, @wire, @baseUrl, @apiKey, @model, @optionsJson, @capabilitiesJson, @createdAt, @updatedAt)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name, preset = excluded.preset, wire = excluded.wire,
+           base_url = excluded.base_url, api_key = excluded.api_key, model = excluded.model,
+           options_json = excluded.options_json, capabilities_json = excluded.capabilities_json,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        ...profile,
+        optionsJson: JSON.stringify(profile.options),
+        capabilitiesJson: profile.capabilities == null ? null : JSON.stringify(profile.capabilities),
+      })
+    return profile
+  }
+
+  deleteModelProfile(id: string): void {
+    this.db.prepare('DELETE FROM model_profiles WHERE id = ?').run(id)
+  }
+
+  getSetting<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value_json FROM settings WHERE key = ?').get(key) as
+      | { value_json: string }
+      | undefined
+    return row === undefined ? null : (JSON.parse(row.value_json) as T)
+  }
+
+  setSetting(key: string, value: unknown): void {
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      )
+      .run(key, JSON.stringify(value), Date.now())
+  }
 }
 
 // ── 输入类型 ───────────────────────────────────────────────────
@@ -634,7 +1067,42 @@ export interface NewStep {
   probe?: ReadinessProbe | null
   timeoutMs?: number | null
   expectedMinutes?: number | null
+  /** 覆盖整批的来源。 */
+  origin?: StepOrigin
+  /** 复制底稿时沿用原步骤的血缘；新建时不填，自动生成。 */
+  lineageKey?: string
+  sourceRef?: string | null
   children?: NewStep[]
+}
+
+interface ModelProfileRow {
+  id: string
+  name: string
+  preset: string
+  wire: string
+  base_url: string
+  api_key: string
+  model: string
+  options_json: string
+  capabilities_json: string | null
+  created_at: number
+  updated_at: number
+}
+
+function toModelProfile(r: ModelProfileRow): StoredModelProfile {
+  return {
+    id: r.id,
+    name: r.name,
+    preset: r.preset,
+    wire: r.wire,
+    baseUrl: r.base_url,
+    apiKey: r.api_key,
+    model: r.model,
+    options: JSON.parse(r.options_json) as Record<string, unknown>,
+    capabilities: r.capabilities_json === null ? null : (JSON.parse(r.capabilities_json) as unknown),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
 }
 
 // ── 行 → 领域对象 ──────────────────────────────────────────────
@@ -693,6 +1161,12 @@ interface StepRow {
   ended_at: number | null
   actual_ms: number | null
   delegate_task_id: string | null
+  rev: number
+  lineage_key: string | null
+  origin: string
+  edited_by: string | null
+  source_ref: string | null
+  status_note: string | null
 }
 
 interface EventRow {
@@ -874,6 +1348,12 @@ function toStep(r: StepRow): Step {
     endedAt: r.ended_at,
     actualMs: r.actual_ms,
     delegateTaskId: r.delegate_task_id,
+    rev: r.rev,
+    lineageKey: r.lineage_key,
+    origin: r.origin as StepOrigin,
+    editedBy: r.edited_by,
+    sourceRef: r.source_ref,
+    statusNote: r.status_note,
   }
 }
 

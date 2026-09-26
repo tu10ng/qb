@@ -230,4 +230,56 @@ CREATE TRIGGER skills_fts_update AFTER UPDATE ON skills BEGIN
 END;
 `,
   },
+  {
+    version: 2,
+    name: 'editable-runbook-and-model-profiles',
+    sql: `
+-- runbook 改为原地修改：每次编辑是一条 edit 事件，不再新建版本。
+-- rev 做乐观并发；deleted_at 让删除可撤销。
+ALTER TABLE steps ADD COLUMN rev INTEGER NOT NULL DEFAULT 0;
+-- 步骤血缘：复制底稿时保留，坑挂在它上面。存量步骤各补一个。
+ALTER TABLE steps ADD COLUMN lineage_key TEXT;
+-- 存量步骤都是起草或接口写入的，按 QB 写的算。
+ALTER TABLE steps ADD COLUMN origin TEXT NOT NULL DEFAULT 'qb';
+ALTER TABLE steps ADD COLUMN edited_by TEXT REFERENCES users(id);
+ALTER TABLE steps ADD COLUMN source_ref TEXT;
+ALTER TABLE steps ADD COLUMN deleted_at INTEGER;
+ALTER TABLE steps ADD COLUMN status_note TEXT;
+UPDATE steps SET lineage_key = 'lin_' || lower(hex(randomblob(8))) WHERE lineage_key IS NULL;
+CREATE INDEX idx_steps_lineage ON steps(lineage_key);
+
+-- QB 的大改（导入、调整、重规划）原地应用之前先留一份快照，供对比与回退。
+CREATE TABLE runbook_snapshots (
+  id          TEXT PRIMARY KEY,
+  runbook_id  TEXT NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
+  reason      TEXT NOT NULL,
+  steps_json  TEXT NOT NULL,
+  created_by  TEXT REFERENCES users(id),
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_snapshots_runbook ON runbook_snapshots(runbook_id, created_at DESC);
+
+-- 模型档案。key 只存本机这份库里，永不同步、不写日志。
+CREATE TABLE model_profiles (
+  id                TEXT PRIMARY KEY,
+  name              TEXT NOT NULL,
+  preset            TEXT NOT NULL,
+  wire              TEXT NOT NULL,
+  base_url          TEXT NOT NULL,
+  api_key           TEXT NOT NULL DEFAULT '',
+  model             TEXT NOT NULL,
+  options_json      TEXT NOT NULL DEFAULT '{}',
+  capabilities_json TEXT,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+
+-- 本机设置（按用途选哪个模型档案等）。
+CREATE TABLE settings (
+  key         TEXT PRIMARY KEY,
+  value_json  TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+`,
+  },
 ]

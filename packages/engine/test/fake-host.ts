@@ -1,13 +1,4 @@
-import type {
-  Completion,
-  CompletionRequest,
-  Disposable,
-  HostPort,
-  OutputChunk,
-  RunRequest,
-  RunResult,
-  StreamingRun,
-} from '../src/dsh/port.ts'
+import type { Disposable, HostPort, OutputChunk, RunRequest, RunResult, StreamingRun } from '../src/dsh/port.ts'
 
 export interface FakeRunSpec {
   stdout?: string
@@ -85,10 +76,6 @@ export class FakeHost implements HostPort {
         return true
       },
     }
-  }
-
-  async complete(_req: CompletionRequest): Promise<Completion> {
-    return { text: '', model: 'fake' }
   }
 
   /** 假定时器：记录下来，由测试用 flushTimers 推进。 */
