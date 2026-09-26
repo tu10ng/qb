@@ -190,6 +190,8 @@ export interface DraftResult {
   assumptions: Array<{ key: string; value: string; editedByUser: boolean }>
   steps: StepOut[]
   model: string
+  /** 宽容校验丢弃的不合格式步骤数。静默丢不行——用户得知道少了几个。 */
+  dropped: number
 }
 
 export async function draftRunbook(
@@ -227,6 +229,7 @@ export async function draftRunbook(
     // 扁平列表按 section 还原成树
     steps: toTree(steps),
     model: result.model,
+    dropped: result.output.steps.length - steps.length,
   }
 }
 

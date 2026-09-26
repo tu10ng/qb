@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Event, Evidence, Expectation, Step, StepKind } from '@qb/core'
+import { isSection, type MoveDirection } from '@qb/core'
 import { ApiError, api, evidenceImageUrl, type Diagnosis, type Job, type StepPatchInput } from './api.ts'
 import { Editable } from './Editable.tsx'
-import { isSection, type MoveDirection } from './tree.ts'
 
 export interface StepRunState {
   output: string
@@ -67,9 +67,19 @@ export function StepCell(props: Props) {
 }
 
 function SectionHead({ step, current, autoEdit, canMove, actions, onFocus }: Props) {
+  const [error, setError] = useState<string | null>(null)
   return (
     <div className={`section-head${current ? ' current' : ''}`} onClick={onFocus}>
-      <Editable value={step.title} autoEdit={autoEdit} onSave={(title) => actions.edit({ title })} />
+      <Editable
+        value={step.title}
+        autoEdit={autoEdit}
+        onSave={(title) =>
+          actions
+            .edit({ title })
+            .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+        }
+      />
+      {error !== null && <span className="verdict fail">{error}</span>}
       <span className="spacer" />
       <MoreMenu step={step} canMove={canMove} actions={actions} />
     </div>

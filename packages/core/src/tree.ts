@@ -1,13 +1,21 @@
-import type { Step } from '@qb/core'
-
 /**
- * runbook 树上的位置计算。步骤列表是先序的（同层按 orderKey），
- * 位置统一表示成"父节点 + 排在哪个兄弟之后"（afterId=null 表示最前）。
+ * runbook 树上的位置计算（纯函数）。
+ *
+ * 步骤列表是先序的（同层按 orderKey），位置统一表示成
+ * "父节点 + 排在哪个兄弟之后"（afterId=null 表示最前）。
+ * 放在 core 是为了能直接单测——树算错，编辑、拖拽、撤销全跟着错。
  */
+
+import type { Step } from './schema.ts'
 
 export interface Position {
   parentId: string | null
   afterId: string | null
+}
+
+/** 顶层的 note 就是章节。 */
+export function isSection(step: Step): boolean {
+  return step.kind === 'note' && step.parentId === null
 }
 
 export function siblingsOf(steps: Step[], step: Pick<Step, 'parentId'>): Step[] {
@@ -18,9 +26,15 @@ function childrenOf(steps: Step[], parentId: string): Step[] {
   return steps.filter((s) => s.parentId === parentId)
 }
 
-/** 顶层的 note 就是章节。 */
-export function isSection(step: Step): boolean {
-  return step.kind === 'note' && step.parentId === null
+/** 沿父链走到顶层的那个节点。 */
+export function topLevelOf(steps: Step[], step: Step): Step {
+  let cur = step
+  while (cur.parentId !== null) {
+    const parent = steps.find((s) => s.id === cur.parentId)
+    if (parent === undefined) break
+    cur = parent
+  }
+  return cur
 }
 
 /** 一步当前所在的位置——撤销移动、撤销删除时要回到这里。 */
@@ -67,7 +81,7 @@ export function movedPosition(steps: Step[], step: Step, dir: MoveDirection): Po
       if (idx < 0 || idx >= sibs.length - 1) return null
       return { parentId: step.parentId, afterId: sibs[idx + 1]!.id }
     case 'indent': {
-      // 只能移进紧挨在上面的那一章
+      // 只有普通步骤能移进紧挨在上面的那一章
       const prev = idx > 0 ? sibs[idx - 1] : undefined
       if (prev === undefined || !isSection(prev) || isSection(step)) return null
       const kids = childrenOf(steps, prev.id)
@@ -79,8 +93,19 @@ export function movedPosition(steps: Step[], step: Step, dir: MoveDirection): Po
   }
 }
 
-/** 拖到某一步上松手：拖到章节标题上 = 放进这一章最前面；否则放在它后面。 */
-export function dropPosition(target: Step, dragged: Step): Position {
-  if (isSection(target) && !isSection(dragged)) return { parentId: target.id, afterId: null }
+/**
+ * 拖到某一步上松手的位置。
+ *
+ * 拖普通步骤到章节标题上 = 放进这一章最前面；否则放在它后面。
+ * 拖章节时永远留在顶层：落到章内步骤上时，改为排在它所属章节的后面——
+ * 章节一旦成为别人的子节点就会"降级"成普通说明（isSection 要求
+ * parentId 为空），从大纲里凭空消失一层。
+ */
+export function dropPosition(steps: Step[], target: Step, dragged: Step): Position {
+  if (isSection(dragged)) {
+    const anchor = isSection(target) ? target : topLevelOf(steps, target)
+    return { parentId: null, afterId: anchor.id }
+  }
+  if (isSection(target)) return { parentId: target.id, afterId: null }
   return { parentId: target.parentId, afterId: target.id }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { hasLoneSurrogate, sanitizeText } from '../src/sanitize.ts'
+import { hasLoneSurrogate, sanitizeText, tailCap } from '../src/sanitize.ts'
 
 describe('sanitizeText', () => {
   it('普通文本原样返回', () => {
@@ -70,5 +70,23 @@ describe('hasLoneSurrogate', () => {
 
   it('识别污染文本', () => {
     expect(hasLoneSurrogate('bad \udc8d')).toBe(true)
+  })
+})
+
+describe('tailCap', () => {
+  it('没超限原样返回', () => {
+    expect(tailCap('NCCL WARN: No route to host', 100)).toEqual({ text: 'NCCL WARN: No route to host', truncated: false })
+  })
+
+  it('超限时保留尾部并注明截断了多少', () => {
+    const input = 'a'.repeat(300)
+    const { text, truncated } = tailCap(input, 100)
+    expect(truncated).toBe(true)
+    expect(text).toMatch(/^……（前面 200 字符已截断）\n/)
+    expect(text.endsWith('a'.repeat(100))).toBe(true)
+  })
+
+  it('正好等于上限时不截断', () => {
+    expect(tailCap('x'.repeat(50), 50).truncated).toBe(false)
   })
 })

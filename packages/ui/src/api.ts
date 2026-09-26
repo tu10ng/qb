@@ -297,10 +297,11 @@ export type ServerEvent =
 /**
  * 连接事件流，断线自动重连。
  *
- * 用户切走再回来、笔记本休眠唤醒都会断线；执行中的步骤还在跑，
- * 所以重连后要能继续收到输出，而不是永远卡在"运行中"。
+ * 用户切走再回来、笔记本休眠唤醒都会断线；断线期间的 step.done /
+ * job.update 永远收不到了，所以每次连上（含首次）都回调一次 onResync，
+ * 由上层重拉当前数据——否则界面会卡在"运行中"直到手动刷新。
  */
-export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
+export function connectEvents(onEvent: (e: ServerEvent) => void, onResync?: () => void): () => void {
   let ws: WebSocket | null = null
   let retry = 0
   let stopped = false
@@ -314,6 +315,7 @@ export function connectEvents(onEvent: (e: ServerEvent) => void): () => void {
 
     ws.addEventListener('open', () => {
       retry = 0
+      onResync?.()
     })
 
     ws.addEventListener('message', (ev) => {

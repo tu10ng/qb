@@ -139,7 +139,13 @@ export class LlmSettings implements ProfileSource {
     }
     const row = this.store.getModelProfile(id)
     if (row === null) return
-    this.store.saveModelProfile({ ...row, capabilities: caps })
+    // 探明的结构化方式写进 options，之后的调用直接照用（json_object 端点
+    // 若继续按 json_schema 请求会每次失败）
+    const options =
+      caps.structured.ok && caps.structured.jsonMode !== undefined && row.wire === 'openai-compatible'
+        ? { ...row.options, jsonMode: caps.structured.jsonMode }
+        : row.options
+    this.store.saveModelProfile({ ...row, options, capabilities: caps })
   }
 
   toPublic(p: ModelProfile): PublicProfile {

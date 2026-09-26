@@ -13,8 +13,11 @@ import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/server'
-import type { Expectation, Step, StepStatus, Verdict } from '@qb/core'
-import { checkExpectation, redact, sanitizeText } from '@qb/core'
+import type { Step, StepStatus, Verdict } from '@qb/core'
+import { checkExpectation, redact, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind } from '@qb/core'
+
+/** 落库的证据文本上限。报错在尾部，截前面；整份详情接口扛不住几十 MB 的日志。 */
+const EVIDENCE_MAX_CHARS = 64 * 1024
 
 export interface ApiDeps {
   host: HostPort
@@ -30,6 +33,52 @@ export interface ApiDeps {
   attachments: Attachments
   guard: LocalGuard
 }
+
+/** 整份替换接口的输入校验。之前直接 as 断言，畸形的 expectation 能入库。 */
+interface StepInputT {
+  kind: StepKind
+  title: string
+  whyMd?: string | null
+  whySource?: string | null
+  command?: string | null
+  envId?: string | null
+  expectation?: z.infer<typeof Expectation> | null
+  probe?: z.infer<typeof ReadinessProbe> | null
+  timeoutMs?: number | null
+  expectedMinutes?: number | null
+  origin?: 'human' | 'import' | 'base' | 'qb'
+  lineageKey?: string
+  sourceRef?: string | null
+  children?: StepInputT[]
+}
+
+// 递归 schema 要显式标注类型，否则 TS 推不出自引用
+const StepInput: z.ZodType<StepInputT> = z.object({
+  kind: StepKind,
+  title: z.string().min(1),
+  whyMd: z.string().nullable().optional(),
+  whySource: z.string().nullable().optional(),
+  command: z.string().nullable().optional(),
+  envId: z.string().nullable().optional(),
+  expectation: Expectation.nullable().optional(),
+  probe: ReadinessProbe.nullable().optional(),
+  timeoutMs: z.number().int().positive().nullable().optional(),
+  expectedMinutes: z.number().positive().nullable().optional(),
+  origin: z.enum(['human', 'import', 'base', 'qb']).optional(),
+  lineageKey: z.string().optional(),
+  sourceRef: z.string().nullable().optional(),
+  children: z.array(z.lazy(() => StepInput)).optional(),
+})
+
+const RunbookBody = z.object({
+  steps: z.array(StepInput).min(1),
+  assumptions: z
+    .array(z.object({ key: z.string(), value: z.string(), editedByUser: z.boolean().default(false) }))
+    .optional(),
+  sourceSkillId: z.string().nullable().optional(),
+  sourceSkillVersion: z.number().int().positive().nullable().optional(),
+  reason: z.string().optional(),
+})
 
 const DEFAULT_TIMEOUT_MS = 120_000
 
@@ -144,6 +193,8 @@ export function buildApi(deps: ApiDeps): Router {
    *
    * 只用于"推倒重来"（重新起草）和外部导入。日常编辑走 PATCH /steps/:id
    * 等原地修改的接口，不再每改一次就新建一个版本。
+   * 替换前给当前版本留快照：复盘"上次为什么那样分解"、M7 的原地差异
+   * 应用都以它为底。
    */
   router.post('/tasks/:id/runbook', (_req, res, ctx) => {
     const taskId = ctx.params.id!
@@ -153,31 +204,24 @@ export function buildApi(deps: ApiDeps): Router {
       return
     }
 
-    const body = (ctx.body ?? {}) as {
-      steps?: unknown
-      assumptions?: unknown
-      sourceSkillId?: string | null
-      sourceSkillVersion?: number | null
-      reason?: string
-    }
-
-    if (!Array.isArray(body.steps) || body.steps.length === 0) {
-      sendJson(res, 400, { error: 'bad_request', message: 'steps 不能为空' })
+    const parsed = RunbookBody.safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('；') })
       return
     }
+    const body = parsed.data
 
     try {
+      const latest = store.getLatestRunbook(taskId)
+      if (latest !== null) store.snapshotRunbook(latest.runbook.id, body.reason ?? '整份替换前', currentUserId())
+
       const result = store.createRunbook({
         taskId,
         createdBy: currentUserId(),
-        steps: body.steps as Parameters<Store['createRunbook']>[0]['steps'],
-        ...(Array.isArray(body.assumptions)
-          ? { assumptions: body.assumptions as Parameters<Store['createRunbook']>[0]['assumptions'] }
-          : {}),
+        steps: body.steps,
+        ...(body.assumptions !== undefined ? { assumptions: body.assumptions } : {}),
         ...(body.sourceSkillId !== undefined ? { sourceSkillId: body.sourceSkillId } : {}),
-        ...(body.sourceSkillVersion !== undefined
-          ? { sourceSkillVersion: body.sourceSkillVersion }
-          : {}),
+        ...(body.sourceSkillVersion !== undefined ? { sourceSkillVersion: body.sourceSkillVersion } : {}),
       })
 
       // 版本 >1 意味着这是重规划，值得单独记一笔——它是最强的学习信号
@@ -213,6 +257,10 @@ export function buildApi(deps: ApiDeps): Router {
 
     const { job, existing } = jobs.start('draft', taskId, async (report) => {
       let lastPush = 0
+      // 重新起草前先留快照：旧版本的步骤连同状态是"上次是怎么分解的"的唯一记录
+      const before = store.getLatestRunbook(taskId)
+      if (before !== null) store.snapshotRunbook(before.runbook.id, 'QB 重新起草前', currentUserId())
+
       const draft = await draftRunbook(
         llm,
         prompts.persona,
@@ -253,6 +301,8 @@ export function buildApi(deps: ApiDeps): Router {
           by: 'qb',
           model: draft.model,
           reason: result.runbook.version === 1 ? '起草' : '重新起草',
+          // 丢弃数：宽容校验会静默丢掉不合格式的步骤，用户得知道少了几个
+          dropped: draft.dropped,
         },
       })
 
@@ -355,12 +405,13 @@ export function buildApi(deps: ApiDeps): Router {
           store.updateStepStatus(stepId, status, { endedAt, actualMs: outcome.result.durationMs })
         }
 
-        // 输出落库（脱敏后的版本）。不存的话刷新页面就看不到了，
+        // 输出落库（脱敏 + 截尾后的版本）。不存的话刷新页面就看不到了，
         // 而复盘恰恰需要"当时到底输出了什么"。
+        const capped = tailCap(joinOutput(outcome.redactedStdout, outcome.redactedStderr), EVIDENCE_MAX_CHARS)
         store.addEvidence({
           stepId,
           source: 'auto',
-          text: joinOutput(outcome.redactedStdout, outcome.redactedStderr),
+          text: capped.text,
           exitCode: outcome.result.exitCode,
           timedOut: outcome.result.timedOut,
           durationMs: outcome.result.durationMs,
@@ -449,21 +500,23 @@ export function buildApi(deps: ApiDeps): Router {
 
     if (hasText) {
       const clean = redact(sanitizeText(body.text!))
+      const capped = tailCap(clean.text, EVIDENCE_MAX_CHARS)
       store.addEvidence({
         stepId,
         source: 'paste',
-        text: clean.text,
+        text: capped.text,
         redacted: clean.hits.length > 0,
       })
 
       // 用户贴回来的输出同样要判定——他自己跑的和 QB 跑的一视同仁。
       // 但没有退出码：手动粘贴时那个信息本就不存在，不该因此判 unclear。
-      // 所以只在有显式预期时判定，没有预期就交给用户自己说了算。
-      if (step.expectation !== null) {
-        const check = checkExpectation(step.expectation as Expectation, {
-          // 人工提供的输出没有退出码。给 0 表示"不是异常终止"，
-          // 真正依赖退出码的预期（kind: exitCode）本就不适合手动判定，
-          // 那种情况下用户应该直接点"完成"。
+      // 依赖退出码的预期（kind: exitCode）在贴文本时干脆不判——硬按
+      // 退出码 0 判，会让"预期退出码非 0"的检查步一贴输出就误报失败，
+      // 这种步骤由用户自己点"完成"或"失败"。
+      const expectation = step.expectation as Expectation | null
+      if (expectation !== null && expectation.kind !== 'exitCode') {
+        const check = checkExpectation(expectation, {
+          // 人工提供的输出没有退出码。给 0 表示"不是异常终止"。
           exitCode: 0,
           stdout: body.text!,
           stderr: '',
@@ -477,8 +530,13 @@ export function buildApi(deps: ApiDeps): Router {
     let judging = false
     if (imageName !== null) {
       const evidence = store.addEvidence({ stepId, source: 'image', imagePath: imageName })
-      // 能看图、这步有预期、且文本没有给出结论时，才劳烦模型
-      if (verdict === null && body.markDone !== true && step.expectation !== null && llm.status('vision').ok) {
+      // 能看图、这步有预期、且文本没有给出结论（没判或判 unclear）时，才劳烦模型
+      if (
+        (verdict === null || verdict === 'unclear') &&
+        body.markDone !== true &&
+        step.expectation !== null &&
+        llm.status('vision').ok
+      ) {
         judging = true
         startImageJudge(step, evidence.id, imageName, taskId)
       }
@@ -535,53 +593,65 @@ export function buildApi(deps: ApiDeps): Router {
       'content-length': file.data.length,
       // 内容寻址，文件名即哈希，可以放心长缓存
       'cache-control': 'private, max-age=31536000, immutable',
+      'x-content-type-options': 'nosniff',
     })
     res.end(file.data)
   })
 
-  /** 后台看截图：判定这一步达没达到预期，并把读到的内容记下来。 */
+  /**
+   * 后台看截图：判定这一步达没达到预期，并把读到的内容记下来。
+   * 排队执行：QB 还在看上一张时又贴一张，两张都要被看。
+   */
   function startImageJudge(step: Step, evidenceId: string, imageName: string, taskId: string | null): void {
-    jobs.start('judge', step.id, async (report) => {
-      report('QB 在看截图')
-      const image = await attachments.read(imageName)
-      if (image === null) throw new Error('截图文件不见了')
+    jobs.start(
+      'judge',
+      step.id,
+      async (report) => {
+        report('QB 在看截图')
+        const image = await attachments.read(imageName)
+        if (image === null) throw new Error('截图文件不见了')
 
-      const result = await llm.structured({
-        purpose: 'vision',
-        name: 'judgement',
-        system:
-          '你是 QB。用户执行完一步后贴回了截图。只依据图里看得到的内容，判断这一步是否达到了预期。看不出来就说看不出来，不要猜。',
-        prompt: [
-          `这一步：${step.title}`,
-          step.command !== null ? `命令：${step.command}` : '',
-          `预期：${describeExpectation(step.expectation as Expectation)}`,
-        ]
-          .filter(Boolean)
-          .join('\n'),
-        images: [{ data: image.data, mediaType: image.mediaType }],
-        schema: JudgeSchema,
-      })
-
-      const { verdict, reason, seen } = result.output
-      if (seen.trim() !== '') store.setEvidenceText(evidenceId, `QB 看到：${seen.trim()}`)
-
-      const current = store.getStep(step.id)
-      if (current !== null && verdict !== 'unclear' && current.status !== 'running') {
-        store.updateStepStatus(step.id, verdict === 'pass' ? 'ok' : 'failed', { endedAt: Date.now() })
-        ws.broadcast({ type: 'step.status', stepId: step.id, status: verdict === 'pass' ? 'ok' : 'failed' })
-      }
-      if (taskId !== null) {
-        store.appendEvent({
-          taskId,
-          stepId: step.id,
-          actorId: null,
-          kind: verdict === 'fail' ? 'step_failed' : 'step_ok',
-          payload: { source: 'image', by: 'qb', verdict, reason, model: result.model },
+        const result = await llm.structured({
+          purpose: 'vision',
+          name: 'judgement',
+          system:
+            '你是 QB。用户执行完一步后贴回了截图。只依据图里看得到的内容，判断这一步是否达到了预期。看不出来就说看不出来，不要猜。',
+          prompt: [
+            `这一步：${step.title}`,
+            step.command !== null ? `命令：${step.command}` : '',
+            `预期：${describeExpectation(step.expectation as Expectation)}`,
+          ]
+            .filter(Boolean)
+            .join('\n'),
+          images: [{ data: image.data, mediaType: image.mediaType }],
+          schema: JudgeSchema,
         })
-        ws.broadcast({ type: 'runbook.changed', taskId, stepId: step.id })
-      }
-      return { verdict, reason, seen }
-    })
+
+        const { verdict, reason, seen } = result.output
+        if (seen.trim() !== '') store.setEvidenceText(evidenceId, `QB 看到：${seen.trim()}`)
+
+        // 人的判断不被机器否决：看图期间用户若已动手（完成/跳过/失败/
+        // 又跑起来了），只把 QB 看到的记下来，不改状态
+        const current = store.getStep(step.id)
+        const applied = current !== null && verdict !== 'unclear' && current.status === 'pending'
+        if (applied) {
+          store.updateStepStatus(step.id, verdict === 'pass' ? 'ok' : 'failed', { endedAt: Date.now() })
+          ws.broadcast({ type: 'step.status', stepId: step.id, status: verdict === 'pass' ? 'ok' : 'failed' })
+        }
+        if (taskId !== null) {
+          store.appendEvent({
+            taskId,
+            stepId: step.id,
+            actorId: null,
+            kind: verdict === 'fail' ? 'step_failed' : 'step_ok',
+            payload: { source: 'image', by: 'qb', verdict, reason, applied, model: result.model },
+          })
+          ws.broadcast({ type: 'runbook.changed', taskId, stepId: step.id })
+        }
+        return { verdict, reason, seen }
+      },
+      { queue: true },
+    )
   }
 
   /**

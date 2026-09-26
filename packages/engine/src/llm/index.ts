@@ -3,7 +3,7 @@
  */
 
 import { bindModel } from './models.ts'
-import type { ModelProfile, Purpose } from './profiles.ts'
+import type { JsonMode, ModelProfile, Purpose } from './profiles.ts'
 import { LlmError, type Llm, type PurposeStatus, type StructuredCall, type StructuredResult } from './port.ts'
 import { runStructured } from './structured.ts'
 
@@ -45,7 +45,7 @@ export function createLlm(source: ProfileSource): Llm {
           `「${profile.name}」测试时看不了图。到「设置 · 模型」给"看截图"选一个能看图的档案。`,
         )
       }
-      return runStructured(bindModel(profile), profile, call)
+      return runStructured(bindModel(profile, jsonModeOverride(profile)), profile, call)
     },
 
     status(purpose: Purpose): PurposeStatus {
@@ -62,3 +62,17 @@ export function createLlm(source: ProfileSource): Llm {
 }
 
 export { LlmError, type Llm, type StructuredCall, type StructuredResult } from './port.ts'
+
+/**
+ * "测试连接"探明的结构化方式要落到实际调用上：只支持 json_object 的
+ * 端点（部分 OpenAI 兼容服务）若仍按 json_schema 请求，每次都会失败。
+ * 本机档案在保存能力时已把 jsonMode 写进 options；环境变量档案是只读的，
+ * 靠这里的运行时覆盖兜住。
+ */
+function jsonModeOverride(profile: ModelProfile): { jsonMode?: JsonMode } {
+  const caps = profile.capabilities
+  if (profile.wire === 'openai-compatible' && caps?.structured.ok === true && caps.structured.jsonMode !== undefined) {
+    return { jsonMode: caps.structured.jsonMode }
+  }
+  return {}
+}

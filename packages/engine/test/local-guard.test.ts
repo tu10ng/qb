@@ -33,6 +33,17 @@ describe('本机引擎的请求守卫', () => {
     expect(guard.http(req('POST', { host: '127.0.0.1:3080', origin: 'null', 'content-type': 'application/json' }))).toMatch(/来源/)
   })
 
+  it('本机其他端口的页面也拒：端口要对上（否则任意本地端口都能连 WS 读广播）', () => {
+    expect(guard.http(req('GET', { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:9999' }))).toMatch(/跨端口/)
+    expect(guard.upgrade(req('GET', { host: '127.0.0.1:3080', origin: 'http://localhost:9999' }))).toMatch(/跨端口/)
+    // 端口一致（哪怕主机名写法不同）放行
+    expect(guard.upgrade(req('GET', { host: '127.0.0.1:3080', origin: 'http://localhost:3080' }))).toBeNull()
+  })
+
+  it('Host 带 userinfo 的把戏：按 URL 语义解析，不认 localhost 前缀', () => {
+    expect(guard.http(req('GET', { host: 'localhost:3080@evil.example.com' }))).toMatch(/Host/)
+  })
+
   it('写操作必须是 application/json：挡住不触发预检的"简单请求"', () => {
     expect(guard.http(req('POST', { host: '127.0.0.1:3080', 'content-type': 'text/plain' }))).toMatch(/application\/json/)
     expect(guard.http(req('DELETE', { host: '127.0.0.1:3080' }))).toMatch(/application\/json/)

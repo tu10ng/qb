@@ -51,3 +51,16 @@ export function sanitizeText(input: string): string {
 export function hasLoneSurrogate(input: string): boolean {
   return sanitizeText(input) !== input
 }
+
+/**
+ * 落库前把超长文本截成尾部一段。
+ *
+ * 证据的价值集中在尾部（报错在最后），而且整份详情接口会把所有证据
+ * 一起返回：一条几十 MB 的构建日志足以让响应和界面卡死。保留尾部、
+ * 在开头注明截掉了多少。
+ */
+export function tailCap(input: string, maxChars: number): { text: string; truncated: boolean } {
+  if (input.length <= maxChars) return { text: input, truncated: false }
+  const dropped = input.length - maxChars
+  return { text: `……（前面 ${dropped} 字符已截断）\n${input.slice(-maxChars)}`, truncated: true }
+}

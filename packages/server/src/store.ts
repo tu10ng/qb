@@ -434,23 +434,29 @@ export class Store {
   updateStepStatus(
     stepId: string,
     status: StepStatus,
-    extra: { startedAt?: number; endedAt?: number; actualMs?: number; note?: string | null } = {},
+    extra: { startedAt?: number; endedAt?: number; actualMs?: number; note?: string | null; resetTimings?: boolean } = {},
   ): void {
-    // note 只在显式给出时覆盖：自动判定的状态变化不该抹掉人写的原因
+    // note 只在显式给出时覆盖：自动判定的状态变化不该抹掉人写的原因。
+    // resetTimings（重置为未开始）则把三个时间字段清空——留着旧耗时
+    // 会让"重来一遍"的步骤显示上一次的用时。
     const setNote = extra.note !== undefined
+    const reset = extra.resetTimings === true ? 1 : 0
     this.db
       .prepare(
         `UPDATE steps SET status = ?,
-           started_at  = COALESCE(?, started_at),
-           ended_at    = COALESCE(?, ended_at),
-           actual_ms   = COALESCE(?, actual_ms),
+           started_at  = CASE WHEN ? THEN NULL ELSE COALESCE(?, started_at) END,
+           ended_at    = CASE WHEN ? THEN NULL ELSE COALESCE(?, ended_at) END,
+           actual_ms   = CASE WHEN ? THEN NULL ELSE COALESCE(?, actual_ms) END,
            status_note = CASE WHEN ? THEN ? ELSE status_note END
          WHERE id = ?`,
       )
       .run(
         status,
+        reset,
         extra.startedAt ?? null,
+        reset,
         extra.endedAt ?? null,
+        reset,
         extra.actualMs ?? null,
         setNote ? 1 : 0,
         extra.note ?? null,
@@ -614,6 +620,24 @@ export class Store {
       return { ids, deletedAt }
     })
     return run()
+  }
+
+  /**
+   * 一步连同其子树的全部 id（不含已删除的行——正在执行的行不可能是
+   * 已删除的）。删除章节前用它检查有没有正在跑的子孙。
+   */
+  subtreeIds(stepId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE sub AS (
+           SELECT id FROM steps WHERE id = ?
+           UNION ALL
+           SELECT s.id FROM steps s JOIN sub ON s.parent_id = sub.id WHERE s.deleted_at IS NULL
+         )
+         SELECT id FROM sub`,
+      )
+      .all(stepId) as Array<{ id: string }>
+    return rows.map((r) => r.id)
   }
 
   /** 撤销删除：恢复这一步和同一次被删掉的子步骤。 */

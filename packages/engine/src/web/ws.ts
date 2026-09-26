@@ -96,14 +96,47 @@ export function createWsHandler(opts: WsServerOptions = {}) {
     socket.on('close', cleanup)
 
     // 只解析控制帧：客户端的 close 要回应，ping 要 pong。
-    // 业务上浏览器不往这条连接发数据，所以不实现完整的分片重组。
-    socket.on('data', (buf: Buffer) => {
-      if (buf.length < 2) return
-      const opcode = buf[0]! & 0x0f
-      if (opcode === 0x8) {
-        cleanup()
-      } else if (opcode === 0x9) {
-        socket.write(Buffer.from([0x8a, 0x00])) // pong
+    // 业务上浏览器不往这条连接发数据，所以不解析数据帧；但 TCP 分片
+    // 可能把一个帧拆到多个 data 事件里，必须先攒够再判——按前两字节
+    // 硬判会把分片的 ping 漏掉、把别人的残片当 opcode。
+    let frameBuf = Buffer.alloc(0)
+    socket.on('data', (chunk: Buffer) => {
+      frameBuf = Buffer.concat([frameBuf, chunk])
+
+      while (frameBuf.length >= 2) {
+        const opcode = frameBuf[0]! & 0x0f
+        const masked = (frameBuf[1]! & 0x80) !== 0
+        let len = frameBuf[1]! & 0x7f
+        let off = 2
+
+        if (len === 126) {
+          if (frameBuf.length < 4) return
+          len = frameBuf.readUInt16BE(2)
+          off = 4
+        } else if (len === 127) {
+          if (frameBuf.length < 10) return
+          len = Number(frameBuf.readBigUInt64BE(2))
+          off = 10
+        }
+        const maskLen = masked ? 4 : 0
+        if (frameBuf.length < off + maskLen + len) return
+
+        if (opcode === 0x8) {
+          cleanup()
+          return
+        }
+        if (opcode === 0x9) {
+          // pong 要回显 ping 的负载；客户端发来的帧是掩码的，先解开
+          const mask = frameBuf.subarray(off, off + maskLen)
+          const payload = Buffer.from(frameBuf.subarray(off + maskLen, off + maskLen + len))
+          if (masked) for (let i = 0; i < payload.length; i++) payload[i] = payload[i]! ^ mask[i % 4]!
+          const head = Buffer.alloc(2)
+          head[0] = 0x8a
+          head[1] = payload.length
+          socket.write(Buffer.concat([head, payload]))
+        }
+        // 其余帧（数据帧）忽略，只消费掉
+        frameBuf = frameBuf.subarray(off + maskLen + len)
       }
     })
 

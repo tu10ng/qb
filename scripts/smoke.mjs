@@ -166,13 +166,19 @@ async function main() {
           command: 'rm -rf /tmp/qb-smoke-nonexistent',
           timeoutMs: 5000,
         },
+        {
+          kind: 'command',
+          title: '验证大输出被截断',
+          command: 'node -e "process.stdout.write(\'x\'.repeat(300000))"',
+          timeoutMs: 30000,
+        },
       ],
     }),
   })
   const rb = await rbRes.json()
-  check('能写入 runbook', rbRes.status === 201 && rb.steps?.length === 3, JSON.stringify(rb).slice(0, 200))
+  check('能写入 runbook', rbRes.status === 201 && rb.steps?.length === 4, JSON.stringify(rb).slice(0, 200))
 
-  const [okStep, timeoutStep, dangerStep] = rb.steps ?? []
+  const [okStep, timeoutStep, dangerStep, bigStep] = rb.steps ?? []
 
   // 1) 正常执行 + 预期判定 + 流式输出
   const run1 = await fetch(`${API}/steps/${okStep.id}/run`, {
@@ -245,6 +251,34 @@ async function main() {
     body: JSON.stringify({ confirmed: true }),
   })
   check('确认后放行', allowed.status === 202, `status ${allowed.status}`)
+
+  // 4.5) 大文本：粘贴 300KB，落库截到尾部 64KB 并注明
+  //     （自动执行路径看不到这条——dsh 自己先把输出截到 64KB）
+  if (bigStep !== undefined) {
+    const pasted = await fetch(`${API}/steps/${bigStep.id}/evidence`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'x'.repeat(300000) }),
+    })
+    const bigDetail = await (await fetch(`${API}/tasks/${task.id}/runbook`)).json()
+    const bigEvidence = (bigDetail.evidence[bigStep.id] ?? []).at(-1)
+    check(
+      '大输出截断落库',
+      pasted.status === 201 &&
+        typeof bigEvidence?.text === 'string' &&
+        bigEvidence.text.startsWith('……（前面') &&
+        bigEvidence.text.length <= 64 * 1024 + 60,
+      `len=${bigEvidence?.text?.length} 开头=${bigEvidence?.text?.slice(0, 20)}`,
+    )
+  }
+
+  // 4.6) 超大请求体：413 而不是 500
+  const tooBig = await fetch(`${API}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: 'x'.repeat(9 * 1024 * 1024),
+  })
+  check('请求体超限回 413', tooBig.status === 413, `status ${tooBig.status}`)
 
   // ── M6：原地编辑 ────────────────────────────────────────
   const json = (method, path, body) =>

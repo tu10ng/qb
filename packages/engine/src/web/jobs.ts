@@ -36,6 +36,8 @@ export interface JobEvents {
 export class Jobs {
   private readonly jobs = new Map<string, Job>()
   private readonly events: JobEvents
+  /** 每个 (kind, subject) 上的串行链：排队任务等前一个做完再跑。 */
+  private readonly chains = new Map<string, Promise<unknown>>()
   private seq = 0
 
   constructor(events: JobEvents) {
@@ -45,19 +47,23 @@ export class Jobs {
   /**
    * 启动一个后台任务。
    *
-   * @param dedupeKey 同一个 subject 上同类任务只跑一个——用户连点两次
-   *   "让 QB 起草"不该产生两份 runbook。
+   * @param opts.dedupeKey 同一个 subject 上同类任务只跑一个——用户连点
+   *   两次"让 QB 起草"不该产生两份 runbook。
+   * @param opts.queue 已有一个在跑时排队而不是返回它：连贴两张截图，
+   *   第二张也要被看，不能因为第一张还在看就被静默吞掉。
    */
   start<T>(
     kind: string,
     subjectId: string,
     work: (report: (progress: string) => void) => Promise<T>,
+    opts: { queue?: boolean } = {},
   ): { job: Job; existing: boolean } {
     const running = [...this.jobs.values()].find(
       (j) => j.kind === kind && j.subjectId === subjectId && j.status === 'running',
     )
-    if (running !== undefined) return { job: running, existing: true }
+    if (running !== undefined && opts.queue !== true) return { job: running, existing: true }
 
+    const chainKey = `${kind}:${subjectId}`
     const job: Job = {
       id: `job_${++this.seq}`,
       kind,
@@ -83,7 +89,21 @@ export class Jobs {
       }
     }
 
-    void work(report)
+    // 排在同类任务之后串行执行；没有前驱时立刻跑
+    const chained = (this.chains.get(chainKey) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => work(report))
+    this.chains.set(chainKey, chained)
+
+    // 链清理挂在已吞掉 rejection 的分支上，别让它变成 unhandled rejection
+    chained.then(
+      () => undefined,
+      () => undefined,
+    ).finally(() => {
+      if (this.chains.get(chainKey) === chained) this.chains.delete(chainKey)
+    })
+
+    void chained
       .then((result) => {
         job.status = 'done'
         job.result = result

@@ -35,6 +35,10 @@ export function useHistory() {
       await entry.undo()
       future.current.push(entry)
       return entry.label
+    } catch (e) {
+      // 失败时放回去：否则这一条从两个栈里都消失，Ctrl+Z 没法重试
+      past.current.push(entry)
+      throw e
     } finally {
       bump()
     }
@@ -47,6 +51,9 @@ export function useHistory() {
       await entry.redo()
       past.current.push(entry)
       return entry.label
+    } catch (e) {
+      future.current.push(entry)
+      throw e
     } finally {
       bump()
     }

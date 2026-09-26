@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Event, Step, Task } from '@qb/core'
 import {
+  dropPosition,
+  insertionAfter,
+  insertionAtEnd,
+  isSection,
+  movedPosition,
+  positionOf,
+  type MoveDirection,
+  type Position,
+} from '@qb/core'
+import {
   ApiError,
   api,
   connectEvents,
@@ -15,16 +25,6 @@ import {
 import { StepCell, formatMs, type StepActions, type StepRunState } from './StepCell.tsx'
 import { Settings } from './Settings.tsx'
 import { useHistory } from './history.ts'
-import {
-  dropPosition,
-  insertionAfter,
-  insertionAtEnd,
-  isSection,
-  movedPosition,
-  positionOf,
-  type MoveDirection,
-  type Position,
-} from './tree.ts'
 
 /** 大纲里拖拽步骤时 dataTransfer 用的类型。 */
 const DRAG_TYPE = 'application/x-qb-step'
@@ -157,6 +157,12 @@ export function App() {
           setPartials((p) => ({ ...p, [e.subjectId]: e.steps }))
           break
       }
+    },
+    // 每次连上（含断线重连）都重拉一次：断线期间的完成/失败事件补不
+    // 回来，重拉数据是唯一可靠的恢复方式
+    () => {
+      void refreshTasks()
+      if (activeRef.current !== null) void refreshDetail(activeRef.current)
     })
   }, [refreshDetail, refreshTasks])
 
@@ -199,7 +205,9 @@ export function App() {
     async (step: Step, patch: StepPatchInput, record = true): Promise<void> => {
       const before = Object.fromEntries(Object.keys(patch).map((k) => [k, step[k as keyof Step]])) as StepPatchInput
       try {
-        await api.updateStep(step.id, step.rev, patch)
+        // rev 从最新数据取：快速连改同一步两个字段时，第二次用的是刷新后的 rev，
+        // 不会因为自己上一次的修改而 409
+        await withFreshRev(step.id, (rev) => api.updateStep(step.id, rev, patch))
       } catch (e) {
         if (e instanceof ApiError && e.conflict !== null) {
           await reload()
@@ -388,8 +396,8 @@ export function App() {
 
   const uploadImage = useCallback(
     async (step: Step, file: File): Promise<void> => {
-      if (file.size > 6 * 1024 * 1024) {
-        toast(`图片太大（${Math.round(file.size / 1024)} KB），上限 6 MB`, { tone: 'error' })
+      if (file.size > 5 * 1024 * 1024) {
+        toast(`图片太大（${Math.round(file.size / 1024)} KB），上限 5 MB`, { tone: 'error' })
         return
       }
       try {
@@ -571,7 +579,7 @@ export function App() {
             if (id !== editTarget) setEditTarget(null)
           }}
           onInsert={(pos) => void insertAt(pos)}
-          onDrop={(dragged, target) => void moveTo(dragged, dropPosition(target, dragged))}
+          onDrop={(dragged, target) => void moveTo(dragged, dropPosition(steps, target, dragged))}
           onChanged={() => void reload()}
           onOpenSettings={() => setView('settings')}
           toast={toast}
@@ -720,6 +728,24 @@ function TaskPage({
         </nav>
 
         <main className="runbook">
+          {/* 重新起草也流式显示：不用等整份写完才知道 QB 在写什么 */}
+          {draftJob?.status === 'running' && steps.length > 0 && (
+            <div className="redrafting">
+              <p style={{ color: 'var(--text-dim)', margin: '0 0 6px' }}>
+                QB 正在重新起草……{draftJob.progress ?? ''}（现在的 runbook 仍在，替换前会留快照）
+              </p>
+              {partial.map((s, i) => (
+                <div className="ghost-step" key={i}>
+                  {(i === 0 || partial[i - 1]!.section !== s.section) && s.section !== '' && (
+                    <div className="ghost-section">{s.section}</div>
+                  )}
+                  <div className="ghost-title">○ {s.title}</div>
+                  {s.command !== undefined && <pre className="ghost-cmd">{s.command}</pre>}
+                </div>
+              ))}
+            </div>
+          )}
+
           {runbook !== null && runbook.assumptions.length > 0 && (
             <div className="assumptions">
               <h3>假设</h3>
@@ -785,7 +811,14 @@ function TaskPage({
               className="btn"
               title="临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人"
               onClick={() => {
-                void navigator.clipboard.writeText(askText(task, current, current !== null ? (detail.evidence[current.id] ?? []) : []))
+                void navigator.clipboard.writeText(
+                  askText(
+                    task,
+                    current,
+                    current !== null ? (detail.evidence[current.id] ?? []) : [],
+                    current !== null ? detail.events : [],
+                  ),
+                )
                 toast('求助内容已复制，贴到 IM 里发给发起人（临时 · 复制到 IM）')
               }}
             >
@@ -997,10 +1030,15 @@ function titleFromCommand(line: string): string {
 }
 
 /**
- * 求助文本（临时 · 复制到 IM）：目标、卡在哪一步、命令、输出尾部。
- * 发起人不用追问上下文就能回答。
+ * 求助文本（临时 · 复制到 IM）：目标、卡在哪一步、命令、输出尾部、
+ * 已经试过什么。发起人不用追问上下文就能回答。
  */
-function askText(task: Task, step: Step | null, evidence: Array<{ text: string | null; imagePath: string | null }>): string {
+function askText(
+  task: Task,
+  step: Step | null,
+  evidence: Array<{ text: string | null; imagePath: string | null }>,
+  events: Event[],
+): string {
   const lines = [`【求助】${task.title}`]
   if (step !== null) {
     lines.push(`卡在：${step.title}${step.statusNote !== null ? `（${step.statusNote}）` : ''}`)
@@ -1011,8 +1049,23 @@ function askText(task: Task, step: Step | null, evidence: Array<{ text: string |
       lines.push(`现象（输出尾部）：\n${tail}`)
     }
     if (evidence.some((e) => e.imagePath !== null)) lines.push('（我这边还有截图，需要的话发你）')
+
+    // 已经试过什么：最近在这条步骤上的失败、超时和改动
+    const tried = events
+      .filter((e) => e.stepId === step.id && (e.kind === 'step_failed' || e.kind === 'step_timeout' || e.kind === 'edit'))
+      .slice(-3)
+      .map((e) => {
+        if (e.kind === 'step_timeout') return '等到超时'
+        if (e.kind === 'step_failed') {
+          const r = typeof e.payload.reason === 'string' && e.payload.reason !== '' ? `（${e.payload.reason}）` : ''
+          return `失败${r}`
+        }
+        const changes = Array.isArray(e.payload.changes) ? (e.payload.changes as Array<{ field: string }>) : []
+        return changes.some((c) => c.field === 'command') ? '改过命令' : '改过这步'
+      })
+    lines.push(`我试过：${tried.length > 0 ? tried.join('；') : '（还没试过别的办法）'}`)
   }
-  lines.push('我试过：', '—— QB 整理')
+  lines.push('—— QB 整理')
   return lines.join('\n')
 }
 
@@ -1107,8 +1160,10 @@ function eventText(e: Event, steps: Step[]): string {
       return `删除了${which}`
     case 'step_restored':
       return `恢复了${which}`
-    case 'replanned':
-      return `${byQb ? 'QB ' : ''}${reason !== '' ? reason : '重新规划'}`
+    case 'replanned': {
+      const dropped = typeof payload.dropped === 'number' && payload.dropped > 0 ? `（${payload.dropped} 个步骤不合格式被丢弃）` : ''
+      return `${byQb ? 'QB ' : ''}${reason !== '' ? reason : '重新规划'}${dropped}`
+    }
     case 'situation_changed':
       return `情况变了：${reason}`
     default:

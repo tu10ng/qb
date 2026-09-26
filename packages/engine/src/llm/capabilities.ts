@@ -32,10 +32,13 @@ export async function testProfile(
     structured: { ok: false },
     vision: { ok: false },
   }
+  // 探测一律限时 60 秒：哪怕档案把超时配到 4 分钟，"测试连接"也不该
+  // 让用户等那么久才发现填错了地址
+  const probeProfile: ModelProfile = { ...profile, options: { ...profile.options, timeoutMs: 60_000 } }
 
   // 1. 连通、鉴权、模型名
   report('连通与鉴权…')
-  const bound = bindModel(profile)
+  const bound = bindModel(probeProfile)
   let t0 = Date.now()
   try {
     const r = await generateText({
@@ -60,7 +63,7 @@ export async function testProfile(
     let partials = 0
     let firstPartialMs: number | undefined
     try {
-      const res = await runStructured(bindModel(profile, mode === undefined ? {} : { jsonMode: mode }), profile, {
+      const res = await runStructured(bindModel(probeProfile, mode === undefined ? {} : { jsonMode: mode }), probeProfile, {
         purpose: 'structure',
         name: 'probe',
         system: '你在帮忙测试接口。严格按要求的格式输出。',

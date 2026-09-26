@@ -28,12 +28,16 @@ export function createLocalGuard(extraHosts: () => string[] = () => []): LocalGu
 
   const checkHostAndOrigin = (req: IncomingMessage): string | null => {
     const host = req.headers.host
-    if (!allowed(hostnameOf(host))) return `拒绝：Host ${host ?? '(空)'} 不是本机地址`
+    const hostName = hostnameOf(host)
+    if (!allowed(hostName)) return `拒绝：Host ${host ?? '(空)'} 不是本机地址`
 
     const origin = req.headers.origin
     if (origin === undefined) return null
     if (origin === 'null') return '拒绝：来源不明的请求'
     if (!allowed(hostnameOfUrl(origin))) return `拒绝：来自 ${origin} 的跨站请求`
+    // 端口也要对上：本机其他端口上的页面同样不该读我们的数据（写路径
+    // 有 content-type 挡着，但 WS 广播和 GET 读取只靠这一层）
+    if (portOfUrl(origin) !== portOf(host)) return `拒绝：来自 ${origin} 的跨端口请求`
     return null
   }
 
@@ -54,14 +58,39 @@ export function createLocalGuard(extraHosts: () => string[] = () => []): LocalGu
   }
 }
 
-/** "127.0.0.1:3080" → "127.0.0.1"；"[::1]:3080" → "[::1]"。 */
+/**
+ * "127.0.0.1:3080" → "127.0.0.1"；"[::1]:3080" → "[::1]"。
+ * 用 URL 解析而不是切分：`localhost:3080@evil.com` 这种带 userinfo 的
+ * Host 头，按冒号切会把 "localhost" 当主机名，实际指向的是 evil.com。
+ */
 function hostnameOf(hostHeader: string | undefined): string | null {
   if (hostHeader === undefined || hostHeader === '') return null
-  if (hostHeader.startsWith('[')) {
-    const end = hostHeader.indexOf(']')
-    return end < 0 ? null : hostHeader.slice(0, end + 1)
+  try {
+    const h = new URL(`http://${hostHeader}`).hostname.toLowerCase()
+    // Node 的 URL 对 IPv6 主机名保留方括号；没带的补上，统一成 [::1] 形式
+    return h.includes(':') ? (h.startsWith('[') ? h : `[${h}]`) : h
+  } catch {
+    return null
   }
-  return hostHeader.split(':')[0]!.toLowerCase()
+}
+
+/** "127.0.0.1:3080" → 3080；没写端口返回 null（由调用方按 80 对齐）。 */
+function portOf(hostHeader: string | undefined): number | null {
+  if (hostHeader === undefined || hostHeader === '') return null
+  try {
+    return new URL(`http://${hostHeader}`).port === '' ? null : Number(new URL(`http://${hostHeader}`).port)
+  } catch {
+    return null
+  }
+}
+
+function portOfUrl(origin: string): number | null {
+  try {
+    const p = new URL(origin).port
+    return p === '' ? null : Number(p)
+  } catch {
+    return null
+  }
 }
 
 function hostnameOfUrl(url: string): string | null {

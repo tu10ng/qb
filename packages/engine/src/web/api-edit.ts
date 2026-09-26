@@ -173,8 +173,11 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
       sendJson(res, 404, { error: 'not_found', message: '步骤不存在或已删除' })
       return
     }
-    if (deps.isRunning(stepId)) {
-      sendJson(res, 409, { error: 'running', message: '这一步正在执行，先取消再删' })
+    // 查整棵子树，不只是这一步：删掉"子步骤正在跑"的章节，跑完后会把
+    // 状态和证据写进已隐藏的行
+    const runningChild = store.subtreeIds(stepId).find((id) => deps.isRunning(id))
+    if (runningChild !== undefined) {
+      sendJson(res, 409, { error: 'running', message: '这一步或它的子步骤正在执行，先取消再删' })
       return
     }
 
@@ -227,7 +230,7 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
     const status: StepStatus = parsed.data.status
     const note = parsed.data.note?.trim() ?? ''
     store.updateStepStatus(stepId, status, {
-      ...(status === 'pending' ? {} : { endedAt: Date.now() }),
+      ...(status === 'pending' ? { resetTimings: true } : { endedAt: Date.now() }),
       note: note === '' ? null : note,
     })
     store.markTaskStarted(taskId, currentUserId())

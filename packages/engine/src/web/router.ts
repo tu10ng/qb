@@ -98,6 +98,23 @@ export class Router {
 
       sendJson(res, 404, { error: 'not_found', path })
     } catch (e) {
+      if (e instanceof BodyTooLarge) {
+        // 413 而不是 500：这是用户的输入问题，说清楚一点。
+        // 不能直接掐断连接——客户端还在传请求体，掐了会让它的 fetch 变
+        // 成 ECONNRESET 而不是收到 413。排空剩余字节，用 Connection:
+        // close 收尾。
+        if (!res.headersSent) {
+          const msg = JSON.stringify({ error: 'too_large', message: e.message })
+          res.writeHead(413, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': Buffer.byteLength(msg),
+            connection: 'close',
+          })
+          res.end(msg)
+          req.resume()
+        }
+        return
+      }
       // 处理函数没写 header 时才好发错误响应
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'internal', message: errMessage(e) })
@@ -125,6 +142,9 @@ function matchSegments(pattern: string[], actual: string[]): Record<string, stri
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024 // 贴图可能不小
 
+/** 请求体超过上限。路由层据此回 413 而不是笼统的 500。 */
+class BodyTooLarge extends Error {}
+
 async function readBody(req: IncomingMessage): Promise<unknown> {
   const method = req.method ?? 'GET'
   if (method === 'GET' || method === 'HEAD') return undefined
@@ -135,7 +155,7 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
     const buf = chunk as Buffer
     total += buf.length
     if (total > MAX_BODY_BYTES) {
-      throw new Error(`请求体超过 ${MAX_BODY_BYTES} 字节`)
+      throw new BodyTooLarge(`请求体超过 ${MAX_BODY_BYTES / 1024 / 1024} MB（贴的图或粘贴的内容太大）`)
     }
     chunks.push(buf)
   }

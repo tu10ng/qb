@@ -459,6 +459,28 @@ describe('编辑：原地修改', () => {
     expect(store.getStep(a.id)!.statusNote).toBe('这台机器已经装过了')
   })
 
+  it('重置为未开始时清掉时间戳——否则步骤显示上一次的耗时', () => {
+    const { by } = seed()
+    const a = by('a')
+    store.updateStepStatus(a.id, 'running', { startedAt: 1000 })
+    store.updateStepStatus(a.id, 'ok', { endedAt: 4000, actualMs: 3000 })
+    store.updateStepStatus(a.id, 'pending', { resetTimings: true })
+
+    const after = store.getStep(a.id)!
+    expect(after.startedAt).toBeNull()
+    expect(after.endedAt).toBeNull()
+    expect(after.actualMs).toBeNull()
+  })
+
+  it('subtreeIds 返回整棵子树', () => {
+    const { by } = seed()
+    const ids = store.subtreeIds(by('1 准备').id)
+    expect(ids).toHaveLength(3)
+    expect(ids).toContain(by('a').id)
+    expect(ids).toContain(by('b').id)
+    expect(store.subtreeIds(by('a').id)).toEqual([by('a').id])
+  })
+
   it('大改前的快照', () => {
     const { runbook, titles } = seed()
     store.snapshotRunbook(runbook.id, '导入前', me)
