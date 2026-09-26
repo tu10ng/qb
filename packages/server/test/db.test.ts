@@ -174,6 +174,49 @@ describe('数据库 schema', () => {
     }
   })
 
+  it('v2 的库升级到 v3：假设迁成参数，素材表与任务索引可用', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qb-migrate3-'))
+    const path = join(dir, 'old.db')
+    try {
+      // 手工造一个 v2 库（只应用前两个迁移）
+      const old = new Database(path)
+      old.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+      for (const m of MIGRATIONS.slice(0, 2)) {
+        old.exec(m.sql)
+        old.prepare('INSERT INTO schema_migrations VALUES (?, ?, 1)').run(m.version, m.name)
+      }
+      old.exec(`
+        INSERT INTO users (id, name, display_name, created_at) VALUES ('u1','a','A',1);
+        INSERT INTO tasks (id, title, brief_md, initiator_id, assignee_id, status, created_at)
+          VALUES ('t1','在 X 集群部署 vLLM PD 分离','','u1','u1','done',1);
+        INSERT INTO runbooks (id, task_id, version, created_by, created_at, assumptions_json)
+          VALUES ('r1','t1',1,'u1',1,
+                  '[{"key":"集群","value":"X","editedByUser":false},{"key":"模型","value":"Qwen2.5-72B","editedByUser":false}]');
+      `)
+      old.close()
+
+      const db = openDb({ path })
+      // 假设 → 参数（qb_guess），数据不丢
+      const params = db.prepare('SELECT params_json FROM runbooks WHERE id = ?').get('r1') as { params_json: string }
+      const parsed = JSON.parse(params.params_json) as Array<{ name: string; value: string; source: string }>
+      expect(parsed).toEqual([
+        { name: '集群', value: 'X', source: 'qb_guess', secret: 0 },
+        { name: '模型', value: 'Qwen2.5-72B', source: 'qb_guess', secret: 0 },
+      ])
+      // 任务索引建好了且同步
+      expect(db.prepare(`SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH 'vllm'`).all()).toHaveLength(1)
+      db.close()
+    } finally {
+      // Windows 上偶发句柄释放延迟（EPERM）；临时目录留给 OS 清理即可，
+      // 清不掉不算测试失败
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      } catch {
+        /* 留给系统清理 */
+      }
+    }
+  })
+
   it('任务可以指向父步骤（递归委派）', () => {
     const db = openDb({ path: ':memory:' })
     db.exec(`

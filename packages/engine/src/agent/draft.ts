@@ -41,6 +41,7 @@ const FlatStep = z.object({
     .catch(undefined),
   minutes: z.number().positive().optional().describe('预计耗时，分钟，可以是小数').catch(undefined),
 })
+export type FlatStep = z.infer<typeof FlatStep>
 
 export const DraftSchema = z.object({
   assumptions: z
@@ -59,7 +60,7 @@ export const DraftSchema = z.object({
 
 type Flat = z.infer<typeof FlatStep>
 
-interface StepOut {
+export interface StepOut {
   kind: 'command' | 'check' | 'wait' | 'manual' | 'decision' | 'note'
   title: string
   whyMd?: string
@@ -70,6 +71,8 @@ interface StepOut {
   timeoutMs?: number
   expectedMinutes?: number
   children?: StepOut[]
+  /** 出处：素材里对应的那一小段（导入路径）。 */
+  sourceRef?: string
 }
 
 /** 按 section 把扁平列表还原成两层树。 */
@@ -107,8 +110,9 @@ const TIMEOUT_FACTOR = 3
 /** 没有耗时估计时的兜底超时。 */
 const FALLBACK_TIMEOUT_MS = 120_000
 
-function toStepOut(f: Flat): StepOut {
+function toStepOut(f: Flat & { source?: string }): StepOut {
   const step: StepOut = { kind: f.kind, title: f.title }
+  if (f.source !== undefined && f.source.trim() !== '') step.sourceRef = f.source.trim()
 
   if (f.why !== undefined && f.why.trim() !== '') step.whyMd = f.why
   if (f.command !== undefined && f.command.trim() !== '') step.command = f.command

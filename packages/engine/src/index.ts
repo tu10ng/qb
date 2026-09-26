@@ -56,6 +56,8 @@ export function apply(ctx: DshContext, config: Config): void {
     persona: readPrompt('qb-persona.md'),
     draft: readPrompt('draft.md'),
     diagnose: readPrompt('diagnose.md'),
+    import: readPrompt('import.md'),
+    adapt: readPrompt('adapt.md'),
   }
 
   const api = buildApi({

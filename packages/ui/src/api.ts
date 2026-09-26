@@ -1,4 +1,4 @@
-import type { Event, Evidence, Expectation, Runbook, Step, StepKind, Task, User } from '@qb/core'
+import type { Event, Evidence, Expectation, Param, Runbook, Step, StepKind, Task, User } from '@qb/core'
 
 const BASE = '/qb/api'
 
@@ -74,6 +74,42 @@ export interface TaskDetail {
   evidence: Record<string, Evidence[]>
   /** 进行中的后台任务（起草、看截图），刷新后接回进度。 */
   jobs: Job[]
+  /** M7：导入来的 runbook 的保真报告；参数一改会跟着变。 */
+  fidelity: FidelityView | null
+  /** 任务最近贴进来的素材（有它才能"从素材整理"）。 */
+  material: { id: string; kind: string; filename: string | null } | null
+}
+
+export interface FidelityView {
+  items: Array<{ stepId: string; verbatim: boolean; unverified: boolean; closest: string | null }>
+  uncoveredCount: number
+  materialId: string | null
+}
+
+export interface BaseSuggestion {
+  taskId: string
+  title: string
+  status: string
+  runbookId: string
+  version: number
+  updatedAt: number
+}
+
+export interface LiteralSuggestionView {
+  value: string
+  count: number
+  kind: string
+  suggestedName: string
+}
+
+export interface AdaptProposal {
+  paramChanges: Array<{ name: string; to: string; reason?: string }>
+  newParams: Array<{ name: string; value: string; description?: string }>
+  stepEdits: Array<{ stepIndex: number; command: string; reason?: string }>
+  obsolete: Array<{ what: string; reason?: string }>
+  questions: string[]
+  rejectedStepEdits: Array<{ stepIndex: number; reason: string }>
+  model: string
 }
 
 /** 起草时流式到达的步骤预览（还没落库）。 */
@@ -241,6 +277,72 @@ export const api = {
     req<{ stepId: string; status: string }>(`/steps/${stepId}/status`, {
       method: 'POST',
       body: JSON.stringify({ status, ...(note !== undefined ? { note } : {}) }),
+    }),
+
+  // ── M7：从已有的开始 + 参数 ───────────────────────────────
+
+  createMaterial: (taskId: string, input: { kind: string; text: string; filename?: string }) =>
+    req<{ id: string; createdAt: number }>(`/tasks/${taskId}/material`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** 模式 B：把贴进来的素材忠实整理成 runbook（后台任务，流式出步骤）。 */
+  importFromMaterial: (taskId: string, materialId: string) =>
+    req<{ jobId: string; existing: boolean }>(`/tasks/${taskId}/import`, {
+      method: 'POST',
+      body: JSON.stringify({ materialId }),
+    }),
+
+  /** 找底稿。 */
+  suggestBases: (q: string) =>
+    req<{ suggestions: BaseSuggestion[] }>(`/tasks/suggest-bases?q=${encodeURIComponent(q)}`).then(
+      (r) => r.suggestions,
+    ),
+
+  /** 模式 A 第一步：以一份 runbook 为基础复制（保留血缘与参数）。 */
+  basedOn: (taskId: string, runbookId: string) =>
+    req<{ runbook: Runbook; steps: Step[] }>(`/tasks/${taskId}/based-on`, {
+      method: 'POST',
+      body: JSON.stringify({ runbookId }),
+    }),
+
+  /** 差异提议（后台任务）；结果经 job.update 推送，不直接应用。 */
+  adapt: (taskId: string, message: string) =>
+    req<{ jobId: string; existing: boolean }>(`/tasks/${taskId}/adapt`, {
+      method: 'POST',
+      body: JSON.stringify({ message }),
+    }),
+
+  adaptApply: (
+    taskId: string,
+    input: {
+      paramChanges: Array<{ name: string; to: string }>
+      newParams: Array<{ name: string; value: string; description?: string }>
+      stepEdits: Array<{ stepId: string; command: string }>
+      reason?: string
+    },
+  ) => req<{ ok: boolean; summary: string }>(`/tasks/${taskId}/adapt/apply`, { method: 'POST', body: JSON.stringify(input) }),
+
+  updateParams: (taskId: string, params: Param[]) =>
+    req<{ params: Param[] }>(`/tasks/${taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params }) }),
+
+  suggestParams: (taskId: string) =>
+    req<{ suggestions: LiteralSuggestionView[] }>(`/tasks/${taskId}/params/suggest`, { method: 'POST' }).then(
+      (r) => r.suggestions,
+    ),
+
+  applySuggestions: (taskId: string, items: Array<{ value: string; name: string }>) =>
+    req<{ touchedSteps: number }>(`/tasks/${taskId}/params/apply-suggestions`, {
+      method: 'POST',
+      body: JSON.stringify({ items }),
+    }),
+
+  /** L0.5：贴一大段终端输出，按命令分回各步。 */
+  submitTranscript: (taskId: string, text: string) =>
+    req<{ matched: number; unmatched: string[] }>(`/tasks/${taskId}/transcript`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
     }),
 
   // ── 设置 · 模型 ─────────────────────────────────────────────

@@ -56,6 +56,27 @@ export const Assumption = z.object({
 })
 export type Assumption = z.infer<typeof Assumption>
 
+// ── 参数（M7）───────────────────────────────────────────────
+
+/**
+ * 参数值的来源——界面据此分组展示与高亮：
+ * origin=逐字来自贴进来的素材；base=从底稿复制；mine=用户改过；
+ * qb_guess=QB 猜的、待确认；env=从环境事实取的。
+ */
+export const ParamSource = z.enum(['origin', 'base', 'mine', 'qb_guess', 'env'])
+export type ParamSource = z.infer<typeof ParamSource>
+
+export const Param = z.object({
+  /** 大写下划线，模板里写 {{NAME}}。 */
+  name: z.string().regex(/^[A-Z][A-Z0-9_]*$/, '参数名要大写下划线'),
+  value: z.string(),
+  description: z.string().optional(),
+  source: ParamSource,
+  /** secret 只存本机：界面打码、证据脱敏、永不上传。 */
+  secret: z.boolean().default(false),
+})
+export type Param = z.infer<typeof Param>
+
 export const Runbook = z.object({
   id: Id,
   taskId: Id,
@@ -63,6 +84,16 @@ export const Runbook = z.object({
   createdBy: Id,
   createdAt: Timestamp,
   assumptions: z.array(Assumption),
+  /**
+   * 参数表（M7+）。命令模板里的 {{NAME}} 在这里取值。
+   * 空白起草走的仍是 assumptions；导入/底稿路径写 params。
+   */
+  params: z.array(Param).default([]),
+  /** 从哪份 runbook 复制/差异而来（模式 A 的"底稿"）。 */
+  baseRunbookId: Id.nullable(),
+  /** 这份 runbook 怎么来的：import=贴素材整理，copy=以底稿为基础，
+   * adapt=在底稿上应用过差异，draft=空白起草。 */
+  origin: z.enum(['import', 'copy', 'adapt', 'draft', 'human']).nullable(),
   sourceSkillId: Id.nullable(),
   sourceSkillVersion: z.number().int().positive().nullable(),
 })

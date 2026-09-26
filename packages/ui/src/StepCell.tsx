@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
-import type { Event, Evidence, Expectation, Step, StepKind } from '@qb/core'
-import { isSection, type MoveDirection } from '@qb/core'
-import { ApiError, api, evidenceImageUrl, type Diagnosis, type Job, type StepPatchInput } from './api.ts'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import type { Event, Evidence, Expectation, Param, Step, StepKind } from '@qb/core'
+import { isSection, PARAM_RE, renderCommand, type MoveDirection } from '@qb/core'
+import { ApiError, api, evidenceImageUrl, type Diagnosis, type FidelityView, type Job, type StepPatchInput } from './api.ts'
 import { Editable } from './Editable.tsx'
 
 export interface StepRunState {
@@ -31,6 +31,10 @@ interface Props {
   runState: StepRunState | undefined
   /** 历史证据（上次跑的输出、手动贴的内容、截图）。 */
   evidence: Evidence[]
+  /** 当前参数表：命令显示的是渲染值，编辑改的是模板。 */
+  params: Param[]
+  /** 这一步的保真检查结果（导入来的 runbook 才有）。 */
+  fidelity: FidelityView['items'][number] | undefined
   /** 这一步上正在跑的后台任务（QB 在看截图）。 */
   job: Job | undefined
   /** 最近一次内容编辑，悬停"我改的"时显示改前改后。 */
@@ -86,7 +90,7 @@ function SectionHead({ step, current, autoEdit, canMove, actions, onFocus }: Pro
   )
 }
 
-function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, canMove, actions, onFocus, onChanged }: Props) {
+function StepBody({ step, current, runState, evidence, params, fidelity, job, lastEdit, autoEdit, canMove, actions, onFocus, onChanged }: Props) {
   const [confirmed, setConfirmed] = useState(false)
   const [danger, setDanger] = useState<string[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -156,6 +160,7 @@ function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, 
   }
 
   const isDangerous = danger !== null
+  const rendered = step.command !== null ? renderCommand(step.command, params) : { text: '', missing: [] as string[], undeclared: [] as string[] }
   const badge = originBadge(step, lastEdit)
 
   return (
@@ -226,6 +231,7 @@ function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, 
                   multiline
                   mono
                   placeholder="＋ 命令"
+                  display={(template) => renderWithParams(template, params)}
                   onPasteIntoEmpty={offerSplit}
                   onSave={(v) => edit({ command: v === '' ? null : v })}
                 />
@@ -234,11 +240,12 @@ function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, 
                 <div className="actions">
                   <button
                     className="btn primary"
+                    title={rendered.missing.length > 0 ? `缺参数：${rendered.missing.join('、')}` : undefined}
                     onClick={(e) => {
                       e.stopPropagation()
                       void run()
                     }}
-                    disabled={running || (isDangerous && !confirmed)}
+                    disabled={running || (isDangerous && !confirmed) || rendered.missing.length > 0}
                   >
                     {running ? '运行中' : '▶ 运行'}
                   </button>
@@ -246,7 +253,7 @@ function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, 
                     className="btn"
                     onClick={(e) => {
                       e.stopPropagation()
-                      void navigator.clipboard.writeText(step.command!)
+                      void navigator.clipboard.writeText(rendered.text)
                     }}
                   >
                     ⧉ 复制
@@ -254,6 +261,34 @@ function StepBody({ step, current, runState, evidence, job, lastEdit, autoEdit, 
                 </div>
               )}
             </div>
+
+            {step.command !== null && rendered.missing.length > 0 && (
+              <div className="cmd-note">缺参数：{rendered.missing.join('、')} —— 在上面的参数面板里补上</div>
+            )}
+
+            {step.command !== null && fidelity !== undefined && !fidelity.verbatim && !fidelity.unverified && (
+              <div className="cmd-note fidelity" onClick={(e) => e.stopPropagation()}>
+                QB 改写过（与素材原文不一致）
+                {fidelity.closest !== null && (
+                  <>
+                    {' '}
+                    <button
+                      className="btn ghost"
+                      onClick={() => {
+                        if (window.confirm(`用素材原文替换这条命令？\n${fidelity.closest}`)) {
+                          edit({ command: fidelity.closest! })
+                        }
+                      }}
+                    >
+                      用原文
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            {step.command !== null && fidelity?.unverified === true && (
+              <div className="cmd-note">参数缺值，没法跟素材原文核对</div>
+            )}
 
             {splitOffer !== null && (
               <div className="inline-offer" onClick={(e) => e.stopPropagation()}>
@@ -718,6 +753,34 @@ function withExpectationText(e: Expectation | null, text: string, kind: StepKind
     case 'exitCode':
       return /^-?\d+$/.test(text) ? { kind: 'exitCode', code: Number(text) } : { kind: 'contains', text, caseSensitive: true }
   }
+}
+
+/** 模板 → 渲染值展示：参数带下划线（悬停显示名字），缺值标红。 */
+function renderWithParams(template: string, params: Param[]): ReactNode {
+  const byName = new Map(params.map((p) => [p.name, p]))
+  const out: ReactNode[] = []
+  let last = 0
+  let key = 0
+
+  for (const m of template.matchAll(PARAM_RE)) {
+    const idx = m.index ?? 0
+    if (idx > last) out.push(template.slice(last, idx))
+    const p = byName.get(m[1]!)
+    out.push(
+      p !== undefined && p.value !== '' ? (
+        <span key={key++} className="param-slot" title={m[1]}>
+          {p.value}
+        </span>
+      ) : (
+        <span key={key++} className="param-slot missing" title={`${m[1]}（缺值）`}>
+          {m[0]}
+        </span>
+      ),
+    )
+    last = idx + m[0].length
+  }
+  if (last < template.length) out.push(template.slice(last))
+  return <>{out}</>
 }
 
 function mark(step: Step, running: boolean): string {

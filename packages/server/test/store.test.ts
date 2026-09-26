@@ -289,7 +289,7 @@ describe('编辑：原地修改', () => {
     const { runbook, steps } = store.createRunbook({
       taskId: t.id,
       createdBy: me,
-      origin: 'qb',
+      origin: 'draft',
       steps: [
         {
           kind: 'note',
@@ -495,6 +495,84 @@ describe('编辑：原地修改', () => {
     store.appendEvent({ taskId: runbook.taskId, stepId: a.id, kind: 'edit', payload: { changes: [1] } })
     store.appendEvent({ taskId: runbook.taskId, stepId: a.id, kind: 'edit', payload: { changes: [2] } })
     expect(store.lastEditOf(a.id)!.payload.changes).toEqual([2])
+  })
+})
+
+describe('M7：参数 / 底稿 / 素材', () => {
+  const seedParams = () => {
+    const t = store.createTask({ title: '在 X 集群部署 vLLM PD 分离', briefMd: 'Qwen2.5-72B', initiatorId: me })
+    const { runbook, steps } = store.createRunbook({
+      taskId: t.id,
+      createdBy: me,
+      origin: 'import',
+      params: [
+        { name: 'DECODE_HOST', value: 'gpu-18', source: 'origin', secret: false },
+        { name: 'MODEL_PATH', value: '/data/models/Qwen2.5-72B', source: 'origin', secret: false },
+        { name: 'PROXY_IP', value: '10.0.3.17', source: 'origin', secret: false },
+      ],
+      steps: [
+        {
+          kind: 'note',
+          title: '1 启动',
+          children: [
+            { kind: 'command', title: '起 decode', command: 'ssh {{DECODE_HOST}} vllm serve {{MODEL_PATH}}', sourceRef: 'mat_x#L12' },
+          ],
+        },
+      ],
+    })
+    return { task: t, runbook, steps }
+  }
+
+  it('参数随 runbook 存取', () => {
+    const { runbook } = seedParams()
+    const loaded = store.getLatestRunbook(runbook.taskId)!.runbook
+    expect(loaded.params).toHaveLength(3)
+    expect(loaded.origin).toBe('import')
+    expect(loaded.params[0]).toMatchObject({ name: 'DECODE_HOST', value: 'gpu-18', source: 'origin' })
+  })
+
+  it('updateRunbookParams 覆盖参数并标记来源', () => {
+    const { runbook } = seedParams()
+    store.updateRunbookParams(runbook.id, [{ name: 'DECODE_HOST', value: 'gpu-19', source: 'mine', secret: false }])
+    const loaded = store.getLatestRunbook(runbook.taskId)!.runbook
+    expect(loaded.params).toEqual([{ name: 'DECODE_HOST', value: 'gpu-19', source: 'mine', secret: false }])
+  })
+
+  it('copyRunbook：血缘保留、步骤来源 base、参数来源 base、记下底稿', () => {
+    const { task, runbook, steps } = seedParams()
+    const t2 = store.createTask({ title: '在 Y 集群部署 PD 分离', briefMd: '', initiatorId: me })
+    const copied = store.copyRunbook(runbook.id, t2.id, me)
+
+    const decode = copied.steps.find((s) => s.title === '起 decode')!
+    expect(decode.lineageKey).toBe(steps.find((s) => s.title === '起 decode')!.lineageKey)
+    expect(decode.origin).toBe('base')
+    expect(copied.runbook.baseRunbookId).toBe(runbook.id)
+    expect(copied.runbook.origin).toBe('copy')
+    expect(copied.runbook.params).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'DECODE_HOST', source: 'base' })]),
+    )
+    // 原任务不受影响
+    expect(store.getLatestRunbook(task.id)!.runbook.id).toBe(runbook.id)
+  })
+
+  it('素材：写入、读取、最近一份', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const m1 = store.createMaterial({ taskId: t.id, kind: 'doc', text: '第一份', createdBy: me })
+    store.createMaterial({ taskId: t.id, kind: 'terminal', text: '第二份', createdBy: me })
+
+    expect(store.getMaterial(m1.id)!.text).toBe('第一份')
+    expect(store.getMaterial('mat_none')).toBeNull()
+    expect(store.latestMaterial(t.id)!.kind).toBe('terminal')
+  })
+
+  it('searchTasks：按标题与描述找底稿', () => {
+    seedParams()
+    store.createTask({ title: ' unrelated 整理周报', initiatorId: me })
+
+    const hits = store.searchTasks('vllm PD 分离')
+    expect(hits.map((t) => t.title)).toContain('在 X 集群部署 vLLM PD 分离')
+    // 中文按字切、OR 匹配，单字查询天然很宽；用一个肯定不存在的词验证空结果
+    expect(store.searchTasks('zzzqwer')).toEqual([])
   })
 })
 

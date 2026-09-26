@@ -8,13 +8,14 @@ import { Router, sendJson, errMessage } from './router.ts'
 import { Jobs } from './jobs.ts'
 import { registerEditRoutes } from './api-edit.ts'
 import { registerSettingsRoutes } from './api-settings.ts'
+import { fidelityFor, registerM7Routes } from './api-m7.ts'
 import { AttachmentError, type Attachments } from './attachments.ts'
 import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/server'
 import type { Step, StepStatus, Verdict } from '@qb/core'
-import { checkExpectation, redact, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind } from '@qb/core'
+import { checkExpectation, redact, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind } from '@qb/core'
 
 /** 落库的证据文本上限。报错在尾部，截前面；整份详情接口扛不住几十 MB 的日志。 */
 const EVIDENCE_MAX_CHARS = 64 * 1024
@@ -27,7 +28,7 @@ export interface ApiDeps {
   /** 单人 dogfood 阶段的当前用户；多人阶段换成从令牌解析。 */
   currentUserId: () => string
   /** QB 的提示词资产。 */
-  prompts: { persona: string; draft: string; diagnose: string }
+  prompts: { persona: string; draft: string; diagnose: string; import: string; adapt: string }
   llm: Llm
   settings: LlmSettings
   attachments: Attachments
@@ -185,6 +186,9 @@ export function buildApi(deps: ApiDeps): Router {
       evidence: latest === null ? {} : store.evidenceByRunbook(latest.runbook.id),
       // 进行中的后台任务：刷新后能接回"QB 正在起草/看截图"
       jobs: [taskId, ...(latest?.steps ?? []).map((s) => s.id)].flatMap((id) => jobs.activeFor(id)),
+      // M7：导入来的 runbook 带保真报告与素材指针（贴了素材的任务才能"从素材整理"）
+      fidelity: fidelityFor(store, taskId),
+      material: store.latestMaterial(taskId),
     })
   })
 
@@ -287,7 +291,7 @@ export function buildApi(deps: ApiDeps): Router {
       const result = store.createRunbook({
         taskId,
         createdBy: currentUserId(),
-        origin: 'qb',
+        origin: 'draft',
         assumptions: draft.assumptions,
         steps: draft.steps as Parameters<Store['createRunbook']>[0]['steps'],
       })
@@ -354,11 +358,20 @@ export function buildApi(deps: ApiDeps): Router {
 
     const taskId = store.taskIdOfStep(stepId)
 
+    // 命令是模板：先按当前参数表渲染。缺值的参数宁可拒绝运行，
+    // 也不能把 {{DECODE_HOST}} 原样发给 shell。
+    const runbook = taskId === null ? null : store.getLatestRunbook(taskId)
+    const rendered = renderCommand(step.command, runbook?.runbook.params ?? [])
+    if (rendered.missing.length > 0) {
+      sendJson(res, 400, { error: 'missing_params', message: `缺参数：${rendered.missing.join('、')}`, missing: rendered.missing })
+      return
+    }
+
     let handle: StepRunHandle
     try {
       handle = runStep(host, {
         stepId,
-        command: step.command,
+        command: rendered.text,
         expectation: step.expectation as Expectation | null,
         timeoutMs: step.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
@@ -738,6 +751,7 @@ export function buildApi(deps: ApiDeps): Router {
 
   registerEditRoutes(router, { store, ws, currentUserId, isRunning: (id) => running.has(id) })
   registerSettingsRoutes(router, { settings, llm, jobs })
+  registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
 
   return router
 }

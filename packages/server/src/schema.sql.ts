@@ -282,4 +282,63 @@ CREATE TABLE settings (
 );
 `,
   },
+  {
+    version: 3,
+    name: 'params-materials-and-bases',
+    sql: `
+-- 参数表（M7）。命令模板里的 {{NAME}} 在这里取值；复制和运行用渲染后的命令。
+ALTER TABLE runbooks ADD COLUMN params_json TEXT;
+-- 模式 A 的"底稿"：这份 runbook 从哪份复制/差异而来。
+ALTER TABLE runbooks ADD COLUMN base_runbook_id TEXT REFERENCES runbooks(id) DEFERRABLE INITIALLY DEFERRED;
+-- 这份 runbook 怎么来的。
+ALTER TABLE runbooks ADD COLUMN origin TEXT;
+
+-- 存量假设迁成"QB 猜的"展示参数：界面从假设面板换成参数面板时数据不断档。
+-- 名字保持原文（如中文维度名），模板渲染只认大写下划线，互不干扰。
+-- 注意 json_each 展开数组时 key 是下标，真正的字段要用 json_extract 取。
+UPDATE runbooks SET params_json = (
+  SELECT json_group_array(
+           json_object('name', json_extract(je.value, '$.key'),
+                       'value', json_extract(je.value, '$.value'),
+                       'source', 'qb_guess', 'secret', 0))
+  FROM json_each(runbooks.assumptions_json) je
+) WHERE assumptions_json IS NOT NULL AND assumptions_json != '[]';
+
+-- 用户贴进来的素材（文档/脚本/聊天/终端日志），保真与覆盖检查、出处引用都对着它。
+CREATE TABLE materials (
+  id          TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind        TEXT NOT NULL,
+  text        TEXT NOT NULL,
+  filename    TEXT,
+  created_by  TEXT REFERENCES users(id),
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_materials_task ON materials(task_id, created_at DESC);
+
+-- 找底稿用的任务全文索引（标题 + 描述）。
+CREATE VIRTUAL TABLE tasks_fts USING fts5(
+  title, brief_md,
+  content='tasks', content_rowid='rowid',
+  tokenize='unicode61'
+);
+CREATE TRIGGER tasks_fts_insert AFTER INSERT ON tasks BEGIN
+  INSERT INTO tasks_fts(rowid, title, brief_md)
+  VALUES (new.rowid, new.title, new.brief_md);
+END;
+CREATE TRIGGER tasks_fts_delete AFTER DELETE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, brief_md)
+  VALUES ('delete', old.rowid, old.title, old.brief_md);
+END;
+CREATE TRIGGER tasks_fts_update AFTER UPDATE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, brief_md)
+  VALUES ('delete', old.rowid, old.title, old.brief_md);
+  INSERT INTO tasks_fts(rowid, title, brief_md)
+  VALUES (new.rowid, new.title, new.brief_md);
+END;
+
+-- 存量任务回填（建表时触发器还没生效，不回填就永远搜不到老任务）
+INSERT INTO tasks_fts(rowid, title, brief_md) SELECT rowid, title, brief_md FROM tasks;
+`,
+  },
 ]

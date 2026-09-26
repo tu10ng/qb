@@ -25,4 +25,5 @@ export const ids = {
   lineage: () => newId('lin'),
   snapshot: () => newId('snp'),
   modelProfile: () => newId('mdl'),
+  material: () => newId('mat'),
 }

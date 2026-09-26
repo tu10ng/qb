@@ -53,6 +53,9 @@ export class Router {
       segments: pattern.split('/').filter(Boolean),
       handler,
     })
+    // 字面量多的模式优先：否则 GET /tasks/suggest-bases 会被先注册的
+    // GET /tasks/:id 吃掉。稳定排序保住同优先级下的注册顺序。
+    this.routes.sort((a, b) => paramCount(a) - paramCount(b))
     return this
   }
 
@@ -138,6 +141,10 @@ function matchSegments(pattern: string[], actual: string[]): Record<string, stri
     }
   }
   return params
+}
+
+function paramCount(route: Route): number {
+  return route.segments.filter((s) => s.startsWith(':')).length
 }
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024 // 贴图可能不小

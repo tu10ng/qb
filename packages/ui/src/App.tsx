@@ -14,6 +14,8 @@ import {
   ApiError,
   api,
   connectEvents,
+  type AdaptProposal,
+  type BaseSuggestion,
   type Job,
   type NewStepInput,
   type PartialStep,
@@ -24,6 +26,8 @@ import {
 } from './api.ts'
 import { StepCell, formatMs, type StepActions, type StepRunState } from './StepCell.tsx'
 import { Settings } from './Settings.tsx'
+import { ParamsPanel } from './ParamsPanel.tsx'
+import { AdaptCard } from './AdaptCard.tsx'
 import { useHistory } from './history.ts'
 
 /** 大纲里拖拽步骤时 dataTransfer 用的类型。 */
@@ -650,6 +654,10 @@ function TaskPage({
   const { task, runbook, steps } = detail
   const currentRef = useRef<HTMLDivElement>(null)
   const [dragId, setDragId] = useState<string | null>(null)
+  // 差异卡片：job 一次一换 id，按 id 记住"先不用"
+  const [adaptDismissedJob, setAdaptDismissedJob] = useState<string | null>(null)
+  const [situationOpen, setSituationOpen] = useState(false)
+  const [transcriptOpen, setTranscriptOpen] = useState(false)
 
   useEffect(() => {
     currentRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -658,7 +666,15 @@ function TaskPage({
   const real = steps.filter((s) => !isSection(s))
   const done = real.filter((s) => s.status === 'ok' || s.status === 'skipped').length
   const visible = focusMode ? steps.filter((s) => s.id === currentId) : steps
-  const draftJob = jobs[task.id]?.kind === 'draft' ? jobs[task.id] : undefined
+  const startJob = jobs[task.id]
+  const draftJob = startJob?.kind === 'draft' ? startJob : undefined
+  const importJob = startJob?.kind === 'import' ? startJob : undefined
+  const adaptJob = startJob?.kind === 'adapt' ? startJob : undefined
+  const adaptProposal =
+    adaptJob?.status === 'done' ? (adaptJob.result as AdaptProposal | null) : null
+  const showAdapt = adaptProposal !== null && adaptDismissedJob !== adaptJob!.id
+  const params = runbook?.params ?? []
+  const fidelityByStep = new Map((detail.fidelity?.items ?? []).map((i) => [i.stepId, i]))
 
   // 每一步最近一次内容编辑：悬停"我改的"时显示改前改后
   const lastEdits = useMemo(() => {
@@ -728,11 +744,12 @@ function TaskPage({
         </nav>
 
         <main className="runbook">
-          {/* 重新起草也流式显示：不用等整份写完才知道 QB 在写什么 */}
-          {draftJob?.status === 'running' && steps.length > 0 && (
+          {/* 重新起草 / 导入也流式显示：不用等整份写完才知道 QB 在写什么 */}
+          {(draftJob?.status === 'running' || importJob?.status === 'running') && steps.length > 0 && (
             <div className="redrafting">
               <p style={{ color: 'var(--text-dim)', margin: '0 0 6px' }}>
-                QB 正在重新起草……{draftJob.progress ?? ''}（现在的 runbook 仍在，替换前会留快照）
+                {importJob !== undefined ? 'QB 正在从素材整理' : 'QB 正在重新起草'}
+                ……{(importJob ?? draftJob)!.progress ?? ''}（现在的 runbook 仍在，替换前会留快照）
               </p>
               {partial.map((s, i) => (
                 <div className="ghost-step" key={i}>
@@ -746,7 +763,34 @@ function TaskPage({
             </div>
           )}
 
-          {runbook !== null && runbook.assumptions.length > 0 && (
+          {/* 差异卡片：模式 A 的逐项接受 / 情况变了的重规划 */}
+          {showAdapt && adaptProposal !== null && (
+            <AdaptCard
+              taskId={task.id}
+              steps={steps}
+              params={params}
+              proposal={adaptProposal}
+              onApplied={() => {
+                setAdaptDismissedJob(adaptJob!.id)
+                onChanged()
+              }}
+              onDismiss={() => setAdaptDismissedJob(adaptJob!.id)}
+              toast={toast}
+            />
+          )}
+
+          {params.length > 0 && <ParamsPanel taskId={task.id} params={params} onChanged={onChanged} toast={toast} />}
+
+          {/* 导入来的 runbook：保真概况一行（参数一改会跟着变） */}
+          {detail.fidelity !== null && (
+            <div className="fidelity-strip">
+              来自素材：{detail.fidelity.items.filter((i) => i.verbatim).length}/{detail.fidelity.items.length} 条命令逐字 ·{' '}
+              {detail.fidelity.items.filter((i) => !i.verbatim && !i.unverified).length} 条 QB 改写过 ·{' '}
+              素材里 {detail.fidelity.uncoveredCount} 行命令没用上
+            </div>
+          )}
+
+          {runbook !== null && params.length === 0 && runbook.assumptions.length > 0 && (
             <div className="assumptions">
               <h3>假设</h3>
               {runbook.assumptions.map((a) => (
@@ -759,7 +803,18 @@ function TaskPage({
           )}
 
           {steps.length === 0 && (
-            <DraftPrompt taskId={task.id} job={draftJob} partial={partial} llmStatus={llmStatus} onOpenSettings={onOpenSettings} />
+            <DraftPrompt
+              taskId={task.id}
+              title={task.title}
+              brief={task.briefMd}
+              job={importJob ?? draftJob}
+              partial={partial}
+              llmStatus={llmStatus}
+              material={detail.material}
+              onOpenSettings={onOpenSettings}
+              onChanged={onChanged}
+              toast={toast}
+            />
           )}
 
           {visible.map((s) => (
@@ -769,6 +824,8 @@ function TaskPage({
                 current={s.id === currentId}
                 runState={runStates[s.id]}
                 evidence={detail.evidence[s.id] ?? []}
+                params={params}
+                fidelity={fidelityByStep.get(s.id)}
                 job={jobs[s.id]}
                 lastEdit={lastEdits[s.id]}
                 autoEdit={s.id === editTarget}
@@ -824,9 +881,118 @@ function TaskPage({
             >
               问发起人（临时 · 复制到 IM）
             </button>
-            {steps.length > 0 && <RedraftButton taskId={task.id} job={draftJob} />}
+
+            {steps.length > 0 && (
+              <>
+                <button className="btn" onClick={() => setSituationOpen(true)}>
+                  情况变了…
+                </button>
+                <button className="btn" onClick={() => setTranscriptOpen(true)} title="自己在外部终端里跑了几步？把整段输出贴进来，QB 按命令分回各步">
+                  贴一段终端记录
+                </button>
+                <RedraftButton taskId={task.id} job={draftJob} />
+              </>
+            )}
           </div>
         </aside>
+
+        {situationOpen && (
+          <SituationDialog
+            onDone={(message) => {
+              setSituationOpen(false)
+              if (message !== null) {
+                api.adapt(task.id, message).catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+              }
+            }}
+          />
+        )}
+
+        {transcriptOpen && (
+          <TranscriptDialog
+            onDone={(text) => {
+              setTranscriptOpen(false)
+              if (text === null) return
+              api
+                .submitTranscript(task.id, text)
+                .then((r) =>
+                  toast(
+                    r.matched > 0
+                      ? `已把 ${r.matched} 段输出分回对应步骤${r.unmatched.length > 0 ? `，${r.unmatched.length} 条命令没对上步骤（runbook 之外的）` : ''}`
+                      : '没认出任何对应步骤的命令',
+                    r.unmatched.length > 0 ? { action: { label: '看看没对上的', run: () => toast(r.unmatched.join('\n')) } } : undefined,
+                  ),
+                )
+                .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+            }}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── 情况变了 / 终端记录 ───────────────────────────────────────
+
+const SITUATION_QUICK = ['被阻塞了', '环境跟预期不一样', '这步不需要了', '需要更多时间', '审批人不在']
+
+/** 情况变了：快捷项 + 一句话 → 走同一套差异机制（方案 §3 模式 A）。 */
+function SituationDialog({ onDone }: { onDone: (message: string | null) => void }) {
+  const [text, setText] = useState('')
+  return (
+    <div className="modal-backdrop" onClick={() => onDone(null)}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>情况变了</h3>
+        <div className="chip-row">
+          {SITUATION_QUICK.map((q) => (
+            <button key={q} className="chip" onClick={() => setText((t) => (t === '' ? q : `${t}；${q}`))}>
+              {q}
+            </button>
+          ))}
+        </div>
+        <textarea
+          autoFocus
+          placeholder="这次和原计划有什么不同？（QB 会对照当前 runbook 出差异，逐项确认后应用）"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={3}
+        />
+        <div className="row">
+          <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text.trim())}>
+            让 QB 出差异
+          </button>
+          <button className="btn ghost" onClick={() => onDone(null)}>
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** L0.5：贴一大段终端输出，按提示符切分、按命令分回各步。 */
+function TranscriptDialog({ onDone }: { onDone: (text: string | null) => void }) {
+  const [text, setText] = useState('')
+  return (
+    <div className="modal-backdrop" onClick={() => onDone(null)}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <h3>贴一段终端记录</h3>
+        <p className="dim">整段复制粘贴（带提示符）。QB 按提示符切成"命令 + 输出"，命令对得上步骤的自动归档成证据并判定预期。</p>
+        <textarea
+          autoFocus
+          className="mono"
+          placeholder={'[root@gpu-17 ~]# nvidia-smi\n…\n[root@gpu-17 ~]# vllm serve …\n…'}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={10}
+        />
+        <div className="row">
+          <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text)}>
+            分回各步
+          </button>
+          <button className="btn ghost" onClick={() => onDone(null)}>
+            取消
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -855,38 +1021,76 @@ function useElapsed(since: number | null): number {
 }
 
 /**
- * 空 runbook 时的起草入口（兜底路径：QB 的猜测，整份标为"QB 写的"）。
- *
- * 起草在后台跑，步骤边写边经 WS 推过来——首步通常几秒内就出现。
- * 用户切走再回来、刷新页面都能接回进度。
+ * 空 runbook 时的入口（方案 §3）：按优先级排四条路——
+ * B 贴了素材 → 从素材整理；A 有底稿可推荐 → 以它为基础（复制 + 出差异）；
+ * D 兜底 → 让 QB 起草；C 终端日志先落成素材再整理。
  */
 function DraftPrompt({
   taskId,
+  title,
+  brief,
   job,
   partial,
   llmStatus,
+  material,
   onOpenSettings,
+  onChanged,
+  toast,
 }: {
   taskId: string
+  title: string
+  brief: string
   job: Job | undefined
   partial: PartialStep[]
   llmStatus: PurposeStatus | null
+  material: { id: string; kind: string; filename: string | null } | null
   onOpenSettings: () => void
+  onChanged: () => void
+  toast: (text: string, opts?: { tone?: 'error' }) => void
 }) {
   const [error, setError] = useState<string | null>(null)
+  const [bases, setBases] = useState<BaseSuggestion[] | null>(null)
   const running = job?.status === 'running'
   const elapsed = useElapsed(running ? job!.startedAt : null)
+
+  useEffect(() => {
+    api
+      .suggestBases(title)
+      .then((list) => setBases(list.filter((b) => b.taskId !== taskId)))
+      .catch(() => setBases([]))
+  }, [title, taskId])
 
   const start = (): void => {
     setError(null)
     api.draft(taskId).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
   }
 
+  const importFromMaterial = (): void => {
+    if (material === null) return
+    setError(null)
+    api
+      .importFromMaterial(taskId, material.id)
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+  }
+
+  /** 模式 A：复制底稿（血缘与参数跟着来），再拿这次的说明出差异。 */
+  const startFromBase = (runbookId: string): void => {
+    setError(null)
+    api
+      .basedOn(taskId, runbookId)
+      .then(() => {
+        onChanged()
+        return api.adapt(taskId, brief.trim() !== '' ? brief.trim() : title)
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+  }
+
   if (running) {
     return (
       <div>
         <p style={{ color: 'var(--text-dim)' }}>
-          QB 正在起草……{job!.progress ?? '检索团队的 skill 和坑'} · 已等待 {elapsed} 秒
+          {job!.kind === 'import' ? 'QB 正在从素材整理' : 'QB 正在起草'}
+          ……{job!.progress ?? ''} · 已等待 {elapsed} 秒
         </p>
         {partial.map((s, i) => (
           <div className="ghost-step" key={i}>
@@ -907,6 +1111,7 @@ function DraftPrompt({
   return (
     <div style={{ color: 'var(--text-dim)' }}>
       <p>还没有 runbook。</p>
+
       {unconfigured ? (
         <p>
           还没有配置模型。{' '}
@@ -916,12 +1121,52 @@ function DraftPrompt({
         </p>
       ) : (
         <>
-          <button className="btn primary" onClick={start}>
-            让 QB 起草
-          </button>
-          <p className="paste-hint">QB 起草的是猜测，每条命令都会标成"QB 写的"，请逐条核对、直接改。</p>
+          {/* B：贴了素材——最高优先级，命令逐字来自原文 */}
+          {material !== null && (
+            <p>
+              <button className="btn primary" onClick={importFromMaterial}>
+                从素材整理
+              </button>{' '}
+              <span className="paste-hint">
+                已有贴进来的{material.kind === 'terminal' ? '终端记录' : material.kind === 'script' ? '脚本' : '文档'}
+                {material.filename !== null ? `（${material.filename}）` : ''}：QB 忠实整理，命令逐字保留、提取参数，标出改写与缺口。
+              </span>
+            </p>
+          )}
+
+          {/* A：底稿推荐 */}
+          {bases !== null && bases.length > 0 && (
+            <div className="base-suggestions">
+              <p style={{ marginBottom: 4 }}>QB 找到了可以当底稿的：</p>
+              {bases.map((b) => (
+                <div key={b.taskId} className="base-row">
+                  <span className="base-title">{b.title}</span>
+                  <span className="dim">v{b.version} · {new Date(b.updatedAt).toLocaleDateString('zh-CN')}</span>
+                  <button className="btn" onClick={() => startFromBase(b.runbookId)}>
+                    以它为基础
+                  </button>
+                </div>
+              ))}
+              <p className="paste-hint">以它为基础 = 复制步骤和参数（血缘保留），再拿这次的说明出差异，逐项接受。</p>
+            </div>
+          )}
+
+          {/* D：兜底 */}
+          <p>
+            <button className="btn" onClick={start}>
+              让 QB 起草
+            </button>{' '}
+            <span className="paste-hint">没有素材也没有相似任务时才用：QB 起草的是猜测，每条命令都会标成"QB 写的"。</span>
+          </p>
+
+          {material === null && (
+            <p className="paste-hint">
+              更好的起点：把同事发的文档 / 脚本 / 聊天记录贴成素材（新任务页的"手头有什么"），QB 整理出来命令逐字可用。
+            </p>
+          )}
         </>
       )}
+
       {failure !== null && (
         <p className="verdict fail" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
           {failure}
@@ -963,6 +1208,7 @@ function RedraftButton({ taskId, job }: { taskId: string; job: Job | undefined }
 function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }) {
   const [title, setTitle] = useState('')
   const [brief, setBrief] = useState('')
+  const [material, setMaterial] = useState('')
   const [busy, setBusy] = useState(false)
 
   const submit = async (): Promise<void> => {
@@ -970,8 +1216,12 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
     setBusy(true)
     try {
       const task = await api.createTask({ title: title.trim(), briefMd: brief })
+      if (material.trim() !== '') {
+        await api.createMaterial(task.id, { kind: 'doc', text: material })
+      }
       setTitle('')
       setBrief('')
+      setMaterial('')
       await onCreated(task)
     } finally {
       setBusy(false)
@@ -994,6 +1244,12 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
           placeholder="详细说明（就像给 agent 写 prompt：目标、约束、已知的坑）"
           value={brief}
           onChange={(e) => setBrief(e.target.value)}
+        />
+        <textarea
+          className="mono"
+          placeholder="手头有什么？贴同事发的文档 / 脚本 / 聊天记录 / 终端日志——QB 会忠实整理成 runbook，命令逐字保留"
+          value={material}
+          onChange={(e) => setMaterial(e.target.value)}
         />
         <button className="btn primary" onClick={() => void submit()} disabled={busy}>
           创建

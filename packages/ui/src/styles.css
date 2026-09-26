@@ -913,6 +913,266 @@ kbd {
   color: var(--danger);
 }
 
+/* ── M7：参数面板 / 差异卡片 / 底稿推荐 / 弹层 ───────────── */
+
+.dim {
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+
+.fidelity-strip {
+  margin-bottom: 14px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.cmd-note {
+  margin-top: 5px;
+  color: var(--warn);
+  font-size: 12px;
+}
+.cmd-note.fidelity .btn {
+  margin-left: 4px;
+}
+
+.param-slot {
+  border-bottom: 1px dotted var(--accent);
+  cursor: help;
+}
+.param-slot.missing {
+  color: var(--danger);
+  border-bottom-color: var(--danger);
+}
+
+.params-panel {
+  margin-bottom: 18px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  font-size: 13px;
+}
+
+.params-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.params-head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+.params-head .spacer {
+  flex: 1;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+.param-row.changed {
+  background: var(--accent-bg);
+}
+.param-row.missing .param-value {
+  border-color: var(--danger);
+}
+
+.param-name {
+  min-width: 180px;
+  font: 12px var(--mono);
+  color: var(--text-dim);
+}
+
+.param-value {
+  flex: 1;
+  max-width: 420px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font: 12.5px var(--mono);
+}
+.param-value:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.param-source {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.param-suggestions {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 4px;
+}
+.param-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.param-suggestion code {
+  font-size: 12px;
+}
+
+.adapt-card {
+  margin-bottom: 18px;
+  padding: 12px 16px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+
+.adapt-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.adapt-group {
+  margin: 8px 0;
+}
+
+.adapt-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+}
+
+.adapt-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+.adapt-item.check {
+  cursor: pointer;
+}
+.adapt-item .old {
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+.adapt-item .arrow {
+  color: var(--text-faint);
+}
+.adapt-item .new {
+  color: var(--accent);
+}
+
+.adapt-cmd {
+  margin: 3px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-code);
+  font: 12px var(--mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.adapt-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.base-suggestions {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+}
+
+.base-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+}
+.base-title {
+  flex: 1;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.modal {
+  width: min(440px, 90vw);
+  padding: 16px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.modal.wide {
+  width: min(680px, 92vw);
+}
+.modal h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.modal textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.6;
+  resize: vertical;
+}
+.modal textarea.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.modal .row {
+  display: flex;
+  gap: 6px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.new-task-form textarea.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  min-height: 70px;
+}
+
 /* ── 设置 ────────────────────────────────────────────────── */
 
 .sidebar-foot {

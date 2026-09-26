@@ -12,6 +12,7 @@ import {
   type Lesson,
   type LessonAnchor,
   type LessonScope,
+  type Param,
   type ReadinessProbe,
   type Runbook,
   type Skill,
@@ -233,10 +234,14 @@ export class Store {
     taskId: string
     createdBy: string
     assumptions?: Assumption[]
+    /** 参数表（M7+，导入/底稿路径）。 */
+    params?: Param[]
+    /** 底稿：这份 runbook 从哪份复制/差异而来。 */
+    baseRunbookId?: string | null
+    origin?: Runbook['origin']
     sourceSkillId?: string | null
     sourceSkillVersion?: number | null
     /** 这批步骤的来源；单个步骤可在 NewStep 里覆盖。默认 human。 */
-    origin?: StepOrigin
     steps: NewStep[]
   }): { runbook: Runbook; steps: Step[] } {
     const run = this.db.transaction(() => {
@@ -252,6 +257,9 @@ export class Store {
         createdBy: input.createdBy,
         createdAt: Date.now(),
         assumptions: input.assumptions ?? [],
+        params: input.params ?? [],
+        baseRunbookId: input.baseRunbookId ?? null,
+        origin: input.origin ?? null,
         sourceSkillId: input.sourceSkillId ?? null,
         sourceSkillVersion: input.sourceSkillVersion ?? null,
       }
@@ -259,9 +267,9 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO runbooks
-           (id, task_id, version, created_by, created_at, assumptions_json,
-            source_skill_id, source_skill_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, task_id, version, created_by, created_at, assumptions_json, params_json,
+            base_runbook_id, origin, source_skill_id, source_skill_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           runbook.id,
@@ -270,15 +278,140 @@ export class Store {
           runbook.createdBy,
           runbook.createdAt,
           JSON.stringify(runbook.assumptions),
+          JSON.stringify(runbook.params),
+          runbook.baseRunbookId,
+          runbook.origin,
           runbook.sourceSkillId,
           runbook.sourceSkillVersion,
         )
 
-      const steps = this.insertStepTree(runbook.id, null, input.steps, input.origin ?? 'human')
+      // 步骤默认来源跟着 runbook 来源走：import→逐字来自素材，copy/adapt→
+      // 来自底稿，draft→QB 写的，没说就是人写的
+      const stepOrigin: StepOrigin =
+        input.origin === 'import'
+          ? 'import'
+          : input.origin === 'copy' || input.origin === 'adapt'
+            ? 'base'
+            : input.origin === 'draft'
+              ? 'qb'
+              : 'human'
+      const steps = this.insertStepTree(runbook.id, null, input.steps, stepOrigin)
       return { runbook, steps }
     })
 
     return run()
+  }
+
+  /** 覆盖参数表（值的就地修改、同值联动、差异应用都走这里）。 */
+  updateRunbookParams(runbookId: string, params: Param[], origin?: Runbook['origin']): void {
+    this.db
+      .prepare(
+        `UPDATE runbooks SET params_json = ?${origin !== undefined ? ', origin = ?' : ''} WHERE id = ?`,
+      )
+      .run(JSON.stringify(params), ...(origin !== undefined ? [origin] : []), runbookId)
+  }
+
+  /**
+   * 以一份 runbook 为底稿复制出新的（模式 A 的第一步）。
+   *
+   * 步骤保留血缘（origin=base）——挂在血缘上的坑跟着过来；参数值照抄
+   * （source=base）——之后 adapt 出差异、逐项接受。
+   */
+  copyRunbook(baseRunbookId: string, taskId: string, actorId: string): { runbook: Runbook; steps: Step[] } {
+    const base = this.db
+      .prepare('SELECT * FROM runbooks WHERE id = ?')
+      .get(baseRunbookId) as RunbookRow | undefined
+    if (base === undefined) throw new Error('底稿不存在')
+
+    const baseSteps = this.listSteps(baseRunbookId)
+    const childrenOf = new Map<string | null, Step[]>()
+    for (const s of baseSteps) {
+      const list = childrenOf.get(s.parentId) ?? []
+      list.push(s)
+      childrenOf.set(s.parentId, list)
+    }
+    const toNew = (s: Step): NewStep => ({
+      kind: s.kind,
+      title: s.title,
+      whyMd: s.whyMd,
+      whySource: s.whySource,
+      command: s.command,
+      envId: s.envId,
+      expectation: s.expectation,
+      probe: s.probe,
+      timeoutMs: s.timeoutMs,
+      expectedMinutes: s.expectedMinutes,
+      origin: 'base',
+      ...(s.lineageKey !== null ? { lineageKey: s.lineageKey } : {}),
+      ...(s.sourceRef !== null ? { sourceRef: s.sourceRef } : {}),
+      ...(childrenOf.get(s.id) !== undefined ? { children: (childrenOf.get(s.id) ?? []).map(toNew) } : {}),
+    })
+    const top = (childrenOf.get(null) ?? []).map(toNew)
+
+    const params = toRunbook(base).params.map((p) => ({ ...p, source: 'base' as const }))
+    return this.createRunbook({
+      taskId,
+      createdBy: actorId,
+      params,
+      baseRunbookId,
+      origin: 'copy',
+      steps: top,
+    })
+  }
+
+  // ── 素材（M7）：贴进来的原文，保真/覆盖/出处都对着它 ────────
+
+  createMaterial(input: { taskId: string; kind: string; text: string; filename?: string; createdBy: string }): { id: string; createdAt: number } {
+    const id = ids.material()
+    // 时间戳严格递增：同一毫秒连贴两份素材时，latestMaterial 才不会挑错
+    const last = this.db
+      .prepare('SELECT MAX(created_at) m FROM materials WHERE task_id = ?')
+      .get(input.taskId) as { m: number | null }
+    const createdAt = Math.max(Date.now(), (last.m ?? 0) + 1)
+    this.db
+      .prepare(
+        `INSERT INTO materials (id, task_id, kind, text, filename, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, input.taskId, input.kind, input.text, input.filename ?? null, input.createdBy, createdAt)
+    return { id, createdAt }
+  }
+
+  getMaterial(id: string): { id: string; taskId: string; kind: string; text: string; filename: string | null; createdAt: number } | null {
+    const row = this.db.prepare('SELECT * FROM materials WHERE id = ?').get(id) as
+      | { id: string; task_id: string; kind: string; text: string; filename: string | null; created_at: number }
+      | undefined
+    if (row === undefined) return null
+    return { id: row.id, taskId: row.task_id, kind: row.kind, text: row.text, filename: row.filename, createdAt: row.created_at }
+  }
+
+  /** 任务的素材里最近的一份（任务详情带出来供"从素材整理"）。 */
+  latestMaterial(taskId: string): { id: string; kind: string; filename: string | null } | null {
+    const row = this.db
+      .prepare('SELECT id, kind, filename FROM materials WHERE task_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(taskId) as { id: string; kind: string; filename: string | null } | undefined
+    return row === undefined ? null : { id: row.id, kind: row.kind, filename: row.filename }
+  }
+
+  /** 找底稿：按标题+描述全文检索任务。 */
+  searchTasks(query: string, limit = 6): Task[] {
+    const terms = tokenize(query)
+    if (terms.length === 0) return []
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT t.* FROM tasks_fts f
+           JOIN tasks t ON t.rowid = f.rowid
+           WHERE tasks_fts MATCH ?
+             AND t.archived_at IS NULL
+           ORDER BY bm25(tasks_fts), t.created_at DESC
+           LIMIT ?`,
+        )
+        .all(terms.join(' OR '), limit) as TaskRow[]
+      return rows.map(toTask)
+    } catch {
+      return []
+    }
   }
 
   /** 递归写入步骤树，自动生成 orderKey。 */
@@ -1161,6 +1294,9 @@ interface RunbookRow {
   created_by: string
   created_at: number
   assumptions_json: string
+  params_json: string | null
+  base_runbook_id: string | null
+  origin: string | null
   source_skill_id: string | null
   source_skill_version: number | null
 }
@@ -1346,6 +1482,9 @@ function toRunbook(r: RunbookRow): Runbook {
     createdBy: r.created_by,
     createdAt: r.created_at,
     assumptions: JSON.parse(r.assumptions_json) as Assumption[],
+    params: r.params_json === null || r.params_json === '' ? [] : (JSON.parse(r.params_json) as Param[]),
+    baseRunbookId: r.base_runbook_id,
+    origin: (r.origin as Runbook['origin']) ?? null,
     sourceSkillId: r.source_skill_id,
     sourceSkillVersion: r.source_skill_version,
   }

@@ -172,13 +172,20 @@ async function main() {
           command: 'node -e "process.stdout.write(\'x\'.repeat(300000))"',
           timeoutMs: 30000,
         },
+        {
+          kind: 'command',
+          title: '验证参数渲染',
+          command: 'echo "hello {{WHO}}"',
+          expectation: { kind: 'contains', text: 'hello qb', caseSensitive: true },
+          timeoutMs: 15000,
+        },
       ],
     }),
   })
   const rb = await rbRes.json()
-  check('能写入 runbook', rbRes.status === 201 && rb.steps?.length === 4, JSON.stringify(rb).slice(0, 200))
+  check('能写入 runbook', rbRes.status === 201 && rb.steps?.length === 5, JSON.stringify(rb).slice(0, 200))
 
-  const [okStep, timeoutStep, dangerStep, bigStep] = rb.steps ?? []
+  const [okStep, timeoutStep, dangerStep, bigStep, whoStep] = rb.steps ?? []
 
   // 1) 正常执行 + 预期判定 + 流式输出
   const run1 = await fetch(`${API}/steps/${okStep.id}/run`, {
@@ -361,6 +368,84 @@ async function main() {
     body: JSON.stringify({ title: 'csrf' }),
   })
   check('守卫：跨站 Origin 被拒', cross.status === 403, `status ${cross.status}`)
+
+  // ── M7：参数 ────────────────────────────────────────────
+  const setParamsRes = await json('PATCH', `/tasks/${task.id}/params`, {
+    params: [{ name: 'WHO', value: 'qb', source: 'origin' }],
+  })
+  const setParams = { status: setParamsRes.status, body: await setParamsRes.json().catch(() => null) }
+  check('参数：写入参数表', setParams.status === 200 && setParams.body?.params?.[0]?.name === 'WHO', JSON.stringify(setParams.body ?? null).slice(0, 120))
+
+  const whoRun = await fetch(`${API}/steps/${whoStep.id}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+  check('参数：运行前按参数表渲染（{{WHO}} → qb）', whoRun.status === 202, `status ${whoRun.status}`)
+  await waitFor(() => wsEvents.some((e) => e.type === 'step.done' && e.stepId === whoStep.id), 30_000)
+  const whoDone = wsEvents.find((e) => e.type === 'step.done' && e.stepId === whoStep.id)
+  if (whoDone?.verdict !== 'pass') {
+    const dbg = await (await fetch(`${API}/tasks/${task.id}/runbook`)).json()
+    console.log(
+      'who 调试: params=',
+      JSON.stringify(dbg.runbook?.params),
+      ' cmd=',
+      JSON.stringify(dbg.steps.find((s) => s.id === whoStep.id)?.command),
+      ' 证据=',
+      JSON.stringify((dbg.evidence[whoStep.id] ?? []).at(-1)?.text?.slice(0, 80)),
+    )
+  }
+  check('参数：渲染后的命令按预期判定通过', whoDone?.verdict === 'pass', JSON.stringify(whoDone ?? null))
+
+  const clearParams = await json('PATCH', `/tasks/${task.id}/params`, {
+    params: [{ name: 'WHO', value: '' }],
+  })
+  void clearParams
+  const missingRun = await fetch(`${API}/steps/${whoStep.id}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+  const missingBody = await missingRun.json()
+  check(
+    '参数：缺值时拒绝运行（不能把 {{WHO}} 发给 shell）',
+    missingRun.status === 400 && missingBody.error === 'missing_params' && missingBody.missing?.includes('WHO'),
+    JSON.stringify(missingBody).slice(0, 120),
+  )
+  await json('PATCH', `/tasks/${task.id}/params`, { params: [{ name: 'WHO', value: 'qb' }] })
+
+  // ── M7：终端分流（L0.5）──────────────────────────────────
+  const transcriptRes = await json('POST', `/tasks/${task.id}/transcript`, {
+    text: 'Last login: Sun\n[root@gpu-17 ~]# echo QB_EDITED\nQB_EDITED\n[root@gpu-17 ~]# free -g\n              total\n1',
+  })
+  const transcript = { status: transcriptRes.status, body: await transcriptRes.json().catch(() => null) }
+  check('终端分流：按命令匹配回步骤', transcript.status === 200 && transcript.body?.matched === 1, JSON.stringify(transcript.body ?? null))
+  const afterTranscript = await detailOf()
+  const okEvidence = (afterTranscript.evidence[okStep.id] ?? []).filter((e) => e.source === 'paste')
+  check('终端分流：输出成为该步证据', okEvidence.some((e) => (e.text ?? '').includes('QB_EDITED')), JSON.stringify(okEvidence.map((e) => e.text?.slice(0, 30))))
+
+  // ── M7：底稿 ────────────────────────────────────────────
+  const bases = await (await fetch(`${API}/tasks/suggest-bases?q=${encodeURIComponent('PD 分离 vllm')}`)).json()
+  check('找底稿：能按标题检索到任务', bases.suggestions?.some((b) => b.taskId === task.id), JSON.stringify(bases.suggestions ?? []).slice(0, 160))
+
+  const task2 = await (await json('POST', '/tasks', { title: '在 Y 集群跑同样的部署' })).json()
+  const copiedRes = await fetch(`${API}/tasks/${task2.id}/based-on`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ runbookId: rb.runbook.id }),
+  })
+  const copied = { status: copiedRes.status, body: await copiedRes.json().catch(() => null) }
+  if (copied.status !== 201) console.log('based-on 失败:', copied.status, JSON.stringify(copied.body).slice(0, 300))
+  const copiedDetail = await (await fetch(`${API}/tasks/${task2.id}/runbook`)).json()
+  const srcStep = copiedDetail.steps.find((s) => s.title === '验证参数渲染')
+  check(
+    '以底稿为基础：步骤与参数都复制过来，血缘保留',
+    copied.status === 201 &&
+      srcStep?.command === 'echo "hello {{WHO}}"' &&
+      copiedDetail.runbook?.params?.some((p) => p.name === 'WHO' && p.source === 'base') &&
+      srcStep?.lineageKey === whoStep.lineageKey,
+    `steps=${copiedDetail.steps.length} params=${JSON.stringify(copiedDetail.runbook?.params)}`,
+  )
 
   // ── M6：模型设置 ─────────────────────────────────────────
   const settings0 = await (await fetch(`${API}/settings/llm`)).json()
