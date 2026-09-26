@@ -104,6 +104,56 @@ describe('Runbook', () => {
     expect(steps.map((s) => s.title)).toEqual(['a', 'b', 'c'])
   })
 
+  it('多章节的子步骤不会串到别的章节下', () => {
+    // orderKey 只在兄弟间唯一，所以不能全局排序——否则各章节的
+    // 子步骤会按 key 大小混在一起。
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({
+      taskId: t.id,
+      createdBy: me,
+      steps: [
+        {
+          kind: 'note',
+          title: '1 准备',
+          children: [
+            { kind: 'command', title: '1.1' },
+            { kind: 'command', title: '1.2' },
+          ],
+        },
+        {
+          kind: 'note',
+          title: '2 启动',
+          children: [
+            { kind: 'command', title: '2.1' },
+            { kind: 'command', title: '2.2' },
+            { kind: 'command', title: '2.3' },
+          ],
+        },
+        {
+          kind: 'note',
+          title: '3 验证',
+          children: [{ kind: 'command', title: '3.1' }],
+        },
+      ],
+    })
+
+    expect(steps.map((s) => s.title)).toEqual([
+      '1 准备',
+      '1.1',
+      '1.2',
+      '2 启动',
+      '2.1',
+      '2.2',
+      '2.3',
+      '3 验证',
+      '3.1',
+    ])
+
+    // 读回来的顺序必须和写入时一致
+    const loaded = store.getLatestRunbook(t.id)!
+    expect(loaded.steps.map((s) => s.title)).toEqual(steps.map((s) => s.title))
+  })
+
   it('支持嵌套步骤（章节）', () => {
     const t = store.createTask({ title: 'x', initiatorId: me })
     const { steps } = store.createRunbook({

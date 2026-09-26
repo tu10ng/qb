@@ -12,7 +12,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke": "node scripts/smoke.mjs",
-    "qb": "pnpm --filter @qb/cli start"
+    "qb": "pnpm --filter @qb/cli start",
+    "dev": "node scripts/dev.mjs",
+    "build:ui": "pnpm --filter @qb/ui build"
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.1.5-rc.3",

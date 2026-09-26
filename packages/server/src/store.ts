@@ -288,9 +288,26 @@ export class Store {
 
   // ── 步骤 ─────────────────────────────────────────────────────
 
+  /**
+   * 按树结构列出步骤：先序遍历，同层按 orderKey。
+   *
+   * orderKey 只在兄弟之间唯一（这是分数索引的正确语义），所以不能
+   * 直接按它全局排序——那会让不同章节的子步骤混在一起。用递归 CTE
+   * 拼出路径再排序，得到的就是用户在文档里看到的顺序。
+   */
   listSteps(runbookId: string): Step[] {
     const rows = this.db
-      .prepare('SELECT * FROM steps WHERE runbook_id = ? ORDER BY order_key')
+      .prepare(
+        `WITH RECURSIVE tree AS (
+           SELECT s.*, s.order_key AS path, 0 AS depth
+           FROM steps s
+           WHERE s.runbook_id = ? AND s.parent_id IS NULL
+           UNION ALL
+           SELECT s.*, t.path || char(31) || s.order_key, t.depth + 1
+           FROM steps s JOIN tree t ON s.parent_id = t.id
+         )
+         SELECT * FROM tree ORDER BY path`,
+      )
       .all(runbookId) as StepRow[]
     return rows.map(toStep)
   }

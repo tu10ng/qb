@@ -1,3 +1,4 @@
+import { sanitizeText } from '@qb/core'
 import type {
   Completion,
   CompletionRequest,
@@ -116,8 +117,10 @@ export function createDshHostPort(ctx: DshContext): HostPort {
       return {
         exitCode: result.exitCode,
         signal: result.signal,
-        stdout: result.stdout,
-        stderr: result.stderr,
+        // 命令输出不保证是合法 UTF-8（Windows 中文 locale 输出 GBK），
+        // 在唯一入口清洗，避免非法代理项流进数据库和 JSON。
+        stdout: sanitizeText(result.stdout),
+        stderr: sanitizeText(result.stderr),
         timedOut: result.timedOut,
         durationMs: Date.now() - startedAt,
       }
@@ -139,11 +142,13 @@ export function createDshHostPort(ctx: DshContext): HostPort {
         const read = proc.readOutput()
         if (read.delta === '' && !read.lossy) return
 
-        collected += read.delta
+        // 同 runCommand：在入口清洗非法 UTF-8。
+        const text = sanitizeText(read.delta)
+        collected += text
         sawLoss ||= read.lossy
 
         const chunk: OutputChunk = {
-          text: read.delta,
+          text,
           lossy: read.lossy,
           ...(read.stdoutSpillPath !== undefined ? { spillPath: read.stdoutSpillPath } : {}),
         }
