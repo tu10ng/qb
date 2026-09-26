@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { Evidence, Step } from '@qb/core'
-import { ApiError, api } from './api.ts'
+import { ApiError, api, type Diagnosis } from './api.ts'
 
 export interface StepRunState {
   output: string
@@ -199,6 +199,11 @@ export function StepCell({ step, current, runState, evidence, onFocus, onChanged
 
         {error !== null && <div className="verdict fail">{error}</div>}
 
+        {/* 失败了就让 QB 看看——这是"流程不能停"的落点 */}
+        {(step.status === 'failed' || runState?.verdict === 'fail') && (
+          <DiagnosePanel stepId={step.id} onApplied={onChanged} />
+        )}
+
         <div className="step-actions" onClick={(e) => e.stopPropagation()}>
           {running ? (
             <button className="btn" onClick={() => void api.cancelStep(step.id).then(onChanged)}>
@@ -218,6 +223,107 @@ export function StepCell({ step, current, runState, evidence, onFocus, onChanged
             </>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 失败诊断面板。
+ *
+ * QB 先查团队踩过的坑，再给可执行的路径。产品宪法第 9 条"流程不能停"：
+ * 失败不是终点，而是"接下来可以做这几件事"。
+ */
+function DiagnosePanel({ stepId, onApplied }: { stepId: string; onApplied: () => void }) {
+  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
+  const [result, setResult] = useState<Diagnosis | null>(null)
+  const [message, setMessage] = useState('')
+
+  if (state === 'idle') {
+    return (
+      <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+        <button
+          className="btn"
+          onClick={() => {
+            setState('busy')
+            api
+              .diagnose(stepId)
+              .then((d) => {
+                setResult(d)
+                setState('done')
+              })
+              .catch((e: unknown) => {
+                setMessage(e instanceof Error ? e.message : String(e))
+                setState('error')
+              })
+          }}
+        >
+          让 QB 看看
+        </button>
+      </div>
+    )
+  }
+
+  if (state === 'busy') {
+    return (
+      <div className="paste-hint" style={{ marginTop: 8 }}>
+        QB 正在查团队踩过的坑……
+      </div>
+    )
+  }
+
+  if (state === 'error') {
+    return (
+      <div className="verdict fail" style={{ marginTop: 8 }}>
+        {message}
+      </div>
+    )
+  }
+
+  const d = result!
+  return (
+    <div className="lesson-chip" style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ fontWeight: 500 }}>{d.summary}</div>
+
+      {d.fromLessonId !== null && (
+        <div className="origin" style={{ marginTop: 3 }}>
+          依据团队记录的坑
+        </div>
+      )}
+
+      {d.options.map((o, i) => (
+        <div key={i} style={{ marginTop: 8 }}>
+          <div style={{ fontWeight: 500 }}>
+            {i + 1}. {o.label}
+          </div>
+          <div style={{ color: 'var(--text-dim)' }}>{o.detail}</div>
+          {o.command !== undefined && (
+            <div className="cmd" style={{ marginTop: 4 }}>
+              <pre>{o.command}</pre>
+              <div className="actions">
+                <button
+                  className="btn"
+                  onClick={() => void navigator.clipboard.writeText(o.command!)}
+                >
+                  ⧉
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {d.askInstead !== null && (
+        <div style={{ marginTop: 8, color: 'var(--warn)' }}>建议问人：{d.askInstead}</div>
+      )}
+
+      <div style={{ marginTop: 8, display: 'flex', gap: 5 }}>
+        <button className="btn ghost" onClick={() => setState('idle')}>
+          收起
+        </button>
+        <button className="btn ghost" onClick={onApplied}>
+          刷新状态
+        </button>
       </div>
     </div>
   )

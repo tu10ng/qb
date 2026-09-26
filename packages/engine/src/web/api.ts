@@ -1,6 +1,8 @@
 import { NeedsConfirmation, runStep, type StepRunHandle } from '../runner/run-step.ts'
 import { draftRunbook } from '../agent/draft.ts'
+import { diagnoseFailure } from '../agent/diagnose.ts'
 import { Router, sendJson, errMessage } from './router.ts'
+import { Jobs } from './jobs.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/server'
@@ -15,7 +17,7 @@ export interface ApiDeps {
   /** 单人 dogfood 阶段的当前用户；多人阶段换成从令牌解析。 */
   currentUserId: () => string
   /** QB 的提示词资产。 */
-  prompts: { persona: string; draft: string }
+  prompts: { persona: string; draft: string; diagnose: string }
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
@@ -26,6 +28,11 @@ export function buildApi(deps: ApiDeps): Router {
 
   // 正在执行的步骤：用于取消、防重复启动
   const running = new Map<string, StepRunHandle>()
+
+  // 后台任务（起草、诊断）：模型调用慢且耗时不可预测，不占 HTTP 连接
+  const jobs = new Jobs({
+    onUpdate: (job) => ws.broadcast({ type: 'job.update', job }),
+  })
 
   router.get('/health', (_req, res) => {
     sendJson(res, 200, {
@@ -177,10 +184,11 @@ export function buildApi(deps: ApiDeps): Router {
   /**
    * 让 QB 起草 runbook。
    *
-   * 同步等待模型返回（起草要十几秒到一分钟）。前端显示"QB 正在起草"，
-   * 不适合做成异步——用户此刻没有别的事可做，异步只会增加状态复杂度。
+   * 立刻返回任务 id，起草在后台跑，进度经 WS 推送。
+   * 推理型模型的思考量波动很大（实测 40 秒到 4 分钟），占着 HTTP
+   * 连接让用户干等会让他以为卡死了，刷新还会重复触发。
    */
-  router.post('/tasks/:id/draft', async (_req, res, ctx) => {
+  router.post('/tasks/:id/draft', (_req, res, ctx) => {
     const taskId = ctx.params.id!
     const task = store.getTask(taskId)
     if (task === null) {
@@ -188,13 +196,25 @@ export function buildApi(deps: ApiDeps): Router {
       return
     }
 
-    try {
-      const draft = await draftRunbook(host, prompts.persona, prompts.draft, {
-        task,
-        environments: store.listEnvironments(),
-        skills: store.listSkills(),
-        lessons: store.searchLessons(`${task.title} ${task.briefMd}`, 12),
-      })
+    const { job, existing } = jobs.start('draft', taskId, async (report) => {
+      const draft = await draftRunbook(
+        host,
+        prompts.persona,
+        prompts.draft,
+        {
+          task,
+          environments: store.listEnvironments(),
+          skills: store.listSkills(),
+          lessons: store.searchLessons(`${task.title} ${task.briefMd}`, 12),
+        },
+        undefined,
+        (p) =>
+          report(
+            p.kind === 'thinking'
+              ? `思考中（${Math.round(p.chars / 100) / 10}k 字）`
+              : `正在写 runbook（${Math.round(p.chars / 100) / 10}k 字）`,
+          ),
+      )
 
       const result = store.createRunbook({
         taskId,
@@ -216,12 +236,19 @@ export function buildApi(deps: ApiDeps): Router {
       })
 
       ws.broadcast({ type: 'runbook.updated', taskId, version: result.runbook.version })
-      sendJson(res, 201, result)
-    } catch (e) {
-      // 把模型的原话透给前端：起草失败时用户需要知道是没配端点、
-      // 模型拒答，还是输出不合格式。
-      sendJson(res, 502, { error: 'draft_failed', message: errMessage(e) })
+      return { version: result.runbook.version }
+    })
+
+    sendJson(res, existing ? 200 : 202, { jobId: job.id, status: job.status, existing })
+  })
+
+  router.get('/jobs/:id', (_req, res, ctx) => {
+    const job = jobs.get(ctx.params.id!)
+    if (job === null) {
+      sendJson(res, 404, { error: 'not_found', message: '任务不存在或已过期' })
+      return
     }
+    sendJson(res, 200, job)
   })
 
   router.get('/tasks/:id/versions', (_req, res, ctx) => {
@@ -444,6 +471,72 @@ export function buildApi(deps: ApiDeps): Router {
     sendJson(res, 201, { stepId, status, verdict, reason })
   })
 
+  /**
+   * 让 QB 诊断一步的失败。
+   *
+   * 先检索坑（本地 FTS，零成本），再交给模型判断哪条真的匹配。
+   * 团队踩过的坑比模型的推测可信，所以检索在前。
+   */
+  router.post('/steps/:id/diagnose', async (_req, res, ctx) => {
+    const stepId = ctx.params.id!
+    const step = store.getStep(stepId)
+    if (step === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+
+    const evidence = store.listEvidence(stepId)
+    const last = evidence.length > 0 ? evidence[evidence.length - 1]! : null
+    if (last === null) {
+      sendJson(res, 400, {
+        error: 'no_evidence',
+        message: '这一步还没有执行记录，没什么可诊断的',
+      })
+      return
+    }
+
+    // 检索关键词：命令 + 输出尾部。报错通常在尾部，
+    // 前面的进度输出会污染检索。
+    const output = last.text ?? ''
+    const query = [step.title, step.command ?? '', output.slice(-800)].join(' ')
+
+    try {
+      const diagnosis = await diagnoseFailure(host, prompts.persona, prompts.diagnose, {
+        step,
+        outcome: {
+          exitCode: last.exitCode,
+          timedOut: last.timedOut,
+          durationMs: last.durationMs ?? 0,
+          output,
+          verdict: step.status === 'failed' ? 'fail' : step.status,
+          reason: step.status === 'failed' ? '与预期不符' : '',
+        },
+        lessons: store.searchLessons(query, 8),
+        environmentNote: renderEnvNote(store),
+      })
+
+      const taskId = store.taskIdOfStep(stepId)
+      if (taskId !== null) {
+        store.appendEvent({
+          taskId,
+          stepId,
+          actorId: null,
+          kind: 'step_failed',
+          payload: {
+            by: 'qb',
+            diagnosis: diagnosis.summary,
+            fromLessonId: diagnosis.fromLessonId,
+            model: diagnosis.model,
+          },
+        })
+      }
+
+      sendJson(res, 200, diagnosis)
+    } catch (e) {
+      sendJson(res, 502, { error: 'diagnose_failed', message: errMessage(e) })
+    }
+  })
+
   router.post('/steps/:id/cancel', (_req, res, ctx) => {
     const stepId = ctx.params.id!
     const handle = running.get(stepId)
@@ -455,6 +548,23 @@ export function buildApi(deps: ApiDeps): Router {
   })
 
   return router
+}
+
+/** 把环境事实压成一段话，供诊断时判断坑的条件是否匹配。 */
+function renderEnvNote(store: Store): string {
+  const envs = store.listEnvironments()
+  if (envs.length === 0) return '（未采集到环境信息）'
+
+  return envs
+    .map((e) => {
+      const f = e.facts
+      const bits = [f.os, f.shell, f.gpu, f.cuda !== undefined ? `CUDA ${f.cuda}` : undefined]
+        .filter((x): x is string => x !== undefined)
+        .join('，')
+      const quirks = f.quirks !== undefined && f.quirks.length > 0 ? `；注意：${f.quirks.join('；')}` : ''
+      return `${e.name}：${bits}${quirks}`
+    })
+    .join('\n')
 }
 
 /** stdout 与 stderr 合并展示；stderr 单独标出来，否则看不出是哪一路。 */

@@ -63,12 +63,16 @@ export interface CompletionRequest {
   schema?: { name: string; description: string; parameters: unknown }
   maxTokens?: number
   signal?: AbortSignal
+  /** 进度回调：模型思考/写入了多少字符。用于让用户知道它还活着。 */
+  onProgress?: (p: { kind: 'thinking' | 'writing'; chars: number }) => void
 }
 
 export interface Completion {
   text: string
   /** schema 存在时的结构化结果。 */
   structured?: unknown
+  /** 推理型模型的思考过程。不展示给用户，用于诊断起草质量。 */
+  thinking?: string
   model: string
 }
 

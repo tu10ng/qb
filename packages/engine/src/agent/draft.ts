@@ -12,56 +12,22 @@ import type { HostPort } from '../dsh/port.ts'
 
 // ── 模型输出的 schema ────────────────────────────────────────
 
-/** 递归的步骤 schema。JSON Schema 里用 $ref 表达递归。 */
-const STEP_PROPERTIES = {
-  kind: {
-    type: 'string',
-    enum: ['command', 'check', 'wait', 'manual', 'decision', 'note'],
-    description: '步骤类型。note 用作章节标题，把具体步骤放进 children。',
-  },
-  title: { type: 'string', description: '简短标题，一眼能看出这步在做什么' },
-  whyMd: {
-    type: 'string',
-    description: '一句话说明这步为何存在、为何是这个顺序。新人最需要这个。',
-  },
-  whySource: {
-    type: 'string',
-    description: '依据来源，如 skill「PD分离」§3 或 lesson:xxx。没有就省略。',
-  },
-  command: { type: 'string', description: '精确到可直接复制运行的命令' },
-  expectation: {
-    type: 'object',
-    description: '这步算不算做成了的判定标准',
-    properties: {
-      kind: { type: 'string', enum: ['exitCode', 'contains', 'notContains', 'regex', 'manual'] },
-      code: { type: 'number' },
-      text: { type: 'string' },
-      caseSensitive: { type: 'boolean' },
-      pattern: { type: 'string' },
-      flags: { type: 'string' },
-      description: { type: 'string' },
-    },
-    required: ['kind'],
-  },
-  probe: {
-    type: 'object',
-    description: 'wait 步骤的就绪探针',
-    properties: {
-      kind: { type: 'string', enum: ['http', 'port', 'logPattern', 'command'] },
-      url: { type: 'string' },
-      expectStatus: { type: 'number' },
-      host: { type: 'string' },
-      port: { type: 'number' },
-      pattern: { type: 'string' },
-      command: { type: 'string' },
-      expectExitCode: { type: 'number' },
-    },
-    required: ['kind'],
-  },
-  timeoutMs: { type: 'number', description: '止损线，设成预期耗时的 2-3 倍' },
-  expectedMinutes: { type: 'number', description: '给人看的心理预期，可以是小数' },
-} as const
-
+/**
+ * 模型输出的 schema。
+ *
+ * 设计取舍（都有实测依据）：
+ *
+ * 1. **结构扁平**。递归的 children 会让推理型模型的思考量明显上升；
+ *    章节改用 section 字段表达，写库时还原成树。
+ * 2. **字段尽量少**。每个可选字段模型都要权衡"这步要不要填"。
+ *    expect 是一个自由文本字段，由代码推断它是"输出包含某字样"、
+ *    "人工判断"还是"就绪 URL"——这个判断机械且确定，不该占模型的预算。
+ * 3. **超时不让模型算**。由 minutes 推导，它算出来的经常不合理。
+ *
+ * 即便如此，GLM-5.3 这类推理模型在这个任务上的思考量仍会在
+ * 7k~52k 字符之间大幅波动（实测），耗时从 40 秒到 4 分钟。
+ * 所以起草在 API 层做成异步任务，不让用户干等。
+ */
 export const DRAFT_SCHEMA = {
   name: 'propose_runbook',
   description: '提交起草好的 runbook',
@@ -74,7 +40,7 @@ export const DRAFT_SCHEMA = {
         items: {
           type: 'object',
           properties: {
-            key: { type: 'string', description: '假设的维度，如"集群"、"模型版本"' },
+            key: { type: 'string', description: '假设的维度，如集群、模型版本' },
             value: { type: 'string', description: '你假设的取值' },
           },
           required: ['key', 'value'],
@@ -82,18 +48,31 @@ export const DRAFT_SCHEMA = {
       },
       steps: {
         type: 'array',
-        description: '顶层步骤。用 note 类型作章节，具体步骤放进 children。',
+        description: '有序的步骤列表，8-20 步。用 section 标注所属章节，同章节的步骤要连续。',
         items: {
           type: 'object',
           properties: {
-            ...STEP_PROPERTIES,
-            children: {
-              type: 'array',
-              description: '子步骤（章节内容）',
-              items: { type: 'object', properties: STEP_PROPERTIES, required: ['kind', 'title'] },
+            section: {
+              type: 'string',
+              description: '所属章节，如 1 准备 / 2 启动 / 3 验证 / 4 交接',
             },
+            kind: {
+              type: 'string',
+              enum: ['command', 'check', 'wait', 'manual', 'decision'],
+              description:
+                'command=可直接跑的命令；check=验证状态；wait=长任务需等就绪；manual=只有人能做；decision=需要拍板',
+            },
+            title: { type: 'string', description: '简短标题' },
+            why: { type: 'string', description: '一句话：这步为何存在、为何是这个顺序' },
+            command: { type: 'string', description: '精确到可直接复制运行的命令' },
+            expect: {
+              type: 'string',
+              description:
+                '怎么知道这步成了。输出里会出现的关键字样（如 Started server），或人工判断标准。wait 步骤填要探测的 URL。',
+            },
+            minutes: { type: 'number', description: '预计耗时，分钟，可以是小数' },
           },
-          required: ['kind', 'title'],
+          required: ['section', 'kind', 'title'],
         },
       },
     },
@@ -103,68 +82,26 @@ export const DRAFT_SCHEMA = {
 
 // ── 校验 ─────────────────────────────────────────────────────
 
-const ExpectationOut = z
-  .object({
-    kind: z.enum(['exitCode', 'contains', 'notContains', 'regex', 'manual']),
-    code: z.number().optional(),
-    text: z.string().optional(),
-    caseSensitive: z.boolean().optional(),
-    pattern: z.string().optional(),
-    flags: z.string().optional(),
-    description: z.string().optional(),
-  })
-  .transform((e) => {
-    // 模型可能漏掉分支必需的字段，补上合理默认而不是整份丢弃
-    switch (e.kind) {
-      case 'exitCode':
-        return { kind: 'exitCode' as const, code: e.code ?? 0 }
-      case 'contains':
-        return {
-          kind: 'contains' as const,
-          text: e.text ?? '',
-          caseSensitive: e.caseSensitive ?? true,
-        }
-      case 'notContains':
-        return { kind: 'notContains' as const, text: e.text ?? '' }
-      case 'regex':
-        return { kind: 'regex' as const, pattern: e.pattern ?? '.*', flags: e.flags ?? '' }
-      case 'manual':
-        return { kind: 'manual' as const, description: e.description ?? '人工确认' }
-    }
-  })
-  // 空文本的 contains 永远为真，等于没有预期——丢掉比留着误导好
-  .refine(
-    (e) => !((e.kind === 'contains' || e.kind === 'notContains') && e.text === ''),
-    '文本预期不能为空',
-  )
+/** 模型返回的扁平步骤。 */
+const FlatStep = z.object({
+  section: z.string().default(''),
+  kind: z.enum(['command', 'check', 'wait', 'manual', 'decision']),
+  title: z.string().min(1),
+  why: z.string().optional(),
+  command: z.string().optional(),
+  expect: z.string().optional(),
+  minutes: z.number().positive().optional(),
+})
 
-const ProbeOut = z
-  .object({
-    kind: z.enum(['http', 'port', 'logPattern', 'command']),
-    url: z.string().optional(),
-    expectStatus: z.number().optional(),
-    host: z.string().optional(),
-    port: z.number().optional(),
-    pattern: z.string().optional(),
-    command: z.string().optional(),
-    expectExitCode: z.number().optional(),
-  })
-  .transform((p) => {
-    switch (p.kind) {
-      case 'http':
-        return { kind: 'http' as const, url: p.url ?? '', expectStatus: p.expectStatus ?? 200 }
-      case 'port':
-        return { kind: 'port' as const, host: p.host ?? '127.0.0.1', port: p.port ?? 0 }
-      case 'logPattern':
-        return { kind: 'logPattern' as const, pattern: p.pattern ?? '' }
-      case 'command':
-        return {
-          kind: 'command' as const,
-          command: p.command ?? '',
-          expectExitCode: p.expectExitCode ?? 0,
-        }
-    }
-  })
+const DraftOutput = z.object({
+  assumptions: z.array(z.object({ key: z.string(), value: z.string() })).default([]),
+  // 单个步骤不合格就丢掉它，不因此废掉整份 runbook
+  steps: z
+    .array(FlatStep.catch(() => null as never))
+    .transform((arr) => arr.filter((s) => s !== null)),
+})
+
+type Flat = z.infer<typeof FlatStep>
 
 interface StepOut {
   kind: 'command' | 'check' | 'wait' | 'manual' | 'decision' | 'note'
@@ -179,25 +116,91 @@ interface StepOut {
   children?: StepOut[]
 }
 
-const StepOutSchema: z.ZodType<StepOut> = z.lazy(() =>
-  z.object({
-    kind: z.enum(['command', 'check', 'wait', 'manual', 'decision', 'note']),
-    title: z.string().min(1),
-    whyMd: z.string().optional(),
-    whySource: z.string().optional(),
-    command: z.string().optional(),
-    expectation: ExpectationOut.optional().catch(undefined),
-    probe: ProbeOut.optional().catch(undefined),
-    timeoutMs: z.number().positive().optional(),
-    expectedMinutes: z.number().positive().optional(),
-    children: z.array(StepOutSchema).optional(),
-  }),
-)
+/** 按 section 把扁平列表还原成两层树。 */
+function toTree(flat: Flat[]): StepOut[] {
+  const out: StepOut[] = []
+  let currentSection: string | null = null
+  let currentNode: StepOut | null = null
 
-const DraftOutput = z.object({
-  assumptions: z.array(z.object({ key: z.string(), value: z.string() })).default([]),
-  steps: z.array(StepOutSchema).min(1),
-})
+  for (const f of flat) {
+    const step = toStepOut(f)
+    const section = f.section.trim()
+
+    // 没有章节名的步骤直接放顶层
+    if (section === '') {
+      out.push(step)
+      currentSection = null
+      currentNode = null
+      continue
+    }
+
+    if (section !== currentSection) {
+      currentSection = section
+      currentNode = { kind: 'note', title: section, children: [] }
+      out.push(currentNode)
+    }
+
+    currentNode!.children!.push(step)
+  }
+
+  return out
+}
+
+/** 超时相对预期耗时的倍数。给足余量，但不至于让人等到怀疑。 */
+const TIMEOUT_FACTOR = 3
+/** 没有耗时估计时的兜底超时。 */
+const FALLBACK_TIMEOUT_MS = 120_000
+
+function toStepOut(f: Flat): StepOut {
+  const step: StepOut = { kind: f.kind, title: f.title }
+
+  if (f.why !== undefined && f.why.trim() !== '') step.whyMd = f.why
+  if (f.command !== undefined && f.command.trim() !== '') step.command = f.command
+  if (f.minutes !== undefined) step.expectedMinutes = f.minutes
+
+  // 超时由耗时估计推导，不让模型再算一遍——它算出来的经常不合理，
+  // 而这个换算是纯机械的。
+  step.timeoutMs =
+    f.minutes !== undefined
+      ? Math.max(30_000, Math.round(f.minutes * 60_000 * TIMEOUT_FACTOR))
+      : FALLBACK_TIMEOUT_MS
+
+  const expect = f.expect?.trim() ?? ''
+  if (expect !== '') {
+    const probe = asProbe(expect)
+    if (probe !== null && f.kind === 'wait') {
+      step.probe = probe
+    } else if (isHumanJudgement(f.kind)) {
+      step.expectation = { kind: 'manual', description: expect }
+    } else {
+      // 命令类步骤：expect 是输出里会出现的字样
+      step.expectation = { kind: 'contains', text: expect, caseSensitive: true }
+    }
+  }
+
+  return step
+}
+
+/** expect 看起来像个 URL 或 host:port 就当成就绪探针。 */
+function asProbe(expect: string): unknown {
+  const url = /^https?:\/\/\S+$/.exec(expect)
+  if (url !== null) return { kind: 'http', url: expect, expectStatus: 200 }
+
+  const hostPort = /^([\w.-]+):(\d{2,5})$/.exec(expect)
+  if (hostPort !== null) {
+    return { kind: 'port', host: hostPort[1]!, port: Number(hostPort[2]!) }
+  }
+
+  // 只给了端口号
+  const bare = /^:?(\d{2,5})$/.exec(expect)
+  if (bare !== null) return { kind: 'port', host: '127.0.0.1', port: Number(bare[1]!) }
+
+  return null
+}
+
+function isHumanJudgement(kind: Flat['kind']): boolean {
+  return kind === 'manual' || kind === 'decision'
+}
 
 // ── 起草 ─────────────────────────────────────────────────────
 
@@ -220,6 +223,7 @@ export async function draftRunbook(
   template: string,
   ctx: DraftContext,
   signal?: AbortSignal,
+  onProgress?: (p: { kind: 'thinking' | 'writing'; chars: number }) => void,
 ): Promise<DraftResult> {
   const prompt = renderTemplate(template, {
     title: ctx.task.title,
@@ -235,8 +239,10 @@ export async function draftRunbook(
       { role: 'user', content: prompt },
     ],
     schema: DRAFT_SCHEMA,
-    maxTokens: 8192,
+    // 不在这里定上限：起草是最重的调用，推理型模型光思考就可能花掉
+    // 三万字符。预算由 provider 配置决定（config.llm.maxTokens）。
     ...(signal !== undefined ? { signal } : {}),
+    ...(onProgress !== undefined ? { onProgress } : {}),
   })
 
   if (completion.structured === undefined) {
@@ -244,10 +250,14 @@ export async function draftRunbook(
   }
 
   const parsed = DraftOutput.parse(completion.structured)
+  if (parsed.steps.length === 0) {
+    throw new Error('模型返回的步骤全部不合格式')
+  }
 
   return {
     assumptions: parsed.assumptions.map((a) => ({ ...a, editedByUser: false })),
-    steps: parsed.steps,
+    // 扁平列表按 section 还原成树
+    steps: toTree(parsed.steps),
     model: completion.model,
   }
 }

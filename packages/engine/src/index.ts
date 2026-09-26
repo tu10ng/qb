@@ -45,6 +45,7 @@ export function apply(ctx: DshContext, config: Config): void {
   const prompts = {
     persona: readPrompt('qb-persona.md'),
     draft: readPrompt('draft.md'),
+    diagnose: readPrompt('diagnose.md'),
   }
 
   const api = buildApi({ host, store, ws, mount, currentUserId: () => me.id, prompts })

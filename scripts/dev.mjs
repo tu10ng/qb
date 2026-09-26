@@ -43,6 +43,9 @@ async function main() {
           `          baseUrl: '${process.env.QB_LLM_BASE_URL}'`,
           `          apiKey: '${process.env.QB_LLM_API_KEY ?? ''}'`,
           `          model: '${process.env.QB_LLM_MODEL ?? 'deepseek-chat'}'`,
+          // 推理型模型（GLM、带 thinking 的 Claude）会先花掉一大截预算
+          // 在思考上，预算不足会导致工具调用被截断。
+          `          maxTokens: ${process.env.QB_LLM_MAX_TOKENS ?? 65536}`,
         ]
       : []
 

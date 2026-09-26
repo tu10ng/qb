@@ -37,6 +37,28 @@ export class ApiError extends Error {
   }
 }
 
+export type JobStatus = 'running' | 'done' | 'failed'
+
+export interface Job {
+  id: string
+  kind: string
+  subjectId: string
+  status: JobStatus
+  startedAt: number
+  endedAt: number | null
+  error: string | null
+  result: unknown
+  progress: string | null
+}
+
+export interface Diagnosis {
+  summary: string
+  fromLessonId: string | null
+  options: Array<{ label: string; detail: string; command?: string }>
+  askInstead: string | null
+  model: string
+}
+
 export interface TaskDetail {
   task: Task
   runbook: Runbook | null
@@ -57,9 +79,16 @@ export const api = {
 
   taskDetail: (taskId: string) => req<TaskDetail>(`/tasks/${taskId}/runbook`),
 
-  /** 让 QB 起草 runbook。要等模型，可能几十秒。 */
+  /**
+   * 让 QB 起草 runbook。立刻返回任务 id，结果经 WS 的 job.update 推送。
+   * existing=true 表示已经有一个在跑了（连点两次不会起两份）。
+   */
   draft: (taskId: string) =>
-    req<{ runbook: Runbook; steps: Step[] }>(`/tasks/${taskId}/draft`, { method: 'POST' }),
+    req<{ jobId: string; status: JobStatus; existing: boolean }>(`/tasks/${taskId}/draft`, {
+      method: 'POST',
+    }),
+
+  job: (jobId: string) => req<Job>(`/jobs/${jobId}`),
 
   writeRunbook: (
     taskId: string,
@@ -75,6 +104,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(opts),
     }),
+
+  /** 让 QB 诊断一步的失败，给出可执行的路径。 */
+  diagnose: (stepId: string) =>
+    req<Diagnosis>(`/steps/${stepId}/diagnose`, { method: 'POST' }),
 
   /** 手动提交证据：自己跑完把输出贴回来，或直接标记完成。 */
   submitEvidence: (
@@ -108,6 +141,7 @@ export type ServerEvent =
     }
   | { type: 'step.error'; stepId: string; message: string }
   | { type: 'runbook.updated'; taskId: string; version: number }
+  | { type: 'job.update'; job: Job }
 
 /**
  * 连接事件流，断线自动重连。

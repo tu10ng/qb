@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Step, Task } from '@qb/core'
-import { api, connectEvents, type ServerEvent, type TaskDetail } from './api.ts'
+import { api, connectEvents, type Job, type ServerEvent, type TaskDetail } from './api.ts'
 import { StepCell, formatMs, type StepRunState } from './StepCell.tsx'
 
 export function App() {
@@ -10,6 +10,8 @@ export function App() {
   const [runStates, setRunStates] = useState<Record<string, StepRunState>>({})
   const [focusMode, setFocusMode] = useState(false)
   const [currentStepId, setCurrentStepId] = useState<string | null>(null)
+  // QB 的后台任务（起草等）。慢调用不阻塞界面，靠 WS 回报进度。
+  const [jobs, setJobs] = useState<Record<string, Job>>({})
 
   const refreshTasks = useCallback(async () => {
     setTasks(await api.listTasks())
@@ -84,6 +86,10 @@ export function App() {
             return id
           })
           break
+
+        case 'job.update':
+          setJobs((m) => ({ ...m, [e.job.subjectId]: e.job }))
+          break
       }
     })
   }, [refreshDetail, refreshTasks])
@@ -151,6 +157,7 @@ export function App() {
       ) : (
         <TaskPage
           detail={detail}
+          job={jobs[detail.task.id]}
           runStates={runStates}
           currentId={currentId}
           focusMode={focusMode}
@@ -167,6 +174,7 @@ export function App() {
 
 interface TaskPageProps {
   detail: TaskDetail
+  job: Job | undefined
   runStates: Record<string, StepRunState>
   currentId: string | null
   focusMode: boolean
@@ -177,6 +185,7 @@ interface TaskPageProps {
 
 function TaskPage({
   detail,
+  job,
   runStates,
   currentId,
   focusMode,
@@ -238,7 +247,7 @@ function TaskPage({
             </div>
           )}
 
-          {steps.length === 0 && <DraftPrompt taskId={task.id} onDrafted={onChanged} />}
+          {steps.length === 0 && <DraftPrompt taskId={task.id} job={job} />}
 
           {visible.map((s) => (
             <div key={s.id} ref={s.id === currentId ? currentRef : undefined}>
@@ -274,7 +283,7 @@ function TaskPage({
           <div className="qb-actions">
             <button className="btn">情况变了…</button>
             <button className="btn">问发起人</button>
-            {steps.length > 0 && <RedraftButton taskId={task.id} onDone={onChanged} />}
+            {steps.length > 0 && <RedraftButton taskId={task.id} job={job} />}
           </div>
         </aside>
       </div>
@@ -284,54 +293,52 @@ function TaskPage({
 
 // ── 起草 ──────────────────────────────────────────────────────
 
+/** 起草期间显示已等待时长。干等一个不知道要多久的转圈是最烦人的。 */
+function useElapsed(since: number | null): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (since === null) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [since])
+  return since === null ? 0 : Math.floor((now - since) / 1000)
+}
+
 /**
  * 空 runbook 时的起草入口。
  *
- * 起草要等模型几十秒，期间明确告诉用户在等什么——干等一个转圈
- * 不知道要等多久是最烦人的。
+ * 起草在后台跑（推理型模型要 40 秒到 4 分钟），状态来自 WS 推送的
+ * job 事件——用户切走再回来、刷新页面都能接回进度。
  */
-function DraftPrompt({ taskId, onDrafted }: { taskId: string; onDrafted: () => void }) {
-  const [busy, setBusy] = useState(false)
+function DraftPrompt({ taskId, job }: { taskId: string; job: Job | undefined }) {
   const [error, setError] = useState<string | null>(null)
-  const [elapsed, setElapsed] = useState(0)
+  const running = job?.status === 'running'
+  const elapsed = useElapsed(running ? job!.startedAt : null)
 
-  useEffect(() => {
-    if (!busy) return
-    const t = setInterval(() => setElapsed((s) => s + 1), 1000)
-    return () => clearInterval(t)
-  }, [busy])
-
-  const draft = async (): Promise<void> => {
-    setBusy(true)
+  const start = (): void => {
     setError(null)
-    setElapsed(0)
-    try {
-      await api.draft(taskId)
-      onDrafted()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
+    api.draft(taskId).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
   }
 
-  if (busy) {
+  if (running) {
     return (
       <p style={{ color: 'var(--text-dim)' }}>
-        QB 正在起草……已等待 {elapsed} 秒。它在检索团队的 skill 和坑，并按你的环境渲染命令。
+        QB 正在起草……{job!.progress ?? '检索团队的 skill 和坑'} · 已等待 {elapsed} 秒
       </p>
     )
   }
 
+  const failure = error ?? (job?.status === 'failed' ? job.error : null)
+
   return (
     <div style={{ color: 'var(--text-dim)' }}>
       <p>还没有 runbook。</p>
-      <button className="btn primary" onClick={() => void draft()}>
+      <button className="btn primary" onClick={start}>
         让 QB 起草
       </button>
-      {error !== null && (
+      {failure !== null && (
         <p className="verdict fail" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
-          {error}
+          {failure}
         </p>
       )}
     </div>
@@ -339,30 +346,28 @@ function DraftPrompt({ taskId, onDrafted }: { taskId: string; onDrafted: () => v
 }
 
 /** 重新起草。旧版本会保留，不会丢。 */
-function RedraftButton({ taskId, onDone }: { taskId: string; onDone: () => void }) {
-  const [busy, setBusy] = useState(false)
+function RedraftButton({ taskId, job }: { taskId: string; job: Job | undefined }) {
   const [error, setError] = useState<string | null>(null)
+  const running = job?.status === 'running'
+  const elapsed = useElapsed(running ? job!.startedAt : null)
 
   return (
     <>
       <button
         className="btn ghost"
-        disabled={busy}
+        disabled={running}
         onClick={() => {
-          setBusy(true)
           setError(null)
           api
             .draft(taskId)
-            .then(onDone)
             .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-            .finally(() => setBusy(false))
         }}
       >
-        {busy ? 'QB 起草中…' : '让 QB 重新起草'}
+        {running ? `${job!.progress ?? 'QB 起草中'} · ${elapsed}s` : '让 QB 重新起草'}
       </button>
-      {error !== null && (
+      {(error ?? (job?.status === 'failed' ? job.error : null)) !== null && (
         <div className="verdict fail" style={{ fontSize: 12 }}>
-          {error}
+          {error ?? job?.error}
         </div>
       )}
     </>
