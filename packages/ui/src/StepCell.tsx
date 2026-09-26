@@ -161,6 +161,8 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
 
   const isDangerous = danger !== null
   const rendered = step.command !== null ? renderCommand(step.command, params) : { text: '', missing: [] as string[], undeclared: [] as string[] }
+  // 缺值与写错名字的（未声明）参数都挡运行
+  const blockedParams = [...rendered.missing, ...rendered.undeclared]
   const badge = originBadge(step, lastEdit)
 
   return (
@@ -240,12 +242,12 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
                 <div className="actions">
                   <button
                     className="btn primary"
-                    title={rendered.missing.length > 0 ? `缺参数：${rendered.missing.join('、')}` : undefined}
+                    title={blockedParams.length > 0 ? `缺参数：${blockedParams.join('、')}` : undefined}
                     onClick={(e) => {
                       e.stopPropagation()
                       void run()
                     }}
-                    disabled={running || (isDangerous && !confirmed) || rendered.missing.length > 0}
+                    disabled={running || (isDangerous && !confirmed) || blockedParams.length > 0}
                   >
                     {running ? '运行中' : '▶ 运行'}
                   </button>
@@ -262,8 +264,10 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
               )}
             </div>
 
-            {step.command !== null && rendered.missing.length > 0 && (
-              <div className="cmd-note">缺参数：{rendered.missing.join('、')} —— 在上面的参数面板里补上</div>
+            {step.command !== null && blockedParams.length > 0 && (
+              <div className="cmd-note">
+                {rendered.undeclared.length > 0 ? '未声明的参数（模板写错了名字）' : '缺参数'}：{blockedParams.join('、')} —— 在上面的参数面板里补上
+              </div>
             )}
 
             {step.command !== null && fidelity !== undefined && !fidelity.verbatim && !fidelity.unverified && (

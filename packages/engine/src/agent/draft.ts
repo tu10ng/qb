@@ -9,6 +9,7 @@
 import { z } from 'zod'
 import type { Environment, Lesson, Skill, Task } from '@qb/core'
 import type { Llm } from '../llm/port.ts'
+import { fillTemplate } from './prompt.ts'
 
 // ── 模型输出的 schema ────────────────────────────────────────
 
@@ -239,8 +240,9 @@ export async function draftRunbook(
 
 // ── 模板渲染 ─────────────────────────────────────────────────
 
+/** 单趟填充：任务内容里写着 {{knowledge}} 之类的占位不会被再替换。 */
 function renderTemplate(template: string, vars: Record<string, string>): string {
-  return template.replace(/\{\{(\w+)\}\}/g, (_m, key: string) => vars[key] ?? '')
+  return fillTemplate(template, vars)
 }
 
 function renderExpectations(task: DraftContext['task']): string {

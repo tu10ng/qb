@@ -763,12 +763,15 @@ function TaskPage({
             </div>
           )}
 
-          {/* 差异卡片：模式 A 的逐项接受 / 情况变了的重规划 */}
+          {/* 差异卡片：模式 A 的逐项接受 / 情况变了的重规划。
+              key 绑 job id：新一次出差异时勾选状态重置，不沿用上一份的 */}
           {showAdapt && adaptProposal !== null && (
             <AdaptCard
+              key={adaptJob!.id}
               taskId={task.id}
               steps={steps}
               params={params}
+              runbookVersion={runbook?.version ?? 1}
               proposal={adaptProposal}
               onApplied={() => {
                 setAdaptDismissedJob(adaptJob!.id)

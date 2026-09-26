@@ -321,6 +321,7 @@ export const api = {
       newParams: Array<{ name: string; value: string; description?: string }>
       stepEdits: Array<{ stepId: string; command: string }>
       reason?: string
+      expectedVersion?: number
     },
   ) => req<{ ok: boolean; summary: string }>(`/tasks/${taskId}/adapt/apply`, { method: 'POST', body: JSON.stringify(input) }),
 

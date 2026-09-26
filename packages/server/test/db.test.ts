@@ -169,6 +169,37 @@ describe('数据库 schema', () => {
       // 每一步的血缘各不相同
       expect(new Set(rows.map((r) => r.lineage_key)).size).toBe(2)
       db.close()
+
+      // v1 库带假设的 runbook：一路升到最新后，假设变成"QB 猜的"展示参数
+      const dir2 = mkdtempSync(join(tmpdir(), 'qb-migrate1-'))
+      const path2 = join(dir2, 'old.db')
+      try {
+        const old1 = new Database(path2)
+        old1.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+        old1.exec(MIGRATIONS[0]!.sql)
+        old1.prepare('INSERT INTO schema_migrations VALUES (1, ?, 1)').run(MIGRATIONS[0]!.name)
+        old1.exec(`
+          INSERT INTO users (id, name, display_name, created_at) VALUES ('u1','a','A',1);
+          INSERT INTO tasks (id, title, initiator_id, assignee_id, status, created_at)
+            VALUES ('t1','升级 vLLM','u1','u1','done',1);
+          INSERT INTO runbooks (id, task_id, version, created_by, created_at, assumptions_json)
+            VALUES ('r1','t1',1,'u1',1,'[{"key":"版本","value":"0.11.0","editedByUser":false}]');
+        `)
+        old1.close()
+
+        const db1 = openDb({ path: path2 })
+        const row = db1.prepare('SELECT params_json FROM runbooks WHERE id = ?').get('r1') as { params_json: string }
+        expect(JSON.parse(row.params_json)).toEqual([{ name: '版本', value: '0.11.0', source: 'qb_guess', secret: 0 }])
+        // v1→最新一路也回填了任务索引
+        expect(db1.prepare(`SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH 'vllm'`).all()).toHaveLength(1)
+        db1.close()
+      } finally {
+        try {
+          rmSync(dir2, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+        } catch {
+          /* 留给系统清理 */
+        }
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

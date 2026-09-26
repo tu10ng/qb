@@ -86,6 +86,8 @@ export interface BlockMatch {
  *
  * 一段输出里用户可能敲了些 runbook 之外的命令（查看状态之类），匹配
  * 不上的块照常返回（stepId=null），调用方只需提示"有 N 条没对上步骤"。
+ * 子串命中取**最长**的那条步骤命令——两条命令互为前缀时归给更具体的
+ * 那步，而不是迭代顺序碰到的最后一条。
  */
 export function matchBlocks(blocks: TranscriptBlock[], steps: StepLike[], params: Param[]): BlockMatch[] {
   const rendered = new Map<string, string>()
@@ -99,6 +101,7 @@ export function matchBlocks(blocks: TranscriptBlock[], steps: StepLike[], params
 
     let bestId: string | null = null
     let bestExact = false
+    let bestSubLen = 0
     for (const [id, stepCmd] of rendered) {
       if (stepCmd === cmd) {
         bestId = id
@@ -106,8 +109,11 @@ export function matchBlocks(blocks: TranscriptBlock[], steps: StepLike[], params
         break
       }
       // 终端里敲的命令可能带前缀（CUDA_VISIBLE_DEVICES=…）或后缀重定向，
-      // 步骤命令是它的子串时也算命中
-      if (!bestExact && cmd.includes(stepCmd) && stepCmd.length >= 8) bestId = id
+      // 步骤命令是它的子串时也算命中；短于 6 个字符的子串太容易撞
+      if (!bestExact && cmd.includes(stepCmd) && stepCmd.length >= 6 && stepCmd.length > bestSubLen) {
+        bestId = id
+        bestSubLen = stepCmd.length
+      }
     }
     return { blockIndex, stepId: bestId, exact: bestExact }
   })

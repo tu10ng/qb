@@ -359,11 +359,17 @@ export function buildApi(deps: ApiDeps): Router {
     const taskId = store.taskIdOfStep(stepId)
 
     // 命令是模板：先按当前参数表渲染。缺值的参数宁可拒绝运行，
-    // 也不能把 {{DECODE_HOST}} 原样发给 shell。
+    // 也不能把 {{DECODE_HOST}} 原样发给 shell——写错了名字的（未声明）
+    // 同样要拦。
     const runbook = taskId === null ? null : store.getLatestRunbook(taskId)
     const rendered = renderCommand(step.command, runbook?.runbook.params ?? [])
-    if (rendered.missing.length > 0) {
-      sendJson(res, 400, { error: 'missing_params', message: `缺参数：${rendered.missing.join('、')}`, missing: rendered.missing })
+    const blocked = [...rendered.missing, ...rendered.undeclared]
+    if (blocked.length > 0) {
+      sendJson(res, 400, {
+        error: 'missing_params',
+        message: `${rendered.undeclared.length > 0 ? '未声明的参数' : '缺参数'}：${blocked.join('、')}`,
+        missing: blocked,
+      })
       return
     }
 

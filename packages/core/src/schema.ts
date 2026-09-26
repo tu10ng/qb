@@ -91,6 +91,8 @@ export const Runbook = z.object({
   params: z.array(Param).default([]),
   /** 从哪份 runbook 复制/差异而来（模式 A 的"底稿"）。 */
   baseRunbookId: Id.nullable(),
+  /** 从哪份素材整理而来（模式 B）——保真报告对着它比。 */
+  materialId: Id.nullable(),
   /** 这份 runbook 怎么来的：import=贴素材整理，copy=以底稿为基础，
    * adapt=在底稿上应用过差异，draft=空白起草。 */
   origin: z.enum(['import', 'copy', 'adapt', 'draft', 'human']).nullable(),

@@ -77,4 +77,19 @@ describe('matchBlocks', () => {
     expect(m.every((x) => x.stepId === 's')).toBe(true)
     expect(m[1]!.exact).toBe(true)
   })
+
+  it('两条命令互为前缀时归给更长（更具体）的那步，短命令也认（≥6 字符）', () => {
+    const m = matchBlocks(
+      [{ command: 'vllm serve /m --port 8100 --extra-flag', output: '' }],
+      [
+        { id: 'short', command: 'vllm serve /m' },
+        { id: 'long', command: 'vllm serve /m --port 8100' },
+      ],
+      [],
+    )
+    expect(m[0]!.stepId).toBe('long')
+
+    const short = matchBlocks([{ command: 'free -g', output: '' }], [{ id: 'fg', command: 'free -g' }], [])
+    expect(short[0]!.stepId).toBe('fg')
+  })
 })

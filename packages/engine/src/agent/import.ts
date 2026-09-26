@@ -8,6 +8,7 @@
 import { z } from 'zod'
 import type { Environment } from '@qb/core'
 import { KINDS, toTree, type FlatStep, type StepOut } from './draft.ts'
+import { fillTemplate } from './prompt.ts'
 import type { Llm } from '../llm/port.ts'
 
 const ParamOut = z.object({
@@ -68,9 +69,11 @@ export async function importMaterial(
   input: { material: string; environments: Environment[] },
   opts: { signal?: AbortSignal; onPartial?: (partial: unknown) => void } = {},
 ): Promise<ImportResult> {
-  const prompt = importPrompt
-    .replace('{{material}}', input.material)
-    .replace('{{environment}}', renderEnvironments(input.environments))
+  // 单趟填充：素材里写着 {{environment}} 之类的占位不会被吃掉
+  const prompt = fillTemplate(importPrompt, {
+    material: input.material,
+    environment: renderEnvironments(input.environments),
+  })
 
   const result = await llm.structured({
     purpose: 'structure',

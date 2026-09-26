@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import { checkExpectation, literalSuggestions, matchBlocks, redact, renderCommand, sanitizeText, splitTranscript, tailCap, toParamName, checkFidelity, type Expectation, type Param, type StepStatus, type Verdict } from '@qb/core'
+import { checkExpectation, literalSuggestions, matchBlocks, redact, renderCommand, sanitizeText, splitTranscript, tailCap, checkFidelity, type Expectation, type Param, type StepStatus, type Verdict } from '@qb/core'
 import type { Store } from '@qb/server'
 import type { Llm } from '../llm/port.ts'
 import { importMaterial } from '../agent/import.ts'
@@ -36,7 +36,7 @@ const ParamBody = z.object({
 
 const MaterialBody = z.object({
   kind: z.enum(['doc', 'script', 'chat', 'terminal', 'image-text']).catch('doc'),
-  text: z.string().min(1, '素材内容是空的'),
+  text: z.string().min(1, '素材内容是空的').max(200_000, '素材太长（上限 20 万字符）——拆成几段分次贴'),
   filename: z.string().optional(),
 })
 
@@ -45,6 +45,8 @@ const AdaptApplyBody = z.object({
   newParams: z.array(ParamBody).default([]),
   stepEdits: z.array(z.object({ stepId: z.string(), command: z.string().min(1) })).default([]),
   reason: z.string().optional(),
+  /** 界面看到差异时的 runbook 版本：期间被别的标签页换过就拒绝。 */
+  expectedVersion: z.number().int().positive().optional(),
 })
 
 const SuggestApplyBody = z.object({
@@ -114,66 +116,77 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
         },
       )
 
-      const before = latestOf(taskId)
-      if (before !== null) store.snapshotRunbook(before.runbook.id, '导入素材前', currentUserId())
+      // 落库整体一个事务：快照、runbook、坑、事件要么全成要么全无
+      const result = store.inTransaction(() => {
+        const before = latestOf(taskId)
+        if (before !== null) store.snapshotRunbook(before.runbook.id, '导入素材前', currentUserId())
 
-      const params: Param[] = imported.params.map((p) => ({
-        name: p.name,
-        value: p.value,
-        source: 'origin',
-        secret: false,
-        ...(p.description !== undefined ? { description: p.description } : {}),
-      }))
+        const params: Param[] = imported.params.map((p) => ({
+          name: p.name,
+          value: p.value,
+          source: 'origin',
+          secret: false,
+          ...(p.description !== undefined ? { description: p.description } : {}),
+        }))
 
-      const result = store.createRunbook({
-        taskId,
-        createdBy: currentUserId(),
-        origin: 'import',
-        params,
-        steps: imported.steps as Parameters<Store['createRunbook']>[0]['steps'],
-      })
-
-      // 保真/覆盖是确定性校验，导入完立刻算，随事件发出去
-      const flat = result.steps.filter((s) => s.command !== null && s.command !== '')
-      const fidelity = checkFidelity(flat.map((s) => s.command!), material.text, params)
-      const byIndex = new Map(flat.map((s, i) => [i, s.id]))
-
-      // 原文里的坑：存成 personal 的坑（诊断/起草能检索到）；锚定到具体
-      // 步骤的显示层级是 M9 的事
-      for (const l of imported.lessons) {
-        const stepId = l.stepIndex !== undefined ? byIndex.get(l.stepIndex) : undefined
-        const stepTitle = stepId !== undefined ? result.steps.find((s) => s.id === stepId)?.title : undefined
-        store.createLesson({
-          anchorKind: 'free',
-          condition: stepTitle !== undefined ? `步骤「${stepTitle}」` : null,
-          symptom: l.symptom,
-          fixMd: l.fix,
-          authorId: currentUserId(),
-          sourceTaskId: taskId,
-          scope: 'personal',
+        const created = store.createRunbook({
+          taskId,
+          createdBy: currentUserId(),
+          origin: 'import',
+          params,
+          materialId: material.id,
+          steps: imported.steps as Parameters<Store['createRunbook']>[0]['steps'],
         })
-      }
 
-      store.appendEvent({
-        taskId,
-        actorId: null,
-        kind: 'replanned',
-        payload: {
-          version: result.runbook.version,
-          by: 'qb',
-          reason: '从素材整理',
-          model: imported.model,
-          dropped: imported.dropped,
-          gaps: imported.gaps,
-          fidelity: {
-            verbatim: fidelity.items.filter((i) => i.verbatim).length,
-            total: fidelity.items.length,
-            rewritten: fidelity.items
-              .filter((i) => !i.verbatim && !i.unverified)
-              .map((i) => ({ stepId: byIndex.get(i.index) ?? null, closest: i.closest ?? null })),
-            uncoveredCount: fidelity.uncovered.length,
+        // 保真/覆盖是确定性校验，导入完立刻算，随事件发出去
+        const flat = created.steps.filter((s) => s.command !== null && s.command !== '')
+        const fidelity = checkFidelity(flat.map((s) => s.command!), material.text, params)
+        const fidelityStep = new Map(flat.map((s, i) => [i, s.id]))
+        // 坑的 stepIndex 是模型按它自己的步骤列表（含无命令的步骤）编的号，
+        // 映射要用同一套下标：文档序、排除章节标题
+        const lessonStep = new Map(
+          created.steps.filter((s) => !(s.kind === 'note' && s.parentId === null)).map((s, i) => [i, s.id]),
+        )
+
+        // 原文里的坑：存成 personal 的坑（诊断/起草能检索到）；同症状的
+        // 不重复插（重复导入时）；锚定到具体步骤的显示层级是 M9 的事
+        for (const l of imported.lessons) {
+          if (store.hasLesson(taskId, l.symptom)) continue
+          const stepId = l.stepIndex !== undefined ? lessonStep.get(l.stepIndex) : undefined
+          const stepTitle = stepId !== undefined ? created.steps.find((s) => s.id === stepId)?.title : undefined
+          store.createLesson({
+            anchorKind: 'free',
+            condition: stepTitle !== undefined ? `步骤「${stepTitle}」` : null,
+            symptom: l.symptom,
+            fixMd: l.fix,
+            authorId: currentUserId(),
+            sourceTaskId: taskId,
+            scope: 'personal',
+          })
+        }
+
+        store.appendEvent({
+          taskId,
+          actorId: null,
+          kind: 'replanned',
+          payload: {
+            version: created.runbook.version,
+            by: 'qb',
+            reason: '从素材整理',
+            model: imported.model,
+            dropped: imported.dropped,
+            gaps: imported.gaps,
+            fidelity: {
+              verbatim: fidelity.items.filter((i) => i.verbatim).length,
+              total: fidelity.items.length,
+              rewritten: fidelity.items
+                .filter((i) => !i.verbatim && !i.unverified)
+                .map((i) => ({ stepId: fidelityStep.get(i.index) ?? null, closest: i.closest ?? null })),
+              uncoveredCount: fidelity.uncovered.length,
+            },
           },
-        },
+        })
+        return created
       })
 
       ws.broadcast({ type: 'runbook.updated', taskId, version: result.runbook.version })
@@ -282,55 +295,64 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
     }
     const body = parsed.data
 
+    // 期间 runbook 换过版本（别的标签页导入/换底稿）就拒绝：参数会写进
+    // 已非最新的版本，命令改动会被静默丢弃
+    if (body.expectedVersion !== undefined && body.expectedVersion !== latest.runbook.version) {
+      sendJson(res, 409, { error: 'version_conflict', message: 'runbook 已更新（别的页面导入或换了底稿），请刷新后重试' })
+      return
+    }
+
     try {
-      store.snapshotRunbook(latest.runbook.id, '应用差异前', currentUserId())
+      const summary = store.inTransaction(() => {
+        store.snapshotRunbook(latest.runbook.id, '应用差异前', currentUserId())
 
-      // 参数：改值 → source mine；没有的新建
-      const params: Param[] = latest.runbook.params.map((p) => ({ ...p }))
-      const byName = new Map(params.map((p) => [p.name, p]))
-      for (const c of body.paramChanges) {
-        const existing = byName.get(c.name)
-        if (existing !== undefined) {
-          existing.value = c.to
-          existing.source = 'mine'
-        } else {
-          const created: Param = { name: c.name, value: c.to, source: 'mine', secret: false }
-          params.push(created)
-          byName.set(c.name, created)
-        }
-      }
-      for (const p of body.newParams) {
-        if (!byName.has(p.name)) {
-          const created: Param = {
-            name: p.name,
-            value: p.value,
-            source: 'mine',
-            secret: p.secret ?? false,
-            ...(p.description !== undefined ? { description: p.description } : {}),
+        // 参数：改值 → source mine；没有的新建
+        const params: Param[] = latest.runbook.params.map((p) => ({ ...p }))
+        const byName = new Map(params.map((p) => [p.name, p]))
+        for (const c of body.paramChanges) {
+          const existing = byName.get(c.name)
+          if (existing !== undefined) {
+            existing.value = c.to
+            existing.source = 'mine'
+          } else {
+            const created: Param = { name: c.name, value: c.to, source: 'mine', secret: false }
+            params.push(created)
+            byName.set(c.name, created)
           }
-          params.push(created)
-          byName.set(p.name, created)
         }
-      }
-      store.updateRunbookParams(latest.runbook.id, params, latest.runbook.origin === 'copy' ? 'adapt' : undefined)
+        for (const p of body.newParams) {
+          if (!byName.has(p.name)) {
+            const created: Param = {
+              name: p.name,
+              value: p.value,
+              source: 'mine',
+              secret: p.secret ?? false,
+              ...(p.description !== undefined ? { description: p.description } : {}),
+            }
+            params.push(created)
+            byName.set(p.name, created)
+          }
+        }
+        store.updateRunbookParams(latest.runbook.id, params, latest.runbook.origin === 'copy' ? 'adapt' : undefined)
 
-      // 命令：就地改，每处一条 edit 事件
-      for (const e of body.stepEdits) {
-        const step = store.getStep(e.stepId)
-        if (step === null || step.runbookId !== latest.runbook.id) continue
-        const { step: after } = store.updateStep(step.id, { command: e.command }, { expectedRev: step.rev, actorId: currentUserId() })
-        store.appendEvent({
-          taskId,
-          stepId: step.id,
-          actorId: currentUserId(),
-          kind: 'edit',
-          payload: { changes: [{ field: 'command', before: step.command, after: e.command }], source: 'adapt' },
-        })
-        void after
-      }
+        // 命令：就地改，每处一条 edit 事件
+        for (const e of body.stepEdits) {
+          const step = store.getStep(e.stepId)
+          if (step === null || step.runbookId !== latest.runbook.id) continue
+          store.updateStep(step.id, { command: e.command }, { expectedRev: step.rev, actorId: currentUserId() })
+          store.appendEvent({
+            taskId,
+            stepId: step.id,
+            actorId: currentUserId(),
+            kind: 'edit',
+            payload: { changes: [{ field: 'command', before: step.command, after: e.command }], source: 'adapt' },
+          })
+        }
 
-      const summary = `应用差异：${body.paramChanges.length} 项参数、${body.stepEdits.length} 处命令${body.reason !== undefined ? `（${body.reason}）` : ''}`
-      store.appendEvent({ taskId, actorId: currentUserId(), kind: 'replanned', payload: { reason: summary, by: 'user' } })
+        const summary = `应用差异：${body.paramChanges.length} 项参数、${body.stepEdits.length} 处命令${body.reason !== undefined ? `（${body.reason}）` : ''}`
+        store.appendEvent({ taskId, actorId: currentUserId(), kind: 'replanned', payload: { reason: summary, by: 'user' } })
+        return summary
+      })
       changed(taskId)
       sendJson(res, 200, { ok: true, summary })
     } catch (e) {
@@ -355,15 +377,21 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
     }
 
     const prev = new Map(latest.runbook.params.map((p) => [p.name, p]))
-    const next: Param[] = parsed.data.map((p) => ({
-      name: p.name,
-      value: p.value,
-      source: p.source ?? (prev.get(p.name)?.value !== p.value ? 'mine' : prev.get(p.name)?.source ?? 'mine'),
-      secret: p.secret ?? prev.get(p.name)?.secret ?? false,
-      ...(p.description !== undefined || prev.get(p.name)?.description !== undefined
-        ? { description: p.description ?? prev.get(p.name)!.description }
-        : {}),
-    }))
+    const next: Param[] = parsed.data.map((p) => {
+      const before = prev.get(p.name)
+      // 值变了的参数一律标 mine（界面据此高亮"这次改过"），不管客户端
+      // 传了什么 source——面板发的是完整对象，会带着旧 source 回来
+      const changed = before === undefined || before.value !== p.value
+      return {
+        name: p.name,
+        value: p.value,
+        source: changed ? ('mine' as const) : ((p.source ?? before?.source ?? 'mine') as Param['source']),
+        secret: p.secret ?? before?.secret ?? false,
+        ...(p.description !== undefined || before?.description !== undefined
+          ? { description: p.description ?? before!.description }
+          : {}),
+      }
+    })
     store.updateRunbookParams(latest.runbook.id, next)
 
     const changes = next
@@ -407,48 +435,73 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
     }
 
     try {
-      store.snapshotRunbook(latest.runbook.id, '参数化前', currentUserId())
+      const applied = store.inTransaction((): { touchedSteps: number; items: Array<{ value: string; name: string }> } => {
+        store.snapshotRunbook(latest.runbook.id, '参数化前', currentUserId())
 
-      let touched = 0
-      for (const s of latest.steps) {
-        if (s.command === null || s.command === '') continue
-        let next = s.command
+        const params: Param[] = latest.runbook.params.map((p) => ({ ...p }))
+        const byName = new Map(params.map((p) => [p.name, p]))
+        // 同名参数已存在且值不同时换名（NAME_2、NAME_3…）：直接沿用旧名
+        // 会让字面值悄悄渲染成旧参数的值
+        const finalName = new Map<string, string>()
         for (const item of parsed.data.items) {
-          if (next.includes(item.value)) next = next.split(item.value).join(`{{${item.name}}}`)
+          let name = item.name
+          const existing = byName.get(name)
+          if (existing !== undefined && existing.value !== item.value) {
+            // 同名参数已存在但值不同（如 PORT_8080 已是 9090）：换名
+            // NAME_2、NAME_3…，直到不撞或撞到同值（同值直接复用）
+            let resolved = ''
+            for (let i = 2; i < 100; i++) {
+              const cand = `${item.name}_${i}`
+              const candParam = byName.get(cand)
+              if (candParam === undefined || candParam.value === item.value) {
+                resolved = cand
+                break
+              }
+            }
+            if (resolved === '') continue
+            name = resolved
+          }
+          if (!byName.has(name)) {
+            const created: Param = { name, value: item.value, source: 'mine', secret: false }
+            params.push(created)
+            byName.set(name, created)
+          }
+          finalName.set(item.value, name)
         }
-        if (next !== s.command) {
-          const { step } = store.updateStep(s.id, { command: next }, { expectedRev: s.rev, actorId: currentUserId() })
-          store.appendEvent({
-            taskId,
-            stepId: s.id,
-            actorId: currentUserId(),
-            kind: 'edit',
-            payload: { changes: [{ field: 'command', before: s.command, after: next }], source: 'parametrize' },
-          })
-          touched++
-          void step
-        }
-      }
 
-      const params: Param[] = latest.runbook.params.map((p) => ({ ...p }))
-      const byName = new Map(params.map((p) => [p.name, p]))
-      for (const item of parsed.data.items) {
-        if (!byName.has(item.name)) {
-          const created: Param = { name: item.name, value: item.value, source: 'mine', secret: false }
-          params.push(created)
-          byName.set(item.name, created)
+        let touched = 0
+        for (const s of latest.steps) {
+          if (s.command === null || s.command === '') continue
+          let next = s.command
+          for (const item of parsed.data.items) {
+            const name = finalName.get(item.value) ?? item.name
+            if (next.includes(item.value)) next = next.split(item.value).join(`{{${name}}}`)
+          }
+          if (next !== s.command) {
+            store.updateStep(s.id, { command: next }, { expectedRev: s.rev, actorId: currentUserId() })
+            store.appendEvent({
+              taskId,
+              stepId: s.id,
+              actorId: currentUserId(),
+              kind: 'edit',
+              payload: { changes: [{ field: 'command', before: s.command, after: next }], source: 'parametrize' },
+            })
+            touched++
+          }
         }
-      }
-      store.updateRunbookParams(latest.runbook.id, params)
 
-      store.appendEvent({
-        taskId,
-        actorId: currentUserId(),
-        kind: 'edit',
-        payload: { changes: [{ field: 'params', before: null, after: null }], parametrize: parsed.data.items, touchedSteps: touched },
+        store.updateRunbookParams(latest.runbook.id, params)
+        store.appendEvent({
+          taskId,
+          actorId: currentUserId(),
+          kind: 'edit',
+          payload: { changes: [{ field: 'params', before: null, after: null }], parametrize: [...finalName.entries()].map(([value, name]) => ({ value, name })), touchedSteps: touched },
+        })
+        return { touchedSteps: touched, items: [...finalName.entries()].map(([value, name]) => ({ value, name })) }
       })
+      void applied
       changed(taskId)
-      sendJson(res, 200, { touchedSteps: touched })
+      sendJson(res, 200, applied)
     } catch (e) {
       sendJson(res, 400, { error: 'apply_failed', message: errMessage(e) })
     }
@@ -522,18 +575,21 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
   })
 }
 
-/** 任务详情里的保真报告：导入/复制来的 runbook 每次取详情时现算（参数
- * 改了，逐字与否会跟着变）。 */
+/** 任务详情里的保真报告：导入来的 runbook 每次取详情时现算（参数
+ * 改了，逐字与否会跟着变）。copy/adapt 来源不参与——它们的命令来自
+ * 底稿，跟这份任务的素材没有逐字关系，比了只会误报"改写过"。 */
 export function fidelityFor(store: Store, taskId: string): {
   items: Array<{ stepId: string; verbatim: boolean; unverified: boolean; closest: string | null }>
   uncoveredCount: number
   materialId: string | null
 } | null {
   const latest = store.getLatestRunbook(taskId)
-  if (latest === null || (latest.runbook.origin !== 'import' && latest.runbook.origin !== 'adapt' && latest.runbook.origin !== 'copy')) return null
-  const materialMeta = store.latestMaterial(taskId)
-  if (materialMeta === null) return null
-  const material = store.getMaterial(materialMeta.id)
+  if (latest === null || latest.runbook.origin !== 'import') return null
+  // 对着导入时的那份素材比（runbook 记了 materialId）；老数据没记时
+  // 退化用任务最近一份素材
+  const materialId = latest.runbook.materialId ?? store.latestMaterial(taskId)?.id ?? null
+  if (materialId === null) return null
+  const material = store.getMaterial(materialId)
   if (material === null) return null
 
   const flat = latest.steps.filter((s) => s.command !== null && s.command !== '')
@@ -549,6 +605,3 @@ export function fidelityFor(store: Store, taskId: string): {
     materialId: material.id,
   }
 }
-
-/** toParamName 重导出：路由层用它把建议名兜底成合法参数名。 */
-export { toParamName }

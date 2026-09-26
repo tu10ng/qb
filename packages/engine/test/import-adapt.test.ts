@@ -151,4 +151,40 @@ describe('proposeAdapt', () => {
     expect(parsed.paramChanges).toEqual([])
     expect(parsed.stepEdits[0]!.stepIndex).toBe(-1)
   })
+
+  it('paramChanges 的名字归一成大写下划线，中文/非法名丢弃', async () => {
+    const llm = new FakeLlm({
+      paramChanges: [
+        { name: 'decode_host', to: 'gpu-22' },
+        { name: '中文', to: 'x' },
+      ],
+      newParams: [],
+      stepEdits: [],
+      obsolete: [],
+      questions: [],
+    })
+    const r = await proposeAdapt(llm, PERSONA, '{{params}}{{steps}}{{lessons}}{{message}}', {
+      message: 'm',
+      params: [],
+      steps: [],
+      lessons: [],
+    })
+    expect(r.paramChanges).toEqual([{ name: 'DECODE_HOST', to: 'gpu-22' }])
+  })
+
+  it('素材里写着 {{environment}} 或替换模式字符，不会被模板填充吃掉', async () => {
+    let seen = ''
+    const llm = new FakeLlm((call) => {
+      seen = call.prompt
+      return { params: [], steps: [{ section: '', kind: 'command', title: 't' }], lessons: [], gaps: [] }
+    })
+    await importMaterial(llm, PERSONA, '素材：{{material}}\n环境：{{environment}}', {
+      material: '正文里嵌着 {{environment}} 和 $& $` 还有 {{steps}}',
+      environments: [],
+    })
+    expect(seen).toContain('正文里嵌着 {{environment}} 和 $& $` 还有 {{steps}}')
+    expect(seen).toContain('（没有采集到环境信息）')
+    // 被吃掉的标志：正文里的占位被环境文本替换
+    expect(seen).not.toMatch(/没有采集到环境信息.*没有采集到环境信息/)
+  })
 })

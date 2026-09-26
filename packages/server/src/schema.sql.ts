@@ -341,4 +341,13 @@ END;
 INSERT INTO tasks_fts(rowid, title, brief_md) SELECT rowid, title, brief_md FROM tasks;
 `,
   },
+  {
+    version: 4,
+    name: 'runbook-material-link',
+    sql: `
+-- 这份 runbook 是从哪份素材整理来的。保真报告必须对着导入时的那份
+-- 素材比——之后任务里又贴了新素材的话，latestMaterial 会指错。
+ALTER TABLE runbooks ADD COLUMN material_id TEXT REFERENCES materials(id) ON DELETE SET NULL;
+`,
+  },
 ]

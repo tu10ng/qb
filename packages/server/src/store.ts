@@ -238,6 +238,8 @@ export class Store {
     params?: Param[]
     /** 底稿：这份 runbook 从哪份复制/差异而来。 */
     baseRunbookId?: string | null
+    /** 素材：这份 runbook 从哪份素材整理而来（保真对着它比）。 */
+    materialId?: string | null
     origin?: Runbook['origin']
     sourceSkillId?: string | null
     sourceSkillVersion?: number | null
@@ -259,6 +261,7 @@ export class Store {
         assumptions: input.assumptions ?? [],
         params: input.params ?? [],
         baseRunbookId: input.baseRunbookId ?? null,
+        materialId: input.materialId ?? null,
         origin: input.origin ?? null,
         sourceSkillId: input.sourceSkillId ?? null,
         sourceSkillVersion: input.sourceSkillVersion ?? null,
@@ -268,8 +271,8 @@ export class Store {
         .prepare(
           `INSERT INTO runbooks
            (id, task_id, version, created_by, created_at, assumptions_json, params_json,
-            base_runbook_id, origin, source_skill_id, source_skill_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            base_runbook_id, material_id, origin, source_skill_id, source_skill_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           runbook.id,
@@ -280,6 +283,7 @@ export class Store {
           JSON.stringify(runbook.assumptions),
           JSON.stringify(runbook.params),
           runbook.baseRunbookId,
+          runbook.materialId,
           runbook.origin,
           runbook.sourceSkillId,
           runbook.sourceSkillVersion,
@@ -1209,6 +1213,19 @@ export class Store {
       )
       .run(key, JSON.stringify(value), Date.now())
   }
+
+  /** 把一串 store 操作包进单个事务：中途失败整体回滚，不留半套参数/半数改动。 */
+  inTransaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)()
+  }
+
+  /** 这个任务上是否已记过同样症状的坑（重复导入时去重用）。 */
+  hasLesson(taskId: string, symptom: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS hit FROM lessons WHERE source_task_id = ? AND symptom = ? LIMIT 1')
+      .get(taskId, symptom) as { hit: number } | undefined
+    return row !== undefined
+  }
 }
 
 // ── 输入类型 ───────────────────────────────────────────────────
@@ -1296,6 +1313,7 @@ interface RunbookRow {
   assumptions_json: string
   params_json: string | null
   base_runbook_id: string | null
+  material_id: string | null
   origin: string | null
   source_skill_id: string | null
   source_skill_version: number | null
@@ -1484,6 +1502,7 @@ function toRunbook(r: RunbookRow): Runbook {
     assumptions: JSON.parse(r.assumptions_json) as Assumption[],
     params: r.params_json === null || r.params_json === '' ? [] : (JSON.parse(r.params_json) as Param[]),
     baseRunbookId: r.base_runbook_id,
+    materialId: r.material_id,
     origin: (r.origin as Runbook['origin']) ?? null,
     sourceSkillId: r.source_skill_id,
     sourceSkillVersion: r.source_skill_version,

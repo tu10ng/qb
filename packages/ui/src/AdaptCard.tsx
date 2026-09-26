@@ -6,6 +6,8 @@ interface Props {
   taskId: string
   steps: Step[]
   params: Param[]
+  /** 出差异时看到的 runbook 版本：应用时带上，期间被换过版本就 409。 */
+  runbookVersion: number
   /** 模型给的差异（job 的 result）。 */
   proposal: AdaptProposal
   onApplied: () => void
@@ -19,7 +21,7 @@ interface Props {
  * 默认全选参数改动与新参数；命令修改、作废建议、疑问逐项勾选。
  * 模型给出的步骤序号在这里映射回 stepId。
  */
-export function AdaptCard({ taskId, steps, params, proposal, onApplied, onDismiss, toast }: Props) {
+export function AdaptCard({ taskId, steps, params, runbookVersion, proposal, onApplied, onDismiss, toast }: Props) {
   const [selectedEdits, setSelectedEdits] = useState<Set<number>>(
     () => new Set(proposal.stepEdits.map((_, i) => i)),
   )
@@ -42,6 +44,7 @@ export function AdaptCard({ taskId, steps, params, proposal, onApplied, onDismis
         paramChanges: proposal.paramChanges.map((c) => ({ name: c.name, to: c.to })),
         newParams: proposal.newParams,
         stepEdits,
+        expectedVersion: runbookVersion,
       })
       toast(r.summary)
       onApplied()

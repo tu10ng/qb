@@ -28,31 +28,48 @@ const SOURCE_LABEL: Record<Param['source'], string> = {
 export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  // 本地权威副本：保存后立刻更新，连续改两行时第二行看到的是第一行改过的表，
+  // 不会用刷新前的 props 把第一行的修改滚回去
+  const [list, setList] = useState(params)
   const [suggestions, setSuggestions] = useState<LiteralSuggestionView[] | null>(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    setDrafts({})
+    setList(params)
+    // 只清已保存名字的草稿，别把旁边没保存的输入一起抹了
+    setDrafts((d) => {
+      const kept: Record<string, string> = {}
+      for (const name of Object.keys(d)) {
+        if (!params.some((p) => p.name === name && d[name] === p.value)) kept[name] = d[name]!
+      }
+      return kept
+    })
   }, [params])
 
   if (params.length === 0) return null
 
-  const confirmList = params.filter((p) => p.value === '' || p.source === 'qb_guess')
-  const highlight = new Set(params.filter((p) => p.source === 'mine').map((p) => p.name))
-  const shown = expanded ? params : confirmList
+  const confirmList = list.filter((p) => p.value === '' || p.source === 'qb_guess')
+  const highlight = new Set(list.filter((p) => p.source === 'mine').map((p) => p.name))
+  const shown = expanded ? list : confirmList
 
   const save = async (name: string, value: string): Promise<void> => {
     setBusy(true)
+    const next = list.map((p) => (p.name === name ? { ...p, value } : p))
+    setList(next) // 乐观更新
     try {
-      await api.updateParams(taskId, params.map((p) => (p.name === name ? { ...p, value } : p)))
-      const others = othersWithValue(params, name, value)
+      await api.updateParams(taskId, next)
+      setDrafts((d) => {
+        const { [name]: _saved, ...rest } = d
+        return rest
+      })
+      const others = othersWithValue(list, name, value)
       if (others.length > 0) {
         toast(`${others.join('、')} 原来也是这个值`, {
           action: {
             label: '一起改',
             run: () => {
               void api
-                .updateParams(taskId, params.map((p) => (others.includes(p.name) || p.name === name ? { ...p, value } : p)))
+                .updateParams(taskId, next.map((p) => (others.includes(p.name) ? { ...p, value } : p)))
                 .then(onChanged)
             },
           },
@@ -61,6 +78,7 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
       onChanged()
     } catch (e) {
       toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+      setList(list) // 回滚乐观更新
     } finally {
       setBusy(false)
     }
@@ -96,9 +114,9 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
           参数 · {confirmList.length > 0 ? `这次要确认的 ${confirmList.length} 个` : '都在'}
           {highlight.size > 0 ? ` · 与底稿不同的 ${highlight.size} 个已高亮` : ''}
         </h3>
-        {params.length > confirmList.length && (
+        {list.length > confirmList.length && (
           <button className="btn ghost" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? '收起' : `全部 ${params.length} 个 ▸`}
+            {expanded ? '收起' : `全部 ${list.length} 个 ▸`}
           </button>
         )}
         <span className="spacer" />

@@ -574,6 +574,28 @@ describe('M7：参数 / 底稿 / 素材', () => {
     // 中文按字切、OR 匹配，单字查询天然很宽；用一个肯定不存在的词验证空结果
     expect(store.searchTasks('zzzqwer')).toEqual([])
   })
+
+  it('hasLesson：同任务同症状判重（重复导入去重用）', () => {
+    const { task } = seedParams()
+    expect(store.hasLesson(task.id, 'NCCL 卡初始化')).toBe(false)
+    store.createLesson({ anchorKind: 'free', symptom: 'NCCL 卡初始化', fixMd: '比对驱动', authorId: me, sourceTaskId: task.id })
+    expect(store.hasLesson(task.id, 'NCCL 卡初始化')).toBe(true)
+    expect(store.hasLesson(task.id, '别的症状')).toBe(false)
+  })
+
+  it('inTransaction：中途抛错整体回滚', () => {
+    const { task } = seedParams()
+    const before = store.getLatestRunbook(task.id)!.runbook.params
+    expect(() =>
+      store.inTransaction(() => {
+        store.updateRunbookParams(store.getLatestRunbook(task.id)!.runbook.id, [
+          { name: 'X', value: 'y', source: 'mine', secret: false },
+        ])
+        throw new Error('中途失败')
+      }),
+    ).toThrow('中途失败')
+    expect(store.getLatestRunbook(task.id)!.runbook.params).toEqual(before)
+  })
 })
 
 describe('本机设置', () => {

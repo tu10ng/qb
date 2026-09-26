@@ -6,6 +6,7 @@
 import { z } from 'zod'
 import type { Lesson, Param, Step } from '@qb/core'
 import { renderCommand } from '@qb/core'
+import { fillTemplate } from './prompt.ts'
 import type { Llm } from '../llm/port.ts'
 
 const ChangeOut = z.object({
@@ -69,15 +70,13 @@ export async function proposeAdapt(
     .map((s, index) => ({ s, index }))
     .filter(({ s }) => s.kind !== 'note' || s.parentId !== null)
 
-  const prompt = adaptPrompt
-    .replace(
-      '{{params}}',
+  // 单趟填充：说明里写着 {{steps}} 之类的占位不会被吃掉
+  const prompt = fillTemplate(adaptPrompt, {
+    params:
       input.params.length === 0
         ? '（还没有参数）'
         : input.params.map((p) => `- ${p.name} = ${p.value === '' ? '（空）' : p.value}${p.description !== undefined ? `（${p.description}）` : ''}`).join('\n'),
-    )
-    .replace(
-      '{{steps}}',
+    steps:
       indexed.length === 0
         ? '（还没有步骤）'
         : indexed
@@ -86,12 +85,12 @@ export async function proposeAdapt(
               return `${index}. ${s.title}${rendered !== null ? `\n   $ ${rendered}` : ''}${s.whyMd !== null ? `\n   为什么：${s.whyMd}` : ''}`
             })
             .join('\n'),
-    )
-    .replace(
-      '{{lessons}}',
-      input.lessons.length === 0 ? '（没有）' : input.lessons.map((l) => `- ${l.condition !== null ? `【${l.condition}】` : ''}${l.symptom} → ${l.fixMd}`).join('\n'),
-    )
-    .replace('{{message}}', input.message)
+    lessons:
+      input.lessons.length === 0
+        ? '（没有）'
+        : input.lessons.map((l) => `- ${l.condition !== null ? `【${l.condition}】` : ''}${l.symptom} → ${l.fixMd}`).join('\n'),
+    message: input.message,
+  })
 
   const result = await llm.structured({
     purpose: 'structure',
@@ -114,10 +113,13 @@ export async function proposeAdapt(
     stepEdits.push({ stepIndex: e.stepIndex, command: e.command, ...(e.reason !== undefined ? { reason: e.reason } : {}) })
   }
 
-  // 改动引用了当前没有的参数名也没关系：应用时找不到就新建同名参数
+  // 改动引用了当前没有的参数名也没关系：应用时找不到就新建同名参数。
+  // 名字归一成大写下划线（与 newParams 一致），归一后仍非法的丢掉。
   const paramChanges = result.output.paramChanges
     .filter((c): c is NonNullable<typeof c> => c !== null && c.name !== '')
-    .map((c) => ({ name: c.name.trim(), to: c.to, ...(c.reason !== undefined ? { reason: c.reason } : {}) }))
+    .map((c) => ({ ...c, name: c.name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_') }))
+    .filter((c) => /^[A-Z][A-Z0-9_]*$/.test(c.name))
+    .map((c) => ({ name: c.name, to: c.to, ...(c.reason !== undefined ? { reason: c.reason } : {}) }))
 
   return {
     paramChanges,
