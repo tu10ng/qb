@@ -1,0 +1,23 @@
+{
+  "name": "qb",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./packages/* build",
+    "typecheck": "pnpm -r --filter=./packages/* typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "node scripts/smoke.mjs",
+    "qb": "pnpm --filter @qb/cli start"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.3",
+    "@types/node": "^22.18.0",
+    "typescript": "~5.9.3",
+    "vitest": "^5.0.2"
+  }
+}

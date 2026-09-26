@@ -1,0 +1,307 @@
+# QB 初版实现方案（v1）
+
+> 配套文档：`AGENTS.md`（产品方案，本文件是它的实现层）。
+> 本文件描述**怎么落地**：仓库结构、数据模型、接口、执行语义、里程碑、验收。
+
+---
+
+## 0. 实证结论（决定架构的事实）
+
+在 `@deepseek-ai/dsh@0.1.5-rc.3`（240 个包全量安装）上读真实 `.d.ts` 与组合配置验证，非文档推断：
+
+| # | 承重假设 | 结论 | 证据 |
+|---|---|---|---|
+| A | 第三方能挂自己的 SPA 和 HTTP 路由 | **成立** | `ctx.webServer.register({kind:'prefix'\|'exact', path, handler})`、`registerUpgrade`（WebSocket）、`tapIndex` 均为公开 API。包头注释：*"It knows no harness concepts and serves no files; the composing application owns dist serving."* 匹配顺序 exact → 最长 prefix → fallback，内置 UI 占 fallback，故 `/qb/*` 与其共存 |
+| B | 自定义 RPC | **改道** | typert `@Remote` 需 build-time codegen，且只认 HttpOnly cookie（`GET /?token=` 铸造），第三方不顺。**放弃 typert，直接用 A 的裸路由做 REST + WS** |
+| C | 外部插件可挂载 | **成立** | `dsh --patch <path>`（可重复）挂任意外部 YAML overlay，开发期无需发 npm 包；发布期用 bundle（`package.json` 的 `dsh.bundle.patch`）+ `dsh plugin --profile qb add <pkg>` |
+| D | 带超时地跑命令并流式取输出，不经模型 | **成立** | `ctx.shell.resolve(req) → spec`、`run(spec) → ShellRunResult{exitCode,signal,timedOut,stdout,stderr}`、`start(spec) → ShellProcess{status, done, readOutput(), kill()}`。`ShellExecRequest` 含 `timeoutMs / signal / env / workdir / stdin`；源码注释明确 stdin·env 是给 *in-process plugins* 用的（hooks bridges 即如此），非模型工具参数 |
+
+**生态增量**（选 dsh 的实际理由）：自带 `dsh-skill`（skill 注册表 seam）、`dsh-goal`、`dsh-workflow`、`dsh-terminal`（持久 PTY）、`dsh-schedule`（cron/间隔，恢复原会话投递）、`dsh-subagent`、`dsh-mcp-client`、`dsh-llm-pi-ai`（通用 OpenAI/Anthropic 兼容适配）、`dsh-user-questions`、`dsh-jobs-local`。Web UI 自身由约 20 个 `dsh-client-ui-*` 插件组合而成——第三方扩 UI 是设计内的用法。
+
+**已知风险与对策**：
+- npm 子包版本落后 monorepo；peer 版本不匹配的 bundle 会被**静默跳过**（`skippedBundles`）→ 锁定 `0.1.5-rc.3`，启动时主动断言 QB 插件已加载，未加载就报错而非静默降级。
+- 官方 `AGENTS.md` 声明 *"Public APIs are pre-stable"*，无弃用政策 → 所有 dsh 调用收敛到 `packages/engine/src/dsh/` 一层适配（`HostPort` 接口），换 harness 只改这层。
+- dsh 禁止第三方包自带 bin（*"package bins … are forbidden"*）→ QB 的 `qb` 命令是我们自己的启动器，内部 spawn `dsh --profile qb`，不注册进 dsh。
+
+---
+
+## 1. 架构
+
+```
+┌─ 用户浏览器 ──────────────────────────────────────────────┐
+│  http://127.0.0.1:3080/qb   ← QB SPA（React）              │
+│  http://127.0.0.1:3080/     ← dsh 内置 UI（保留，自由对话） │
+└───────────────┬───────────────────────────────────────────┘
+                │ REST /qb/api/*  +  WS /qb/ws
+┌───────────────┴─── dsh 进程（profile: qb）────────────────┐
+│  dsh 内核：llm · shell · terminal · jobs · schedule ·      │
+│            skill · session · mcp · agent loop             │
+│  ┌─ @qb/engine（我们的插件）──────────────────────────┐   │
+│  │  web-mount   webServer.register('/qb', SPA+API)    │   │
+│  │  runner      ctx.shell.run/start → 步骤执行与流式   │   │
+│  │  agent       QB 的 6 种行为（起草/陪跑/求助/复盘…） │   │
+│  │  sync        ←→ team server（离线队列 + 脱敏）      │   │
+│  └────────────────────────────────────────────────────┘   │
+└───────────────┬───────────────────────────────────────────┘
+                │ HTTP（单人时 in-process，多人时内网）
+┌───────────────┴─── @qb/server（团队层）───────────────────┐
+│  Hono + SQLite(Drizzle+FTS5)：任务/Runbook/事件的真源     │
+│  Skill · 坑 · 环境 · 用户 · 通知 · 检索                    │
+└───────────────────────────────────────────────────────────┘
+```
+
+**数据流向**：SPA 只跟本机 engine 说话（同源，无 CORS）；engine 负责执行、捕获证据、本地缓存与离线队列；team server 是跨人数据的真源。看别人的 runbook 也经 engine 取只读镜像。
+
+**为什么 SPA 挂在 dsh 端口而不是独立端口**：同源，免 CORS 与二次鉴权；用户只启一个进程；dsh 内置 UI 在 `/` 依然可用（QB 面板的"自由对话"直接跳过去）。
+
+---
+
+## 2. 仓库结构
+
+```
+qb/
+├── package.json              # pnpm workspace root, packageManager: pnpm@11.24.0
+├── pnpm-workspace.yaml
+├── tsconfig.base.json        # strict, moduleResolution: bundler
+├── AGENTS.md                 # 产品方案
+├── IMPLEMENTATION.md         # 本文件
+├── docs/adr/
+│   └── 0001-dsh-api-surface.md   # 依赖的 dsh API 清单 + 版本锁 + 逃生路线
+├── packages/
+│   ├── core/       @qb/core     零依赖：zod schema + 纯函数
+│   ├── server/     @qb/server   Hono + Drizzle(SQLite) 团队层
+│   ├── engine/     @qb/engine   dsh 插件（bundle）
+│   ├── ui/         @qb/ui       React SPA，构建产物由 engine 托管
+│   └── cli/        @qb/cli      `qb` 启动器
+└── profiles/qb/
+    ├── package.json          # dsh.profile.bundles
+    └── cordis.patch.yml      # 叠加 @qb/engine 到 web profile
+```
+
+**依赖版本**（均为当前 latest，已核）：
+`hono@4.13` · `drizzle-orm@0.45` · `better-sqlite3@13` · `zod@4.6` · `react@19.3` · `vite@8.3` · `tailwindcss@4.3` · `@tanstack/react-query@5.104` · `@dnd-kit/core@6.3` · `@codemirror/view@6.43` · `nanoid@6` · `tsx@4.23` · `vitest@5`
+运行时：Node `^22.19 || >=24`（dsh 要求）；本机 v26.4 ✓。TypeScript 用 `5.9`（7.0 太新，生态未跟上）。
+
+---
+
+## 3. 数据模型（`@qb/core`，SQLite 存储）
+
+所有 id 用 `nanoid`；所有时间戳 `INTEGER`（epoch ms）；软删除用 `archived_at`。
+
+```
+users(id, name, display_name, created_at)
+
+tasks(id, title, brief_md, initiator_id, assignee_id,
+      parent_step_id,            -- 非空 = 由委派产生，递归结构就靠它
+      status,                    -- draft|active|blocked|done|abandoned
+      expected_minutes, due_at, definition_of_done,
+      created_at, started_at, ended_at)
+
+runbooks(id, task_id, version, created_by, created_at,
+         assumptions_json,       -- 顶部"假设"列表，可编辑
+         source_skill_id, source_skill_version)
+         -- 每次 QB 重规划或人编辑产生新 version；v1 全量存储（体积无忧）
+
+steps(id, runbook_id, parent_id, order_key,   -- order_key: 分数索引，拖拽重排不重写兄弟节点
+      kind,                      -- command|check|wait|manual|delegate|decision|note
+      title, why_md, why_source, -- why_source: 'skill:xxx§3' 之类的出处
+      command, env_id, expectation_json, timeout_ms, expected_minutes,
+      status,                    -- pending|running|ok|failed|skipped|blocked
+      started_at, ended_at, actual_ms,
+      delegate_task_id)          -- kind=delegate 时指向子任务
+
+evidence(id, step_id, source,    -- auto|paste|image
+         text, image_path, exit_code, timed_out, duration_ms, created_at,
+         redacted)               -- 脱敏是否生效
+
+events(id, task_id, step_id, actor_id, kind, payload_json, created_at)
+      -- kind: step_run|step_ok|step_failed|step_timeout|edit|reorder|insert|
+      --       situation_changed|question_asked|question_answered|
+      --       delegate_progress|lesson_proposed|lesson_confirmed|replanned
+
+skills(id, name, description, applies_when, owner_id, current_version)
+skill_versions(id, skill_id, version, template_json, created_at, created_by,
+               source_runbook_id, stats_json)   -- stats: 次数/成功率/每步耗时中位数
+
+lessons(id, anchor_kind, anchor_ref,   -- skill_step|environment|free
+        condition, symptom, cause, fix_md, next_time_md,
+        author_id, source_task_id, scope,   -- personal|team
+        confirmed_by, confirmed_at, hit_count, miss_count, stale_at, created_at)
+
+environments(id, name, facts_json, collected_at, owner_id)
+      -- facts: os/shell/gpu/cuda/paths/proxy/quirks
+
+questions(id, task_id, step_id, asker_id, target_id,
+          body_md, options_json, answer_md, answered_by, answered_at, lesson_id)
+```
+
+**检索**：`lessons`、`skills`、`events` 建 FTS5 虚表；`@qb/server` 的 `search.ts` 统一出口，后续换 embeddings 只改这一个文件。
+
+**`order_key` 用分数索引**（LexoRank 简化版）：拖拽只改被移动节点一行，避免重排整棵树。
+
+---
+
+## 4. `@qb/core`：纯逻辑（无 IO，100% 可单测）
+
+```
+schema/         zod 定义 + 类型导出（所有包的单一事实源）
+expectation.ts  预期检查：exitCode | contains | regex | jsonPath | manual
+                → { verdict: 'pass'|'fail'|'unclear', reason }
+                unclear 才唤醒模型判断（省 token，且确定性优先）
+runbook.ts      树操作：insert/move/split/skip、order_key 生成、版本 diff
+danger.ts       破坏性命令模式：rm -rf, mkfs, dd, :>, --force, DROP,
+                kubectl delete, shutdown, reboot, chmod -R 777 …
+                → { level: 'safe'|'caution'|'destructive', matched }
+redact.ts       脱敏：sk-*, ghp_*, AKIA*, password=, token=, Bearer,
+                PEM 块, ssh 私钥；可加团队自定义规则
+escalate.ts     卡住判定：相对 expected_minutes 超时 / 连续失败 N 次 /
+                等待回答超过 M 分钟 → 该不该上浮给发起人
+```
+
+---
+
+## 5. `@qb/engine`：dsh 插件
+
+```ts
+// packages/engine/src/index.ts
+export const name = 'qb-engine'
+export const inject = ['webServer', 'shell', 'llm', 'jobs', 'schedule']
+
+export function apply(ctx: Context, config: Config) {
+  const host = createHostPort(ctx)        // ← 唯一接触 dsh 的地方
+  const api  = createApi(host, config)
+
+  ctx.webServer.register({ kind: 'prefix', path: '/qb/api', handler: api.rest })
+  ctx.webServer.registerUpgrade({ path: '/qb/ws', handler: api.ws })
+  ctx.webServer.register({ kind: 'prefix', path: '/qb', handler: serveSpa() })
+
+  registerQbTools(ctx)                    // 模型可调的 QB 工具
+  ctx.systemPrompt.section('qb', () => buildQbPrompt(...))
+}
+```
+
+**`HostPort` 适配层**（换 harness 只改这里）：
+
+```ts
+interface HostPort {
+  runCommand(req: {command, cwd?, env?, timeoutMs, signal?}): Promise<RunResult>
+  startCommand(req): { onChunk(cb), done: Promise<RunResult>, kill() }
+  complete(req: {messages, tools?, schema?}): Promise<Completion>
+  schedule(at, fn): Disposable
+}
+```
+对 dsh 的实现：`runCommand → ctx.shell.run(ctx.shell.resolve(req))`；`startCommand → ctx.shell.start(...)` 轮询 `readOutput()` 推 WS；`complete → ctx.llm`；`schedule → ctx.schedule`。
+
+**REST**（全部挂 `/qb/api`）：
+```
+GET  /tasks                  POST /tasks
+GET  /tasks/:id              PATCH /tasks/:id
+GET  /tasks/:id/runbook      POST /tasks/:id/replan
+POST /steps/:id/run          POST /steps/:id/cancel
+POST /steps/:id/evidence     PATCH /steps/:id
+POST /steps/:id/move         POST /steps/:id/split
+POST /tasks/:id/situation    POST /tasks/:id/question
+POST /tasks/:id/retrospect
+GET  /skills  /lessons  /environments  /inbox
+```
+
+**WS**（`/qb/ws`）：服务端推 `step.output`（流式）/ `step.status` / `task.event` / `qb.message`；客户端只发心跳与订阅。
+
+**步骤执行时序**（`POST /steps/:id/run`）：
+1. `danger.ts` 判级；`destructive` 且未带 `confirmed:true` → 400 要求前端亮红框（不弹窗）
+2. 写 `events(step_run)`，状态 → `running`
+3. `kind=command`：`host.runCommand`，`timeout_ms` 默认取 skill 统计的 p95×2，兜底 120s
+   `kind=wait`：`host.startCommand` + 就绪探针（http/port/log-pattern/command）轮询，进 `ctx.jobs` 后台，QB 面板说"我盯着"
+4. 输出经 `redact.ts` 后存 `evidence`，同时流式推 WS
+5. `expectation.ts` 判定；`pass/fail` 直接落库，`unclear` 才调模型
+6. 失败 → 检索 `lessons`（按 anchor + 症状 FTS）→ 有命中则 QB 面板给"一键应用修法"
+
+---
+
+## 6. QB Agent（6 种行为）
+
+提示词是 `packages/engine/prompts/*.md`，与代码同版本管理。所有结构化输出走**工具调用的 JSON schema**，不解析自由文本。
+
+| 行为 | 触发 | 产出工具 |
+|---|---|---|
+| draft | 新任务 | `qb_runbook_propose(tree, assumptions[])` |
+| accompany | 步骤结束/超时 | `qb_step_evaluate(verdict, reason)` · `qb_runbook_patch(ops[])` |
+| ask | 点"问发起人"或连续失败 | `qb_question_draft(body_md, options[], suggested_target)` |
+| retrospect | 任务完成 | `qb_lesson_propose[]` · `qb_skill_diff_propose` · 耗时校准 |
+| observe | 旁观模式 | 订阅 dsh `session/event` 的 `command/run`·`tool/result` → `qb_runbook_patch` |
+| oversee | 定时/事件 | 卡住检测 + 发起人摘要 |
+
+**模型接入**：走 dsh 的 `llm` seam，默认 `dsh-llm-pi-ai`（OpenAI/Anthropic 兼容）。配置里填 base_url / api_type / credentials 即可指向公司内网 vLLM 或官方 API，不写任何手工解析。
+
+**起草提示词要点**（决定第一印象）：模糊之处**不追问**，写成顶部可编辑的"假设"；每步必须有可验证的预期和预计耗时；"为什么"一句话并注明出处；命令按目标环境事实渲染。
+
+---
+
+## 7. `@qb/ui`：Runbook 活文档
+
+```
+src/
+  runbook/   RunbookPage · Outline（左，dnd-kit）· StepCell（中）· QbPanel（右）
+  step/      CommandBlock（CodeMirror 只读 + 运行/复制）· OutputBlock（流式 + 折叠）
+             EvidencePaste（文本/图片粘贴）· ExpectationRow · LessonChips
+  task/      TaskList（灵魂宝石状态）· NewTask · Inbox
+  skill/     SkillLibrary · SkillDiff
+  lib/       api.ts（fetch 封装）· ws.ts（重连）· store.ts（zustand）
+```
+
+技术选择：Vite + React 19 + Tailwind 4；React Query 管服务端状态；zustand 管本地 UI 态；dnd-kit 拖拽；CodeMirror 6 显示命令与输出（等宽、可选中、大输出虚拟滚动）。构建产物 `packages/ui/dist` 由 engine 的 `serveSpa()` 托管。
+
+**v1 必须做到的交互**（对应产品宪法）：
+- 当前步自动高亮与滚动；`j/k` 上下步；专注模式（隐藏两侧栏）
+- 内联编辑所有字段（点即编辑，blur 保存，无"编辑模式"）
+- 拖拽重排 + 单元间 `+` 插入
+- `[▶运行]` 流式输出；`[⧉复制]` 一键复制；输出区可直接 Ctrl+V 贴文本或图片
+- 破坏性命令红框 + 内联"确认运行"开关（不弹窗）
+- 无任何"标记为完成"的强制表单——自动观察优先
+
+---
+
+## 8. 里程碑
+
+**M1 — 骨架可跑（可见的第一屏）**
+workspace 脚手架 · `@qb/core` schema 与纯函数 + 单测 · `@qb/server` 建表与 CRUD · `@qb/engine` 挂 `/qb` 路由 · `@qb/ui` 渲染一个硬编码 runbook · `qb` 启动器。
+**验收**：`pnpm qb` 打开浏览器看到 Runbook 页面；`/qb/api/health` 返回版本；dsh 内置 UI 在 `/` 仍正常。
+
+**M2 — 执行闭环（核心价值）**
+`[▶运行]` 走 `ctx.shell` 流式回显 · 超时与取消 · `expectation` 判定 · 粘贴文本/图片 · `wait` 步骤就绪探针 · 事件时间线 · 内联编辑与拖拽重排。
+**验收**：手写一个 5 步 runbook，三种取证方式（自动/粘贴/截图）都正确归档；`sleep 30` + `timeout 800ms` 正确标记 `timedOut` 并可取消。
+
+**M3 — QB 接管（agent 化）**
+接 llm seam · draft 起草 runbook · accompany 判定与重规划 diff · "情况变了"入口 · 失败时检索坑并提议修法 · QB 面板叙述。
+**验收**：输入"在测试集群跑通 vLLM PD 分离"→ 得到 ≥8 步带命令/预期/耗时的 runbook + 顶部假设列表；故意用错端口 → QB 提议修法 → 一键应用重跑通过。
+
+**M4 — 沉淀闭环（差异化）**
+retrospect 复盘 · lesson 提议与一键确认 · skill 结晶与版本 diff · 第二个相似任务复用 skill 与坑 · 旁观模式。
+**验收**：完成任务 → 提议 ≥1 个坑 + skill「PD 分离部署」→ 确认；新建相似任务 → 起草直接基于该 skill 且相关步骤显示已沉淀的坑。
+
+**M5 — 两个人（你 + 你的 PL）**
+登录（个人令牌）· 派任务给别人 · `delegate` 步骤与委派行 · 只读打开对方 runbook · 求助 + 收件箱 + IM webhook · 发起人摘要与卡住检测 · server 托管远程模式 UI。
+
+M1–M4 是单人 dogfood 的完整闭环，用你真实的 vLLM PD 分离部署喂养。
+
+---
+
+## 9. 工程约定
+
+- **测试**：`@qb/core` 的纯函数必须有单测（expectation / danger / redact / order_key / runbook diff）；engine 与 server 用 vitest 做集成测试（真起 `ctx.shell`、真建 SQLite 临时库）；UI 先不做 e2e。
+- **类型**：`strict: true`，禁止 `any`；跨包只经 `@qb/core` 的导出类型。
+- **dsh 边界**：除 `packages/engine/src/dsh/` 外，任何文件不得 import `@deepseek-ai/*`。ADR 记录用到的每个 API，越界先补 ADR。
+- **版本锁**：`@deepseek-ai/dsh` 锁 `0.1.5-rc.3`（不用 `^`）；启动时断言 QB 插件已加载，未加载直接报错。
+- **提示词**：`packages/engine/prompts/*.md` 带版本号；每次模型调用记录提示词版本与模型 id 到 `events`；M4 后建金标准 runbook 回归集。
+- **中文**：界面与提示词中文，代码标识符与注释英文。
+
+---
+
+## 10. 立即开始的顺序
+
+1. workspace 骨架 + `tsconfig.base.json` + ADR 0001
+2. `@qb/core` schema（数据模型的单一事实源，其他包都依赖它）
+3. `@qb/server` 建表 + 最小 CRUD
+4. `@qb/engine` 挂路由（此处做第一次**运行时**实证：真起 dsh，确认 `/qb` 可达、`ctx.shell` 可用）
+5. `@qb/ui` 渲染硬编码 runbook → 通电
+6. 打通 `[▶运行]` → M2 闭环

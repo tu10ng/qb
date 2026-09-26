@@ -1,0 +1,11 @@
+packages:
+  - 'packages/*'
+
+# dsh 仅作为类型参考的 devDependency：QB 插件由 dsh 进程加载，
+# 不需要在本仓库构建这些原生模块。
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': false
+  '@google/genai': false
+  koffi: false
+  node-pty: false
+  protobufjs: false
