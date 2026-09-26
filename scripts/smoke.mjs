@@ -1,8 +1,8 @@
 /**
- * 冒烟验证：真起一个 dsh，确认 QB 插件挂得上、路由可达、命令能跑。
+ * 冒烟验证：真起一个 dsh，确认 QB 插件挂得上、数据能存、命令能跑。
  *
- * 这不是单元测试（它要几十秒、要网络、要真进程），所以不在 vitest 里跑。
- * 用法：node scripts/smoke.mjs
+ * 这不是单元测试（它要几十秒、要真进程），所以不在 vitest 里跑。
+ * 用法：pnpm smoke
  */
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -14,10 +14,12 @@ const repoRoot = resolve(here, '..')
 const scratch = join(repoRoot, '.smoke')
 const dshHome = join(scratch, 'dsh-home')
 const distDir = join(scratch, 'dist')
+const dbPath = join(scratch, 'qb.db')
 
 const PORT = 3099
 const MOUNT = '/qb'
 const BASE = `http://127.0.0.1:${PORT}${MOUNT}`
+const API = `${BASE}/api`
 
 let child
 
@@ -25,8 +27,6 @@ async function main() {
   await rm(scratch, { recursive: true, force: true })
   await mkdir(distDir, { recursive: true })
   await mkdir(dshHome, { recursive: true })
-
-  // 一个最小的 SPA 产物，验证静态托管
   await writeFile(join(distDir, 'index.html'), '<html><body>QB SMOKE</body></html>')
 
   const patch = join(scratch, 'patch.yml')
@@ -38,8 +38,10 @@ async function main() {
       `      name: '${pathToFileUrl(join(repoRoot, 'packages/engine/src/index.ts'))}'`,
       '      inject: [webServer, shell, timer]',
       '      config:',
-      `        distDir: '${distDir.replaceAll('\\', '/')}'`,
+      `        distDir: '${posix(distDir)}'`,
+      `        dbPath: '${posix(dbPath)}'`,
       `        mountPath: '${MOUNT}'`,
+      "        userName: 'smoke'",
       '',
     ].join('\n'),
   )
@@ -56,10 +58,7 @@ async function main() {
       '--port',
       String(PORT),
     ],
-    {
-      env: { ...process.env, DSH_HOME: dshHome },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
+    { env: { ...process.env, DSH_HOME: dshHome }, stdio: ['ignore', 'pipe', 'pipe'] },
   )
 
   let log = ''
@@ -72,103 +71,193 @@ async function main() {
     process.stderr.write(`  dsh! ${d}`)
   })
 
-  const ready = await waitFor(() => fetch(`${BASE}/api/health`).then((r) => r.ok), 90_000)
+  const ready = await waitFor(() => fetch(`${API}/health`).then((r) => r.ok), 90_000)
   if (!ready) {
     console.error('\n✗ dsh 没能在 90 秒内就绪。日志：\n' + log.slice(-3000))
     process.exit(1)
   }
 
   const checks = []
+  const check = (label, ok, detail = '') => checks.push([label, ok, detail])
 
-  // 1. 健康检查 = 插件确实被加载（dsh 会静默跳过不兼容的 bundle）
-  const health = await (await fetch(`${BASE}/api/health`)).json()
-  checks.push(['插件已加载', health.service === 'qb-engine', JSON.stringify(health)])
+  // ── 挂载与共存 ──────────────────────────────────────────
+  const health = await (await fetch(`${API}/health`)).json()
+  check('插件已加载', health.service === 'qb-engine', JSON.stringify(health))
 
-  // 2. SPA 托管
   const spa = await (await fetch(`${BASE}/`)).text()
-  checks.push(['SPA 可访问', spa.includes('QB SMOKE'), spa.slice(0, 60)])
+  check('SPA 可访问', spa.includes('QB SMOKE'))
 
-  // 3. dsh 内置 UI 仍在（共存，没抢 fallback）。
-  //    401 是预期的：dsh 内置 UI 要求 URL 带 token。只要不是 404，
-  //    就说明它的 fallback 路由还在，我们的 prefix 路由没有覆盖它。
+  // 401 是预期的（dsh 内置 UI 要 token）；只要不是 404 就说明
+  // 它的 fallback 还在，我们的 prefix 路由没盖住它。
+  // 内置 UI 的静态服务可能晚于我们就绪，所以给它一点时间。
+  const builtinOk = await waitFor(
+    () => fetch(`http://127.0.0.1:${PORT}/`).then((r) => r.status !== 404),
+    30_000,
+  )
   const builtin = await fetch(`http://127.0.0.1:${PORT}/`)
-  checks.push(['dsh 内置 UI 共存', builtin.status !== 404, `status ${builtin.status}`])
+  check('dsh 内置 UI 共存', builtinOk, `status ${builtin.status}`)
 
-  // 4. 真跑一条命令，并通过 WS 收结果——202 只代表受理，
-  //    必须确认输出真的流回来了、预期判定真的生效了。
+  // ── 数据层（better-sqlite3 能否在 dsh 里加载） ──────────
+  const me = await (await fetch(`${API}/me`)).json()
+  check('SQLite 可用且有当前用户', me.name === 'smoke', JSON.stringify(me))
+
+  const created = await fetch(`${API}/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: '在测试集群跑通 PD 分离', briefMd: '冒烟用' }),
+  })
+  const task = await created.json()
+  check('能建任务', created.status === 201 && task.status === 'draft', JSON.stringify(task))
+
+  const listed = await (await fetch(`${API}/tasks`)).json()
+  check('任务列表可读', listed.tasks?.length === 1, JSON.stringify(listed))
+
+  // ── WS + 执行链路 ──────────────────────────────────────
   const wsEvents = []
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}${MOUNT}/ws`)
-  await new Promise((resolve, reject) => {
-    ws.addEventListener('open', resolve, { once: true })
-    ws.addEventListener('error', reject, { once: true })
-    setTimeout(() => reject(new Error('WS 连接超时')), 10_000)
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true })
+    ws.addEventListener('error', rej, { once: true })
+    setTimeout(() => rej(new Error('WS 连接超时')), 10_000)
   })
   ws.addEventListener('message', (e) => {
     try {
       wsEvents.push(JSON.parse(e.data))
     } catch {
-      // 忽略非 JSON
+      /* 忽略非 JSON */
     }
   })
-  checks.push(['WS 可连接', ws.readyState === WebSocket.OPEN, `readyState ${ws.readyState}`])
+  check('WS 可连接', ws.readyState === WebSocket.OPEN)
 
-  const runRes = await fetch(`${BASE}/api/steps/smoke1/run`, {
+  // 步骤必须来自真源，不能凭前端传命令
+  const ghost = await fetch(`${API}/steps/nonexistent/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+  check('不存在的步骤被拒', ghost.status === 404, `status ${ghost.status}`)
+
+  // ── 完整链路：起 runbook → 跑步骤 → 状态落库 ────────────
+  const rbRes = await fetch(`${API}/tasks/${task.id}/runbook`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      command: 'echo QB_SHELL_WORKS',
-      expectation: { kind: 'contains', text: 'QB_SHELL_WORKS', caseSensitive: true },
-      timeoutMs: 15_000,
+      assumptions: [{ key: '集群', value: '测试集群', editedByUser: false }],
+      steps: [
+        {
+          kind: 'command',
+          title: '验证 shell 可用',
+          whyMd: '确认执行链路通了',
+          command: 'echo QB_SHELL_WORKS',
+          expectation: { kind: 'contains', text: 'QB_SHELL_WORKS', caseSensitive: true },
+          timeoutMs: 15000,
+        },
+        {
+          kind: 'command',
+          title: '验证超时生效',
+          command: 'sleep 30',
+          timeoutMs: 2000,
+        },
+        {
+          kind: 'command',
+          title: '破坏性命令',
+          command: 'rm -rf /tmp/qb-smoke-nonexistent',
+          timeoutMs: 5000,
+        },
+      ],
     }),
   })
-  const runBody = await runRes.text()
-  checks.push(['命令已受理', runRes.status === 202, `status ${runRes.status} ${runBody}`])
+  const rb = await rbRes.json()
+  check('能写入 runbook', rbRes.status === 201 && rb.steps?.length === 3, JSON.stringify(rb).slice(0, 200))
 
-  // 等 step.done
-  const done = await waitFor(() => wsEvents.some((e) => e.type === 'step.done'), 30_000)
-  const doneEvent = wsEvents.find((e) => e.type === 'step.done')
-  checks.push(['收到执行完成事件', done, JSON.stringify(wsEvents)])
-  checks.push([
-    '预期判定为 pass',
-    doneEvent?.verdict === 'pass',
-    JSON.stringify(doneEvent ?? null),
-  ])
-  checks.push([
-    '命令输出已流式推送',
+  const [okStep, timeoutStep, dangerStep] = rb.steps ?? []
+
+  // 1) 正常执行 + 预期判定 + 流式输出
+  const run1 = await fetch(`${API}/steps/${okStep.id}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+  check('步骤已受理', run1.status === 202, `status ${run1.status}`)
+
+  await waitFor(() => wsEvents.some((e) => e.type === 'step.done' && e.stepId === okStep.id), 30_000)
+  const done1 = wsEvents.find((e) => e.type === 'step.done' && e.stepId === okStep.id)
+  check('预期判定为 pass', done1?.verdict === 'pass', JSON.stringify(done1 ?? null))
+  check(
+    '输出已流式推送',
     wsEvents.some((e) => e.type === 'step.output' && String(e.text).includes('QB_SHELL_WORKS')),
-    JSON.stringify(wsEvents.filter((e) => e.type === 'step.output')),
-  ])
+  )
 
-  // 6. 超时真的生效
-  const timeoutStart = Date.now()
-  await fetch(`${BASE}/api/steps/smoke3/run`, {
+  // 2) 状态真的落库了
+  const afterRun = await (await fetch(`${API}/tasks/${task.id}/runbook`)).json()
+  const okStepAfter = afterRun.steps.find((s) => s.id === okStep.id)
+  check('步骤状态已落库', okStepAfter?.status === 'ok', JSON.stringify(okStepAfter ?? null))
+  check('耗时已记录', typeof okStepAfter?.actualMs === 'number')
+  check(
+    '任务自动转为进行中',
+    afterRun.task.status === 'active',
+    `status=${afterRun.task.status}`,
+  )
+  check(
+    '事件时间线已记录',
+    afterRun.events.some((e) => e.kind === 'step_run') &&
+      afterRun.events.some((e) => e.kind === 'step_ok'),
+    JSON.stringify(afterRun.events.map((e) => e.kind)),
+  )
+
+  // 3) 超时
+  const t0 = Date.now()
+  await fetch(`${API}/steps/${timeoutStep.id}/run`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ command: 'sleep 30', timeoutMs: 2000 }),
+    body: JSON.stringify({}),
   })
-  await waitFor(() => wsEvents.some((e) => e.type === 'step.done' && e.stepId === 'smoke3'), 25_000)
-  const timeoutEvent = wsEvents.find((e) => e.type === 'step.done' && e.stepId === 'smoke3')
-  const elapsed = Date.now() - timeoutStart
-  checks.push([
+  await waitFor(
+    () => wsEvents.some((e) => e.type === 'step.done' && e.stepId === timeoutStep.id),
+    25_000,
+  )
+  const elapsed = Date.now() - t0
+  const doneTimeout = wsEvents.find((e) => e.type === 'step.done' && e.stepId === timeoutStep.id)
+  check(
     '超时在限期内被终止',
-    timeoutEvent !== undefined && elapsed < 20_000,
-    `elapsed=${elapsed}ms event=${JSON.stringify(timeoutEvent ?? null)}`,
-  ])
+    doneTimeout !== undefined && elapsed < 20_000,
+    `elapsed=${elapsed}ms event=${JSON.stringify(doneTimeout ?? null)}`,
+  )
 
-  ws.close()
-
-  // 5. 破坏性命令需要确认
-  const danger = await fetch(`${BASE}/api/steps/smoke2/run`, {
+  // 4) 破坏性命令：先拒，确认后放行
+  const denied = await fetch(`${API}/steps/${dangerStep.id}/run`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ command: 'rm -rf /tmp/whatever', timeoutMs: 5000 }),
+    body: JSON.stringify({}),
   })
-  const dangerBody = await danger.json()
-  checks.push([
-    '破坏性命令拦截',
-    danger.status === 409 && dangerBody.error === 'needs_confirmation',
-    JSON.stringify(dangerBody),
-  ])
+  const deniedBody = await denied.json()
+  check(
+    '破坏性命令需确认',
+    denied.status === 409 && deniedBody.error === 'needs_confirmation',
+    JSON.stringify(deniedBody),
+  )
+
+  const allowed = await fetch(`${API}/steps/${dangerStep.id}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ confirmed: true }),
+  })
+  check('确认后放行', allowed.status === 202, `status ${allowed.status}`)
+
+  // 5) 重规划产生新版本
+  const replan = await fetch(`${API}/tasks/${task.id}/runbook`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      reason: '情况变了：审批人请假',
+      steps: [{ kind: 'command', title: '改过的步骤', command: 'echo replanned' }],
+    }),
+  })
+  const replanBody = await replan.json()
+  check('重规划产生新版本', replanBody.runbook?.version === 2, JSON.stringify(replanBody.runbook ?? null))
+
+  const versions = await (await fetch(`${API}/tasks/${task.id}/versions`)).json()
+  check('旧版本保留', versions.versions?.length === 2, JSON.stringify(versions))
 
   console.log('\n─── 结果 ───')
   let failed = 0
@@ -177,12 +266,17 @@ async function main() {
     if (!ok) failed++
   }
 
+  ws.close()
   process.exit(failed === 0 ? 0 : 1)
 }
 
+function posix(p) {
+  return p.replaceAll('\\', '/')
+}
+
 function pathToFileUrl(p) {
-  const normalized = p.replaceAll('\\', '/')
-  return normalized.startsWith('/') ? `file://${normalized}` : `file:///${normalized}`
+  const n = posix(p)
+  return n.startsWith('/') ? `file://${n}` : `file:///${n}`
 }
 
 async function waitFor(probe, timeoutMs) {
@@ -191,7 +285,7 @@ async function waitFor(probe, timeoutMs) {
     try {
       if (await probe()) return true
     } catch {
-      // 还没起来
+      /* 还没起来 */
     }
     await new Promise((r) => setTimeout(r, 1000))
   }

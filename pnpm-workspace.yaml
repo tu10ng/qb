@@ -6,6 +6,8 @@ packages:
 allowBuilds:
   '@deepseek-ai/dsh-subprocess-local': false
   '@google/genai': false
+  # 原生模块，QB 自己要用，必须构建
+  better-sqlite3: true
   koffi: false
   node-pty: false
   protobufjs: false

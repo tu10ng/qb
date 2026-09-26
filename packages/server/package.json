@@ -1,5 +1,5 @@
 {
-  "name": "@qb/engine",
+  "name": "@qb/server",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,9 +12,9 @@
   },
   "dependencies": {
     "@qb/core": "workspace:*",
-    "@qb/server": "workspace:*"
+    "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh": "0.1.5-rc.3"
+    "@types/better-sqlite3": "^9.6.0"
   }
 }
