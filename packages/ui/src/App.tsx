@@ -238,11 +238,7 @@ function TaskPage({
             </div>
           )}
 
-          {steps.length === 0 && (
-            <p style={{ color: 'var(--text-dim)' }}>
-              还没有 runbook。QB 会根据任务描述起草——这部分接入模型后生效（M3）。
-            </p>
-          )}
+          {steps.length === 0 && <DraftPrompt taskId={task.id} onDrafted={onChanged} />}
 
           {visible.map((s) => (
             <div key={s.id} ref={s.id === currentId ? currentRef : undefined}>
@@ -250,6 +246,7 @@ function TaskPage({
                 step={s}
                 current={s.id === currentId}
                 runState={runStates[s.id]}
+                evidence={detail.evidence[s.id] ?? []}
                 onFocus={() => onSelectStep(s.id)}
                 onChanged={onChanged}
               />
@@ -277,10 +274,98 @@ function TaskPage({
           <div className="qb-actions">
             <button className="btn">情况变了…</button>
             <button className="btn">问发起人</button>
+            {steps.length > 0 && <RedraftButton taskId={task.id} onDone={onChanged} />}
           </div>
         </aside>
       </div>
     </div>
+  )
+}
+
+// ── 起草 ──────────────────────────────────────────────────────
+
+/**
+ * 空 runbook 时的起草入口。
+ *
+ * 起草要等模型几十秒，期间明确告诉用户在等什么——干等一个转圈
+ * 不知道要等多久是最烦人的。
+ */
+function DraftPrompt({ taskId, onDrafted }: { taskId: string; onDrafted: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [elapsed, setElapsed] = useState(0)
+
+  useEffect(() => {
+    if (!busy) return
+    const t = setInterval(() => setElapsed((s) => s + 1), 1000)
+    return () => clearInterval(t)
+  }, [busy])
+
+  const draft = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    setElapsed(0)
+    try {
+      await api.draft(taskId)
+      onDrafted()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (busy) {
+    return (
+      <p style={{ color: 'var(--text-dim)' }}>
+        QB 正在起草……已等待 {elapsed} 秒。它在检索团队的 skill 和坑，并按你的环境渲染命令。
+      </p>
+    )
+  }
+
+  return (
+    <div style={{ color: 'var(--text-dim)' }}>
+      <p>还没有 runbook。</p>
+      <button className="btn primary" onClick={() => void draft()}>
+        让 QB 起草
+      </button>
+      {error !== null && (
+        <p className="verdict fail" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** 重新起草。旧版本会保留，不会丢。 */
+function RedraftButton({ taskId, onDone }: { taskId: string; onDone: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  return (
+    <>
+      <button
+        className="btn ghost"
+        disabled={busy}
+        onClick={() => {
+          setBusy(true)
+          setError(null)
+          api
+            .draft(taskId)
+            .then(onDone)
+            .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+            .finally(() => setBusy(false))
+        }}
+      >
+        {busy ? 'QB 起草中…' : '让 QB 重新起草'}
+      </button>
+      {error !== null && (
+        <div className="verdict fail" style={{ fontSize: 12 }}>
+          {error}
+        </div>
+      )}
+    </>
   )
 }
 

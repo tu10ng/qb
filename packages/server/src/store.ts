@@ -2,11 +2,19 @@ import {
   ids,
   orderKeyBetween,
   type Assumption,
+  type Environment,
+  type EnvironmentFacts,
   type Event,
+  type Evidence,
+  type EvidenceSource,
   type EventKind,
   type Expectation,
+  type Lesson,
+  type LessonAnchor,
+  type LessonScope,
   type ReadinessProbe,
   type Runbook,
+  type Skill,
   type Step,
   type StepKind,
   type StepStatus,
@@ -15,6 +23,26 @@ import {
   type User,
 } from '@qb/core'
 import type { Db } from './db.ts'
+
+/**
+ * FTS5 查询分词。
+ *
+ * 中文按字切、英文按词切，拼成 OR 查询。过滤掉 FTS 语法字符，
+ * 否则用户任务标题里的引号、星号会让查询直接报错。
+ */
+function tokenize(text: string): string[] {
+  const cleaned = text.replace(/["*()^:-]/g, ' ')
+  const out = new Set<string>()
+
+  for (const m of cleaned.matchAll(/[a-zA-Z][a-zA-Z0-9_.]*|\d+/g)) {
+    if (m[0].length >= 2) out.add(m[0].toLowerCase())
+  }
+  for (const m of cleaned.matchAll(/[一-鿿]/g)) {
+    out.add(m[0])
+  }
+
+  return [...out].slice(0, 40)
+}
 
 /**
  * 任务 / Runbook / 步骤 / 事件的读写。
@@ -345,6 +373,203 @@ export class Store {
       .run(status, extra.startedAt ?? null, extra.endedAt ?? null, extra.actualMs ?? null, stepId)
   }
 
+  // ── 证据 ─────────────────────────────────────────────────────
+
+  /**
+   * 记录一步的执行证据。
+   *
+   * 只存脱敏后的内容——原始输出不离开执行进程。
+   */
+  addEvidence(input: {
+    stepId: string
+    source: EvidenceSource
+    text?: string | null
+    imagePath?: string | null
+    exitCode?: number | null
+    timedOut?: boolean
+    durationMs?: number | null
+    redacted?: boolean
+  }): Evidence {
+    const evidence: Evidence = {
+      id: ids.evidence(),
+      stepId: input.stepId,
+      source: input.source,
+      text: input.text ?? null,
+      imagePath: input.imagePath ?? null,
+      exitCode: input.exitCode ?? null,
+      timedOut: input.timedOut ?? false,
+      durationMs: input.durationMs ?? null,
+      redacted: input.redacted ?? false,
+      createdAt: Date.now(),
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO evidence
+         (id, step_id, source, text, image_path, exit_code, timed_out, duration_ms, redacted, created_at)
+         VALUES (@id, @stepId, @source, @text, @imagePath, @exitCode, @timedOut, @durationMs, @redacted, @createdAt)`,
+      )
+      .run({
+        ...evidence,
+        timedOut: evidence.timedOut ? 1 : 0,
+        redacted: evidence.redacted ? 1 : 0,
+      })
+
+    return evidence
+  }
+
+  listEvidence(stepId: string): Evidence[] {
+    const rows = this.db
+      .prepare('SELECT * FROM evidence WHERE step_id = ? ORDER BY created_at')
+      .all(stepId) as EvidenceRow[]
+    return rows.map(toEvidence)
+  }
+
+  /** 一次取回整份 runbook 的证据，省得前端按步骤逐个请求。 */
+  evidenceByRunbook(runbookId: string): Record<string, Evidence[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT e.* FROM evidence e
+         JOIN steps s ON s.id = e.step_id
+         WHERE s.runbook_id = ?
+         ORDER BY e.created_at`,
+      )
+      .all(runbookId) as EvidenceRow[]
+
+    const out: Record<string, Evidence[]> = {}
+    for (const row of rows) {
+      const ev = toEvidence(row)
+      ;(out[ev.stepId] ??= []).push(ev)
+    }
+    return out
+  }
+
+  // ── 知识：环境 / skill / 坑 ──────────────────────────────────
+
+  listEnvironments(): Environment[] {
+    const rows = this.db.prepare('SELECT * FROM environments ORDER BY name').all() as EnvRow[]
+    return rows.map(toEnvironment)
+  }
+
+  upsertEnvironment(input: { name: string; facts: EnvironmentFacts; ownerId?: string }): Environment {
+    const existing = this.db.prepare('SELECT * FROM environments WHERE name = ?').get(input.name) as
+      | EnvRow
+      | undefined
+
+    const now = Date.now()
+    if (existing !== undefined) {
+      this.db
+        .prepare('UPDATE environments SET facts_json = ?, collected_at = ? WHERE id = ?')
+        .run(JSON.stringify(input.facts), now, existing.id)
+      return { ...toEnvironment(existing), facts: input.facts, collectedAt: now }
+    }
+
+    const env: Environment = {
+      id: ids.environment(),
+      name: input.name,
+      facts: input.facts,
+      ownerId: input.ownerId ?? null,
+      collectedAt: now,
+      createdAt: now,
+    }
+    this.db
+      .prepare(
+        `INSERT INTO environments (id, name, facts_json, owner_id, collected_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(env.id, env.name, JSON.stringify(env.facts), env.ownerId, env.collectedAt, env.createdAt)
+    return env
+  }
+
+  listSkills(): Skill[] {
+    const rows = this.db
+      .prepare('SELECT * FROM skills WHERE archived_at IS NULL ORDER BY name')
+      .all() as SkillRow[]
+    return rows.map(toSkill)
+  }
+
+  createLesson(input: {
+    anchorKind: LessonAnchor
+    anchorRef?: string | null
+    condition?: string | null
+    symptom: string
+    cause?: string | null
+    fixMd: string
+    nextTimeMd?: string | null
+    authorId: string
+    sourceTaskId?: string | null
+    scope?: LessonScope
+  }): Lesson {
+    const lesson: Lesson = {
+      id: ids.lesson(),
+      anchorKind: input.anchorKind,
+      anchorRef: input.anchorRef ?? null,
+      condition: input.condition ?? null,
+      symptom: input.symptom,
+      cause: input.cause ?? null,
+      fixMd: input.fixMd,
+      nextTimeMd: input.nextTimeMd ?? null,
+      authorId: input.authorId,
+      sourceTaskId: input.sourceTaskId ?? null,
+      // 默认 personal：作者自己立即生效，团队级要负责人确认
+      scope: input.scope ?? 'personal',
+      confirmedBy: null,
+      confirmedAt: null,
+      hitCount: 0,
+      missCount: 0,
+      staleAt: null,
+      createdAt: Date.now(),
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO lessons
+         (id, anchor_kind, anchor_ref, condition, symptom, cause, fix_md, next_time_md,
+          author_id, source_task_id, scope, created_at)
+         VALUES (@id, @anchorKind, @anchorRef, @condition, @symptom, @cause, @fixMd,
+                 @nextTimeMd, @authorId, @sourceTaskId, @scope, @createdAt)`,
+      )
+      .run(lesson)
+
+    return lesson
+  }
+
+  /**
+   * 检索相关的坑。
+   *
+   * FTS5 + unicode61 对中文是按字切分，召回偏宽但不会漏——对"别再踩
+   * 同一个坑"这个目标，宁可多给模型看几条也不要漏掉关键的那条。
+   * 换 embeddings 时只改这个方法。
+   */
+  searchLessons(query: string, limit = 12): Lesson[] {
+    const terms = tokenize(query)
+    if (terms.length === 0) return this.recentLessons(limit)
+
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT l.* FROM lessons_fts f
+           JOIN lessons l ON l.rowid = f.rowid
+           WHERE lessons_fts MATCH ?
+             AND l.stale_at IS NULL
+           ORDER BY bm25(lessons_fts), l.hit_count DESC
+           LIMIT ?`,
+        )
+        .all(terms.join(' OR '), limit) as LessonRow[]
+      return rows.map(toLesson)
+    } catch {
+      // FTS 查询语法出错（用户输入里的特殊字符）不该让起草整个失败
+      return this.recentLessons(limit)
+    }
+  }
+
+  private recentLessons(limit: number): Lesson[] {
+    const rows = this.db
+      .prepare('SELECT * FROM lessons WHERE stale_at IS NULL ORDER BY created_at DESC LIMIT ?')
+      .all(limit) as LessonRow[]
+    return rows.map(toLesson)
+  }
+
   // ── 事件 ─────────────────────────────────────────────────────
 
   appendEvent(input: {
@@ -479,6 +704,118 @@ interface EventRow {
   kind: string
   payload_json: string
   created_at: number
+}
+
+interface EvidenceRow {
+  id: string
+  step_id: string
+  source: string
+  text: string | null
+  image_path: string | null
+  exit_code: number | null
+  timed_out: number
+  duration_ms: number | null
+  redacted: number
+  created_at: number
+}
+
+function toEvidence(r: EvidenceRow): Evidence {
+  return {
+    id: r.id,
+    stepId: r.step_id,
+    source: r.source as EvidenceSource,
+    text: r.text,
+    imagePath: r.image_path,
+    exitCode: r.exit_code,
+    timedOut: r.timed_out === 1,
+    durationMs: r.duration_ms,
+    redacted: r.redacted === 1,
+    createdAt: r.created_at,
+  }
+}
+
+interface EnvRow {
+  id: string
+  name: string
+  facts_json: string
+  owner_id: string | null
+  collected_at: number | null
+  created_at: number
+}
+
+interface SkillRow {
+  id: string
+  name: string
+  description: string
+  applies_when: string | null
+  owner_id: string | null
+  current_version: number
+  created_at: number
+}
+
+interface LessonRow {
+  id: string
+  anchor_kind: string
+  anchor_ref: string | null
+  condition: string | null
+  symptom: string
+  cause: string | null
+  fix_md: string
+  next_time_md: string | null
+  author_id: string
+  source_task_id: string | null
+  scope: string
+  confirmed_by: string | null
+  confirmed_at: number | null
+  hit_count: number
+  miss_count: number
+  stale_at: number | null
+  created_at: number
+}
+
+function toEnvironment(r: EnvRow): Environment {
+  return {
+    id: r.id,
+    name: r.name,
+    facts: JSON.parse(r.facts_json) as EnvironmentFacts,
+    ownerId: r.owner_id,
+    collectedAt: r.collected_at,
+    createdAt: r.created_at,
+  }
+}
+
+function toSkill(r: SkillRow): Skill {
+  return {
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    appliesWhen: r.applies_when,
+    ownerId: r.owner_id,
+    currentVersion: r.current_version,
+    createdAt: r.created_at,
+  }
+}
+
+function toLesson(r: LessonRow): Lesson {
+  return {
+    id: r.id,
+    anchorKind: r.anchor_kind as LessonAnchor,
+    anchorRef: r.anchor_ref,
+    condition: r.condition,
+    symptom: r.symptom,
+    cause: r.cause,
+    fixMd: r.fix_md,
+    nextTimeMd: r.next_time_md,
+    authorId: r.author_id,
+    sourceTaskId: r.source_task_id,
+    scope: r.scope as LessonScope,
+    confirmedBy: r.confirmed_by,
+    confirmedAt: r.confirmed_at,
+    hitCount: r.hit_count,
+    missCount: r.miss_count,
+    staleAt: r.stale_at,
+    createdAt: r.created_at,
+  }
 }
 
 function toUser(r: UserRow): User {

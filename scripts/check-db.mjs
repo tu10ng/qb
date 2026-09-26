@@ -42,6 +42,15 @@ if (last) {
   console.log('\n最后一条事件 reason:', JSON.stringify(p.reason ?? null))
 }
 
+// 环境事实：起草质量直接取决于这些
+const envs = db.prepare('SELECT name, facts_json FROM environments').all()
+if (envs.length > 0) {
+  console.log('\n采集到的环境：')
+  for (const e of envs) {
+    console.log(` ${e.name}: ${JSON.stringify(JSON.parse(e.facts_json), null, 1).replace(/\n/g, '\n ')}`)
+  }
+}
+
 console.log(dirty === 0 ? '\n✓ 数据库中没有非法代理项' : `\n✗ 发现 ${dirty} 处污染`)
 db.close()
 process.exit(dirty === 0 ? 0 : 1)

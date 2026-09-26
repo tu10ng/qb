@@ -38,6 +38,9 @@ importers:
       '@qb/server':
         specifier: workspace:*
         version: link:../server
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
     devDependencies:
       '@deepseek-ai/dsh':
         specifier: 0.1.5-rc.3

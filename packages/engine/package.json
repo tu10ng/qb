@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@qb/core": "workspace:*",
-    "@qb/server": "workspace:*"
+    "@qb/server": "workspace:*",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.1.5-rc.3"

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Step } from '@qb/core'
+import type { Evidence, Step } from '@qb/core'
 import { ApiError, api } from './api.ts'
 
 export interface StepRunState {
@@ -15,6 +15,8 @@ interface Props {
   step: Step
   current: boolean
   runState: StepRunState | undefined
+  /** 历史证据（上次跑的输出、手动贴的内容）。 */
+  evidence: Evidence[]
   onFocus: () => void
   onChanged: () => void
 }
@@ -27,13 +29,17 @@ interface Props {
  * - 不当保姆：运行、复制、手动跑后粘贴、直接标记完成，随用户喜好
  * - 破坏性命令红框 + 内联确认开关，不弹窗
  */
-export function StepCell({ step, current, runState, onFocus, onChanged }: Props) {
+export function StepCell({ step, current, runState, evidence, onFocus, onChanged }: Props) {
   const [confirmed, setConfirmed] = useState(false)
   const [danger, setDanger] = useState<string[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [pasted, setPasted] = useState<string | null>(null)
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
 
   const running = runState?.running ?? false
+  // 本次运行的实时输出优先；没有就显示历史证据
+  const lastEvidence = evidence.length > 0 ? evidence[evidence.length - 1]! : null
+  const shownOutput = runState?.output ?? lastEvidence?.text ?? null
 
   const run = async (): Promise<void> => {
     setError(null)
@@ -50,8 +56,18 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
     }
   }
 
-  const copy = (): void => {
-    if (step.command !== null) void navigator.clipboard.writeText(step.command)
+  const submit = async (input: { text?: string; markDone?: boolean }): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    try {
+      await api.submitEvidence(step.id, input)
+      setDraft('')
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
   }
 
   const isDangerous = danger !== null
@@ -91,7 +107,7 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
                   className="btn"
                   onClick={(e) => {
                     e.stopPropagation()
-                    copy()
+                    void navigator.clipboard.writeText(step.command!)
                   }}
                 >
                   ⧉ 复制
@@ -115,6 +131,13 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
           </>
         )}
 
+        {step.probe !== null && (
+          <div className="expectation">
+            <span className="label">就绪条件：</span>
+            {describeProbe(step.probe)}
+          </div>
+        )}
+
         {step.expectation !== null && (
           <div className="expectation">
             <span className="label">预期：</span>
@@ -122,11 +145,13 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
           </div>
         )}
 
-        {(runState !== undefined || pasted !== null) && (
+        {shownOutput !== null && (
           <div className="output">
-            <span className="label">输出：</span>
+            <span className="label">
+              输出{lastEvidence !== null && runState === undefined ? `（${sourceLabel(lastEvidence.source)}）` : ''}：
+            </span>
             <div className="output-box">
-              {runState?.output ?? pasted ?? ''}
+              {shownOutput}
               {running && '▌'}
             </div>
             {runState?.verdict !== undefined && (
@@ -138,22 +163,38 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
             {(runState?.redactionHits?.length ?? 0) > 0 && (
               <div className="paste-hint">已脱敏：{runState!.redactionHits!.join('、')}</div>
             )}
+            {lastEvidence?.redacted === true && runState === undefined && (
+              <div className="paste-hint">已脱敏</div>
+            )}
           </div>
         )}
 
-        {/* 手动跑完可以把结果贴回来——文本或截图都行 */}
-        {step.command !== null && runState === undefined && (
-          <textarea
-            className="inline-edit paste-area"
-            placeholder="手动跑的话，把输出粘贴到这里（也可以直接贴截图）"
-            rows={1}
-            onClick={(e) => e.stopPropagation()}
-            onPaste={(e) => {
-              const text = e.clipboardData.getData('text')
-              if (text !== '') setPasted(text)
-            }}
-            style={{ marginTop: 7, fontSize: 12.5, color: 'var(--text-dim)' }}
-          />
+        {/* 手动跑完可以贴回来——文本或截图都行 */}
+        {!running && (
+          <div onClick={(e) => e.stopPropagation()}>
+            <textarea
+              className="inline-edit"
+              placeholder={
+                step.command !== null
+                  ? '自己跑的话，把输出粘贴到这里'
+                  : '做完了？可以写点什么（可选）'
+              }
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={draft === '' ? 1 : 4}
+              style={{ marginTop: 7, fontSize: 12.5, fontFamily: 'var(--mono)' }}
+            />
+            {draft !== '' && (
+              <button
+                className="btn primary"
+                style={{ marginTop: 5 }}
+                disabled={busy}
+                onClick={() => void submit({ text: draft })}
+              >
+                提交输出
+              </button>
+            )}
+          </div>
         )}
 
         {error !== null && <div className="verdict fail">{error}</div>}
@@ -165,7 +206,13 @@ export function StepCell({ step, current, runState, onFocus, onChanged }: Props)
             </button>
           ) : (
             <>
-              <button className="btn ghost">完成</button>
+              <button
+                className="btn ghost"
+                disabled={busy || step.status === 'ok'}
+                onClick={() => void submit({ markDone: true })}
+              >
+                完成
+              </button>
               <button className="btn ghost">跳过</button>
               <button className="btn ghost">失败…</button>
             </>
@@ -201,10 +248,14 @@ function markClass(step: Step, running: boolean): string {
 
 function hint(step: Step, runState: StepRunState | undefined): string {
   const parts: string[] = []
-  if (step.expectedMinutes !== null) parts.push(`预计 ${step.expectedMinutes} 分钟`)
+  if (step.expectedMinutes !== null) parts.push(`预计 ${formatMinutes(step.expectedMinutes)}`)
   if (runState?.durationMs !== undefined) parts.push(formatMs(runState.durationMs))
   else if (step.actualMs !== null) parts.push(formatMs(step.actualMs))
   return parts.join(' · ')
+}
+
+function sourceLabel(s: Evidence['source']): string {
+  return s === 'auto' ? '上次运行' : s === 'paste' ? '手动粘贴' : '截图'
 }
 
 function verdictLabel(v: 'pass' | 'fail' | 'unclear'): string {
@@ -224,6 +275,25 @@ function describeExpectation(e: NonNullable<Step['expectation']>): string {
     case 'manual':
       return e.description
   }
+}
+
+function describeProbe(p: NonNullable<Step['probe']>): string {
+  switch (p.kind) {
+    case 'http':
+      return `${p.url} 返回 ${p.expectStatus}`
+    case 'port':
+      return `${p.host}:${p.port} 开始监听`
+    case 'logPattern':
+      return `日志出现 /${p.pattern}/`
+    case 'command':
+      return `\`${p.command}\` 退出码 ${p.expectExitCode}`
+  }
+}
+
+function formatMinutes(min: number): string {
+  if (min < 1) return `${Math.round(min * 60)} 秒`
+  if (min < 60) return `${min % 1 === 0 ? min : min.toFixed(1)} 分钟`
+  return `${(min / 60).toFixed(1)} 小时`
 }
 
 export function formatMs(ms: number): string {

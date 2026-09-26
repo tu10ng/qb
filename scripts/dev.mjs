@@ -33,6 +33,19 @@ async function main() {
     process.exit(1)
   }
 
+  // 模型端点从环境变量读。wire=openai 可直接指向公司内网 vLLM。
+  // 不配的话 QB 的起草会明确报错，而不是静默失效。
+  const llm =
+    process.env.QB_LLM_BASE_URL !== undefined
+      ? [
+          '        llm:',
+          `          wire: '${process.env.QB_LLM_WIRE ?? 'openai'}'`,
+          `          baseUrl: '${process.env.QB_LLM_BASE_URL}'`,
+          `          apiKey: '${process.env.QB_LLM_API_KEY ?? ''}'`,
+          `          model: '${process.env.QB_LLM_MODEL ?? 'deepseek-chat'}'`,
+        ]
+      : []
+
   const patch = join(runDir, 'patch.yml')
   await writeFile(
     patch,
@@ -46,6 +59,7 @@ async function main() {
       `        dbPath: '${posix(join(runDir, 'qb.db'))}'`,
       `        mountPath: '${MOUNT}'`,
       `        userName: '${process.env.QB_USER ?? 'me'}'`,
+      ...llm,
       '',
     ].join('\n'),
     'utf8',

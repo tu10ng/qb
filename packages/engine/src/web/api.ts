@@ -1,9 +1,11 @@
 import { NeedsConfirmation, runStep, type StepRunHandle } from '../runner/run-step.ts'
+import { draftRunbook } from '../agent/draft.ts'
 import { Router, sendJson, errMessage } from './router.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/server'
-import type { Expectation, StepStatus } from '@qb/core'
+import type { Expectation, StepStatus, Verdict } from '@qb/core'
+import { checkExpectation, redact, sanitizeText } from '@qb/core'
 
 export interface ApiDeps {
   host: HostPort
@@ -12,12 +14,14 @@ export interface ApiDeps {
   mount: string
   /** 单人 dogfood 阶段的当前用户；多人阶段换成从令牌解析。 */
   currentUserId: () => string
+  /** QB 的提示词资产。 */
+  prompts: { persona: string; draft: string }
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
 
 export function buildApi(deps: ApiDeps): Router {
-  const { host, store, ws, mount, currentUserId } = deps
+  const { host, store, ws, mount, currentUserId, prompts } = deps
   const router = new Router(`${mount}/api`)
 
   // 正在执行的步骤：用于取消、防重复启动
@@ -107,6 +111,8 @@ export function buildApi(deps: ApiDeps): Router {
       runbook: latest?.runbook ?? null,
       steps: latest?.steps ?? [],
       events: store.listEvents(taskId),
+      // 历史输出按步骤分组带上：刷新页面后还能看到上次跑出了什么
+      evidence: latest === null ? {} : store.evidenceByRunbook(latest.runbook.id),
     })
   })
 
@@ -165,6 +171,56 @@ export function buildApi(deps: ApiDeps): Router {
       sendJson(res, 201, result)
     } catch (e) {
       sendJson(res, 400, { error: 'invalid_steps', message: errMessage(e) })
+    }
+  })
+
+  /**
+   * 让 QB 起草 runbook。
+   *
+   * 同步等待模型返回（起草要十几秒到一分钟）。前端显示"QB 正在起草"，
+   * 不适合做成异步——用户此刻没有别的事可做，异步只会增加状态复杂度。
+   */
+  router.post('/tasks/:id/draft', async (_req, res, ctx) => {
+    const taskId = ctx.params.id!
+    const task = store.getTask(taskId)
+    if (task === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+
+    try {
+      const draft = await draftRunbook(host, prompts.persona, prompts.draft, {
+        task,
+        environments: store.listEnvironments(),
+        skills: store.listSkills(),
+        lessons: store.searchLessons(`${task.title} ${task.briefMd}`, 12),
+      })
+
+      const result = store.createRunbook({
+        taskId,
+        createdBy: currentUserId(),
+        assumptions: draft.assumptions,
+        steps: draft.steps as Parameters<Store['createRunbook']>[0]['steps'],
+      })
+
+      store.appendEvent({
+        taskId,
+        actorId: null,
+        kind: 'replanned',
+        payload: {
+          version: result.runbook.version,
+          by: 'qb',
+          model: draft.model,
+          reason: result.runbook.version === 1 ? '起草' : '重新起草',
+        },
+      })
+
+      ws.broadcast({ type: 'runbook.updated', taskId, version: result.runbook.version })
+      sendJson(res, 201, result)
+    } catch (e) {
+      // 把模型的原话透给前端：起草失败时用户需要知道是没配端点、
+      // 模型拒答，还是输出不合格式。
+      sendJson(res, 502, { error: 'draft_failed', message: errMessage(e) })
     }
   })
 
@@ -251,6 +307,18 @@ export function buildApi(deps: ApiDeps): Router {
           store.updateStepStatus(stepId, status, { endedAt, actualMs: outcome.result.durationMs })
         }
 
+        // 输出落库（脱敏后的版本）。不存的话刷新页面就看不到了，
+        // 而复盘恰恰需要"当时到底输出了什么"。
+        store.addEvidence({
+          stepId,
+          source: 'auto',
+          text: joinOutput(outcome.redactedStdout, outcome.redactedStderr),
+          exitCode: outcome.result.exitCode,
+          timedOut: outcome.result.timedOut,
+          durationMs: outcome.result.durationMs,
+          redacted: outcome.redactionHits.length > 0,
+        })
+
         if (taskId !== null) {
           store.appendEvent({
             taskId,
@@ -287,6 +355,95 @@ export function buildApi(deps: ApiDeps): Router {
     sendJson(res, 202, { stepId, status: 'running' })
   })
 
+  /**
+   * 手动提交证据：用户自己跑完命令，把输出贴回来。
+   *
+   * 这是"相信用户不当保姆"的落点——QB 不强求你用它的运行按钮。
+   * 贴回来的内容同样过脱敏，并触发预期判定。
+   */
+  router.post('/steps/:id/evidence', (_req, res, ctx) => {
+    const stepId = ctx.params.id!
+    const step = store.getStep(stepId)
+    if (step === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+
+    const body = (ctx.body ?? {}) as {
+      text?: string
+      imageBase64?: string
+      markDone?: boolean
+    }
+
+    const hasText = typeof body.text === 'string' && body.text.trim() !== ''
+    if (!hasText && body.imageBase64 === undefined && body.markDone !== true) {
+      sendJson(res, 400, { error: 'bad_request', message: '没有内容' })
+      return
+    }
+
+    const taskId = store.taskIdOfStep(stepId)
+    let verdict: Verdict | null = null
+    let reason = ''
+
+    if (hasText) {
+      const clean = redact(sanitizeText(body.text!))
+      store.addEvidence({
+        stepId,
+        source: 'paste',
+        text: clean.text,
+        redacted: clean.hits.length > 0,
+      })
+
+      // 用户贴回来的输出同样要判定——他自己跑的和 QB 跑的一视同仁。
+      // 但没有退出码：手动粘贴时那个信息本就不存在，不该因此判 unclear。
+      // 所以只在有显式预期时判定，没有预期就交给用户自己说了算。
+      if (step.expectation !== null) {
+        const check = checkExpectation(step.expectation as Expectation, {
+          // 人工提供的输出没有退出码。给 0 表示"不是异常终止"，
+          // 真正依赖退出码的预期（kind: exitCode）本就不适合手动判定，
+          // 那种情况下用户应该直接点"完成"。
+          exitCode: 0,
+          stdout: body.text!,
+          stderr: '',
+          timedOut: false,
+        })
+        verdict = check.verdict
+        reason = check.reason
+      }
+    }
+
+    // 状态推导：用户点"完成"最优先——人的判断不被机器否决。
+    // 其次看预期判定。都没有时，贴了输出本身就说明这步做过了。
+    const status: StepStatus =
+      body.markDone === true
+        ? 'ok'
+        : verdict === 'fail'
+          ? 'failed'
+          : verdict === 'pass'
+            ? 'ok'
+            : hasText
+              ? 'ok'
+              : step.status
+
+    if (status !== step.status) {
+      store.updateStepStatus(stepId, status, { endedAt: Date.now() })
+    }
+
+    if (taskId !== null) {
+      store.markTaskStarted(taskId, currentUserId())
+      store.appendEvent({
+        taskId,
+        stepId,
+        actorId: currentUserId(),
+        kind: status === 'failed' ? 'step_failed' : 'step_ok',
+        payload: { source: 'manual', verdict, reason },
+      })
+    }
+
+    ws.broadcast({ type: 'step.status', stepId, status })
+    sendJson(res, 201, { stepId, status, verdict, reason })
+  })
+
   router.post('/steps/:id/cancel', (_req, res, ctx) => {
     const stepId = ctx.params.id!
     const handle = running.get(stepId)
@@ -298,4 +455,11 @@ export function buildApi(deps: ApiDeps): Router {
   })
 
   return router
+}
+
+/** stdout 与 stderr 合并展示；stderr 单独标出来，否则看不出是哪一路。 */
+function joinOutput(stdout: string, stderr: string): string {
+  if (stderr.trim() === '') return stdout
+  if (stdout.trim() === '') return stderr
+  return `${stdout}\n--- stderr ---\n${stderr}`
 }

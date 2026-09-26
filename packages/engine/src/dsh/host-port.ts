@@ -1,4 +1,5 @@
 import { sanitizeText } from '@qb/core'
+import { createProvider, type ProviderConfig } from './provider.ts'
 import type {
   Completion,
   CompletionRequest,
@@ -71,7 +72,10 @@ export interface DshWebServer {
   register(route: {
     kind: 'exact' | 'prefix'
     path: string
-    handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void | Promise<void>
+    handler: (
+      req: import('node:http').IncomingMessage,
+      res: import('node:http').ServerResponse,
+    ) => void | Promise<void>
   }): () => void
   registerUpgrade(route: {
     path: string
@@ -99,7 +103,83 @@ export interface DshContext {
 /** 流式输出的轮询间隔。够快到像实时，又不至于空转。 */
 const POLL_INTERVAL_MS = 120
 
-export function createDshHostPort(ctx: DshContext): HostPort {
+export function createDshHostPort(ctx: DshContext, llm?: ProviderConfig): HostPort {
+  // 没配 provider 时 complete() 明确抛错，不返回假数据——
+  // 静默的空实现会让上层以为模型在工作。
+  const provider = llm === undefined ? null : createProvider(llm)
+
+  function startCommand(req: RunRequest): StreamingRun {
+    const startedAt = Date.now()
+    const spec = ctx.shell.resolve(toShellRequest(req))
+    const proc = ctx.shell.start(spec)
+
+    const listeners = new Set<(chunk: OutputChunk) => void>()
+    // readOutput 是消费式的：读走就没了。所以自己留一份完整副本，
+    // 供订阅晚于启动的消费者和最终结果使用。
+    let collected = ''
+    let sawLoss = false
+    let timedOut = false
+
+    const drain = (): void => {
+      const read = proc.readOutput()
+      if (read.delta === '' && !read.lossy) return
+
+      // 命令输出不保证是合法 UTF-8（Windows 中文 locale 输出 GBK），
+      // 在唯一入口清洗，避免非法代理项流进数据库和 JSON。
+      const text = sanitizeText(read.delta)
+      collected += text
+      sawLoss ||= read.lossy
+
+      const chunk: OutputChunk = {
+        text,
+        lossy: read.lossy,
+        ...(read.stdoutSpillPath !== undefined ? { spillPath: read.stdoutSpillPath } : {}),
+      }
+      for (const cb of listeners) cb(chunk)
+    }
+
+    // 用 ctx.setInterval 而非裸 setInterval：插件卸载时 cordis 自动清理，
+    // 不会留下孤儿定时器。
+    const stopPolling = ctx.setInterval(drain, POLL_INTERVAL_MS)
+
+    // dsh 的 start() 明确不施加超时（"no timeout applies to background
+    // processes"），超时只对 run() 生效。我们自己计时并 kill。
+    const cancelTimeout = ctx.setTimeout(() => {
+      timedOut = true
+      proc.kill()
+    }, req.timeoutMs)
+
+    const onAbort = (): void => {
+      proc.kill()
+    }
+    req.signal?.addEventListener('abort', onAbort, { once: true })
+
+    const done = proc.done.then((): RunResult => {
+      stopPolling()
+      cancelTimeout()
+      req.signal?.removeEventListener('abort', onAbort)
+      drain() // 收尾，确保进程结束前最后一批输出不丢
+
+      return {
+        exitCode: proc.exitCode,
+        signal: proc.signal,
+        stdout: collected,
+        stderr: '', // start() 路径下 stderr 已合并进 delta
+        timedOut,
+        durationMs: Date.now() - startedAt,
+      }
+    })
+
+    return {
+      onChunk(cb) {
+        listeners.add(cb)
+        return () => listeners.delete(cb)
+      },
+      done,
+      kill: () => proc.kill(),
+    }
+  }
+
   return {
     info: {
       get host() {
@@ -111,98 +191,21 @@ export function createDshHostPort(ctx: DshContext): HostPort {
     },
 
     async runCommand(req: RunRequest): Promise<RunResult> {
-      const startedAt = Date.now()
-      const spec = ctx.shell.resolve(toShellRequest(req))
-      const result = await ctx.shell.run(spec)
-      return {
-        exitCode: result.exitCode,
-        signal: result.signal,
-        // 命令输出不保证是合法 UTF-8（Windows 中文 locale 输出 GBK），
-        // 在唯一入口清洗，避免非法代理项流进数据库和 JSON。
-        stdout: sanitizeText(result.stdout),
-        stderr: sanitizeText(result.stderr),
-        timedOut: result.timedOut,
-        durationMs: Date.now() - startedAt,
-      }
+      // 统一走 start() 而不是 run()：实测两者行为并不等价——同一条
+      // PowerShell 命令在 run() 下拿不到输出，在 start() 下正常。
+      // 超时已在 startCommand 里自行实现，语义不受影响。
+      return startCommand(req).done
     },
 
-    startCommand(req: RunRequest): StreamingRun {
-      const startedAt = Date.now()
-      const spec = ctx.shell.resolve(toShellRequest(req))
-      const proc = ctx.shell.start(spec)
+    startCommand,
 
-      const listeners = new Set<(chunk: OutputChunk) => void>()
-      // readOutput 是消费式的：读走就没了。所以自己留一份完整副本，
-      // 供订阅晚于启动的消费者和最终结果使用。
-      let collected = ''
-      let sawLoss = false
-      let timedOut = false
-
-      const drain = (): void => {
-        const read = proc.readOutput()
-        if (read.delta === '' && !read.lossy) return
-
-        // 同 runCommand：在入口清洗非法 UTF-8。
-        const text = sanitizeText(read.delta)
-        collected += text
-        sawLoss ||= read.lossy
-
-        const chunk: OutputChunk = {
-          text,
-          lossy: read.lossy,
-          ...(read.stdoutSpillPath !== undefined ? { spillPath: read.stdoutSpillPath } : {}),
-        }
-        for (const cb of listeners) cb(chunk)
+    async complete(req: CompletionRequest): Promise<Completion> {
+      if (provider === null) {
+        throw new Error(
+          'QB 没有配置模型端点。在 profile 的 config.llm 里填 wire/baseUrl/apiKey/model。',
+        )
       }
-
-      // 用 ctx.setInterval 而非裸 setInterval：插件卸载时 cordis 自动清理，
-      // 不会留下孤儿定时器。
-      const stopPolling = ctx.setInterval(drain, POLL_INTERVAL_MS)
-
-      // dsh 的 start() 明确不施加超时（"no timeout applies to background
-      // processes"），超时只对 run() 生效。但 HostPort 的契约是两条路径
-      // 语义一致，所以这里自己计时并 kill。
-      const cancelTimeout = ctx.setTimeout(() => {
-        timedOut = true
-        proc.kill()
-      }, req.timeoutMs)
-
-      // 外部 abort 信号同样要终止进程
-      const onAbort = (): void => {
-        proc.kill()
-      }
-      req.signal?.addEventListener('abort', onAbort, { once: true })
-
-      const done = proc.done.then((): RunResult => {
-        stopPolling()
-        cancelTimeout()
-        req.signal?.removeEventListener('abort', onAbort)
-        drain() // 收尾，确保进程结束前最后一批输出不丢
-
-        return {
-          exitCode: proc.exitCode,
-          signal: proc.signal,
-          stdout: collected,
-          stderr: '', // start() 路径下 stderr 已合并进 delta
-          timedOut,
-          durationMs: Date.now() - startedAt,
-        }
-      })
-
-      return {
-        onChunk(cb) {
-          listeners.add(cb)
-          return () => listeners.delete(cb)
-        },
-        done,
-        kill: () => proc.kill(),
-      }
-    },
-
-    async complete(_req: CompletionRequest): Promise<Completion> {
-      // M3 接入。先明确失败而不是返回假数据——静默的空实现会让
-      // 上层以为模型在工作。
-      throw new Error('complete() 尚未实现：等 M3 接入 dsh 的 llm seam')
+      return provider.complete(req)
     },
 
     schedule(delayMs: number, fn: () => void): Disposable {

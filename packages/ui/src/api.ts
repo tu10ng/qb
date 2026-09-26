@@ -1,4 +1,4 @@
-import type { Event, Runbook, Step, Task, User } from '@qb/core'
+import type { Event, Evidence, Runbook, Step, Task, User } from '@qb/core'
 
 const BASE = '/qb/api'
 
@@ -42,6 +42,8 @@ export interface TaskDetail {
   runbook: Runbook | null
   steps: Step[]
   events: Event[]
+  /** 按步骤分组的历史证据——刷新后还能看到上次跑出了什么。 */
+  evidence: Record<string, Evidence[]>
 }
 
 export const api = {
@@ -54,6 +56,10 @@ export const api = {
     req<Task>('/tasks', { method: 'POST', body: JSON.stringify(input) }),
 
   taskDetail: (taskId: string) => req<TaskDetail>(`/tasks/${taskId}/runbook`),
+
+  /** 让 QB 起草 runbook。要等模型，可能几十秒。 */
+  draft: (taskId: string) =>
+    req<{ runbook: Runbook; steps: Step[] }>(`/tasks/${taskId}/draft`, { method: 'POST' }),
 
   writeRunbook: (
     taskId: string,
@@ -69,6 +75,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(opts),
     }),
+
+  /** 手动提交证据：自己跑完把输出贴回来，或直接标记完成。 */
+  submitEvidence: (
+    stepId: string,
+    input: { text?: string; imageBase64?: string; markDone?: boolean },
+  ) =>
+    req<{ stepId: string; status: string; verdict: string | null; reason: string }>(
+      `/steps/${stepId}/evidence`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
 
   cancelStep: (stepId: string) =>
     req<{ stepId: string; killed: boolean }>(`/steps/${stepId}/cancel`, { method: 'POST' }),
