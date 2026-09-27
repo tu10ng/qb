@@ -419,6 +419,7 @@ M1–M4 是单人 dogfood 的完整闭环，用你真实的 vLLM PD 分离部署
 ## 9. 工程约定
 
 - **测试**：`@qb/core` 的纯函数必须有单测（expectation / danger / redact / order_key / runbook diff）；engine 与 server 用 vitest 做集成测试（真起 `ctx.shell`、真建 SQLite 临时库）；UI 先不做 e2e。
+- **同步契约**：引擎 push 新增字段时必须同步加进团队服务 `SyncBody` 的 zod schema——zod 默认静默剥离未知键（M9 的 `lineageKey` 曾因此到不了镜像，路由全空）。下行按血缘路由的数据不依赖游标窗口（游标会越过"当时还不属于我"的项），按状态重发、引擎按 id 幂等。
 - **类型**：`strict: true`，禁止 `any`；跨包只经 `@qb/core` 的导出类型。
 - **dsh 边界**：除 `packages/engine/src/dsh/` 外，任何文件不得 import `@deepseek-ai/*`。ADR 记录用到的每个 API，越界先补 ADR。
 - **模型边界**：除 `packages/engine/src/llm/` 外，任何文件不得 import `ai` / `@ai-sdk/*`；不手写任何模型协议解析（ADR 0002）。
