@@ -105,6 +105,13 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
     scope: z.enum(['personal', 'team']).default('team'),
   })
 
+  const QuestionLessonBody = z.object({
+    symptom: z.string().trim().min(1).max(4000).optional(),
+    fixMd: z.string().trim().min(1).max(8000).optional(),
+    condition: z.string().trim().max(500).nullable().optional(),
+    scope: z.enum(['personal', 'team']).default('team'),
+  })
+
   router.post('/lesson-offers/:id/accept', async (_req, res, ctx) => {
     const offer = store.lessonOfferById(ctx.params.id!)
     if (offer === null || offer.status !== 'pending') {
@@ -138,8 +145,8 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
           body: JSON.stringify({
             lineageKey: step.lineageKey,
             stepTitle: step.title,
-            beforeMd: redact(String(offer.payload.before ?? '')),
-            afterMd: redact(String(offer.payload.after ?? step.command ?? '')),
+            beforeMd: redact(String(offer.payload.before ?? '')).text,
+            afterMd: redact(String(offer.payload.after ?? step.command ?? '')).text,
             fromTaskId: offer.taskId,
             fromTaskTitle: task?.title ?? null,
           }),
@@ -192,12 +199,11 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
         : offer.kind === 'situation'
           ? `情况变了：${String(offer.payload.reason ?? '')}`
           : String(offer.payload.symptom ?? '')
+    // 默认修法只放改后的命令（带围栏）——fixCommandOf 取围栏块当修复命令，
+    // 放"改前"会把坏命令当修法
     const defaultFix =
       offer.kind === 'fix'
-        ? [
-            `改前：\n\`\`\`\n${String(offer.payload.before ?? '')}\n\`\`\``,
-            `改后（这样就通了）：\n\`\`\`\n${String(offer.payload.after ?? '')}\n\`\`\``,
-          ].join('\n\n')
+        ? `\`\`\`\n${String(offer.payload.after ?? '')}\n\`\`\``
         : offer.kind === 'question'
           ? String(offer.payload.answer ?? '')
           : '见任务时间线'
@@ -208,6 +214,8 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
       return
     }
 
+    // 没有血缘锚点的坑共享无意义（别人收不到）——强制 personal
+    const scope = step?.lineageKey != null ? body.scope : 'personal'
     const lesson = store.createLesson({
       anchorKind: step?.lineageKey != null ? 'step_lineage' : 'free',
       anchorRef: step?.lineageKey ?? null,
@@ -217,7 +225,7 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
       fixMd,
       authorId: currentUserId(),
       sourceTaskId: offer.taskId,
-      scope: body.scope,
+      scope,
     })
     if (offer.kind === 'question' && typeof offer.payload.questionId === 'string') {
       store.updateQuestionLesson(offer.payload.questionId, lesson.id)
@@ -228,10 +236,10 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
       stepId: offer.stepId,
       actorId: currentUserId(),
       kind: 'lesson_proposed',
-      payload: { lessonId: lesson.id, symptom: symptom.slice(0, 80), shared: body.scope === 'team' },
+      payload: { lessonId: lesson.id, symptom: symptom.slice(0, 80), shared: scope === 'team' },
     })
     changed(offer.taskId, offer.stepId)
-    if (body.scope === 'team') sync.pushNow()
+    if (scope === 'team') sync.pushNow()
     sendJson(res, 201, { lesson: toView(store, lesson, [], null) })
   })
 
@@ -347,19 +355,25 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
       sendJson(res, 409, { error: 'unanswered', message: '这条求助还没有回答' })
       return
     }
-    const body = (ctx.body ?? {}) as { symptom?: string; fixMd?: string; condition?: string | null; scope?: 'personal' | 'team' }
+    const parsed = QuestionLessonBody.safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
+      return
+    }
+    const body = parsed.data
     const symptom = redact(body.symptom ?? q.bodyMd).text
     const fixMd = redact(body.fixMd ?? q.answerMd).text
     const step = q.stepId !== null ? store.getStep(q.stepId) : null
+    const scope = step?.lineageKey != null ? body.scope : 'personal'
     const lesson = store.createLesson({
       anchorKind: step?.lineageKey != null ? 'step_lineage' : 'free',
       anchorRef: step?.lineageKey ?? null,
-      condition: typeof body.condition === 'string' && body.condition !== '' ? body.condition : null,
+      condition: body.condition != null && body.condition !== '' ? redact(body.condition).text : null,
       symptom,
       fixMd,
       authorId: currentUserId(),
       sourceTaskId: q.taskId,
-      scope: body.scope ?? 'team',
+      scope,
     })
     store.updateQuestionLesson(q.id, lesson.id)
     store.appendEvent({
@@ -367,10 +381,10 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
       stepId: q.stepId,
       actorId: currentUserId(),
       kind: 'lesson_proposed',
-      payload: { lessonId: lesson.id, symptom: symptom.slice(0, 80), fromQuestion: q.id },
+      payload: { lessonId: lesson.id, symptom: symptom.slice(0, 80), fromQuestion: q.id, shared: scope === 'team' },
     })
     changed(q.taskId, q.stepId)
-    if ((body.scope ?? 'team') === 'team') sync.pushNow()
+    if (scope === 'team') sync.pushNow()
     sendJson(res, 201, { lesson: { id: lesson.id } })
   })
 
@@ -398,7 +412,10 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
 }
 
 function toView(store: Store, l: Lesson, params: Param[], env: EnvironmentFacts | null): LessonView {
-  const matched = matchCondition(parseCondition(l.condition), params, env)
+  // 条件是自由文本（解析不了，如导入生成的「步骤「标题」」）→ 无法判定，
+  // 进第二层——conditions 模块的文档语义与方案 §6.3 一致
+  const parsed = parseCondition(l.condition)
+  const matched = l.condition !== null && l.condition.trim() !== '' && parsed === null ? null : matchCondition(parsed, params, env)
   return {
     id: l.id,
     symptom: l.symptom,
@@ -419,6 +436,8 @@ function toView(store: Store, l: Lesson, params: Param[], env: EnvironmentFacts 
 /**
  * 应用别人的底稿提议：找自己手里同血缘、且命令还是 before 的步骤
  * （不是 before 的标冲突，不盲改），改完记 edit 事件。
+ * 注意 offer.taskId 是提议在本机落地的任务（sync 找到的同血缘任务），
+ * 不是提议人的任务——那是对方机器上的，本地不存在，不能跳过。
  */
 function applyProposal(store: Store, actorId: string, offer: LessonOfferRow): 'accepted' | 'declined' | 'conflict' {
   const lineageKey = String(offer.payload.lineageKey ?? '')
@@ -428,11 +447,10 @@ function applyProposal(store: Store, actorId: string, offer: LessonOfferRow): 'a
   const fromName = String(offer.payload.fromName ?? '')
   if (lineageKey === '' || after === '') return 'declined'
 
-  // 自己所有任务里找同血缘的最新 runbook 步骤（排除提议来源任务）
+  // 自己所有任务里找同血缘的最新 runbook 步骤
   let applied = 0
   let conflict = false
   for (const task of store.listTasks({})) {
-    if (task.id === offer.taskId) continue
     const latest = store.getLatestRunbook(task.id)
     if (latest === null) continue
     const step = latest.steps.find((s) => s.lineageKey === lineageKey)

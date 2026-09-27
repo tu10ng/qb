@@ -75,6 +75,8 @@ export interface RemoteStep {
   expectedMinutes: number | null
   actualMs: number | null
   statusNote: string | null
+  /** 执行者开了"共享输出"的步骤带最新输出。 */
+  lastOutput?: string | null
 }
 
 export interface RemoteEvent {

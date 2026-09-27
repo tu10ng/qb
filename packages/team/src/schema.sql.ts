@@ -260,4 +260,13 @@ CREATE TABLE down_notices (
 CREATE INDEX idx_down_notices_user ON down_notices(user_name, down_seq);
 `,
   },
+  {
+    version: 4,
+    name: 'step-last-output',
+    sql: `
+-- M8 遗留补全：执行者开了"共享输出"的步骤，最新输出（脱敏+截尾）随
+-- 快照到达，发起人远程 UI 能看到那一步实际跑出了什么
+ALTER TABLE steps ADD COLUMN last_output TEXT;
+`,
+  },
 ]

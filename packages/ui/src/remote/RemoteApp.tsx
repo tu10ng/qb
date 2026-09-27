@@ -345,6 +345,12 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
                     <pre>{s.command}</pre>
                   </div>
                 )}
+                {s.lastOutput !== null && s.lastOutput !== undefined && (
+                  <div className="shared-output">
+                    <span className="dim">他共享的输出：</span>
+                    <pre>{s.lastOutput}</pre>
+                  </div>
+                )}
                 {s.statusNote !== null && <div className="verdict fail">{s.statusNote}</div>}
                 {/* 这一步上的评论 */}
                 {detail.comments
@@ -465,6 +471,16 @@ function remoteEventText(kind: string, payload: Record<string, unknown>, section
       return `求助有了回答：${typeof payload.answer === 'string' ? payload.answer.slice(0, 80) : ''}`
     case 'comment':
       return `评论：${typeof payload.body === 'string' ? payload.body.slice(0, 80) : ''}`
+    case 'lesson_proposed':
+      return payload.shared === true ? '记了个坑（已共享）' : '记了个坑'
+    case 'lesson_shared':
+      return `${typeof payload.by === 'string' ? payload.by : '同事'} 在${which || '某一步'}记了个坑：${typeof payload.symptom === 'string' ? payload.symptom.slice(0, 60) : ''}`
+    case 'lesson_confirmed':
+      return payload.status === 'confirmed' ? '一个共享的坑被确认有效' : '一个共享的坑被判定无效'
+    case 'base_proposal':
+      return `底稿提议：${typeof payload.stepTitle === 'string' ? payload.stepTitle : ''}`
+    case 'delegate_progress':
+      return '委派进展'
     default:
       return kind
   }

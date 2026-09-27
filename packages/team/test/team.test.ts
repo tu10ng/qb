@@ -370,3 +370,44 @@ describe('坑库与底稿提议（M9）', () => {
     expect((notice[0]!.payload as { status: string }).status).toBe('accepted')
   })
 })
+
+describe('坑的驳回在带内传播（审查修复回归）', () => {
+  it('驳回后：同血缘执行者仍收到带 declined 状态的坑（引擎端据此降级），作者收到通知', () => {
+    const { store } = fresh()
+    setupUsers(store)
+    const linStepsDeclined = [
+      { taskId: 'tsk_1', id: 's2', parentId: null, orderKey: 'k', kind: 'command', title: '起 decode', command: 'x', status: 'failed', expectedMinutes: null, actualMs: null, statusNote: null, lineageKey: 'lin_dec' },
+    ]
+    const push1 = pushBody({
+      tasks: [{ ...pushBody().tasks[0]!, steps: linStepsDeclined }],
+      events: [], alerts: [],
+      lessons: [{ id: 'lsn_d1', lineageKey: 'lin_dec', symptom: 's', cause: null, fixMd: 'f', condition: null, taskId: 'tsk_1', taskTitle: 't', createdAt: 1 }],
+    })
+    store.ingestPush(push1)
+
+    // 小B 同血缘任务
+    store.ingestPush(pushBody({
+      user: { name: 'xiaob', displayName: '小B' },
+      tasks: [{ id: 'tsk_2', title: 'B', briefMd: '', initiatorName: 'laowang', assigneeName: 'xiaob', status: 'active', expectedMinutes: null, startedAt: null, endedAt: null, runbookVersion: 1, steps: linStepsDeclined.map((s) => ({ ...s, taskId: 'tsk_2' })) }],
+      events: [], alerts: [], questions: [], lessons: [], sinceDownSeq: 0,
+    }))
+
+    // 老王驳回
+    const laowang = store.userByName('laowang')!
+    store.confirmLesson('lsn_d1', laowang, false)
+
+    // B 再拉：坑还在下行里，但带 declined
+    const bDown = store.ingestPush(pushBody({
+      user: { name: 'xiaob', displayName: '小B' },
+      tasks: [{ id: 'tsk_2', title: 'B', briefMd: '', initiatorName: 'laowang', assigneeName: 'xiaob', status: 'active', expectedMinutes: null, startedAt: null, endedAt: null, runbookVersion: 1, steps: linStepsDeclined.map((s) => ({ ...s, taskId: 'tsk_2' })) }],
+      events: [], alerts: [], questions: [], lessons: [], sinceDownSeq: 0,
+    }))
+    const lessonDown = bDown.down.find((d) => d.kind === 'lesson')
+    expect((lessonDown!.payload as { status: string }).status).toBe('declined')
+
+    // 作者收到驳回通知
+    const aDown = store.ingestPush(push1)
+    const notice = aDown.down.find((d) => d.kind === 'lesson_status')
+    expect((notice!.payload as { status: string }).status).toBe('declined')
+  })
+})

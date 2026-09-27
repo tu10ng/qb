@@ -32,7 +32,8 @@ function migrate(db: Db): void {
   )
   const record = db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
 
-  for (const m of MIGRATIONS) {
+  // 按版本号升序执行（书写顺序不作数，依赖只认版本号）
+  for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
     if (applied.has(m.version)) continue
     const run = db.transaction(() => {
       db.exec(m.sql)

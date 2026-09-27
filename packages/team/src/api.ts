@@ -403,6 +403,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   })
 
   app.post('/api/push/test', async (c) => {
+    // 测试命令渠道 = 以服务进程身份真跑一条命令，门槛与渠道 CRUD 一致
+    if (!requireAdmin(c)) return c.json({ error: 'forbidden', message: '只有管理员能测试推送渠道' }, 403)
     const body = await c.req.json().catch(() => ({}))
     const ch = store.listChannels().find((x) => x.id === (body as { id?: string }).id)
     if (ch === undefined) return c.json({ error: 'not_found', message: '渠道不存在（先保存）' }, 404)

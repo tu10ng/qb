@@ -643,6 +643,7 @@ export class Store {
              kind = @kind, title = @title, why_md = @whyMd, command = @command,
              expectation_json = @expectationJson, probe_json = @probeJson,
              timeout_ms = @timeoutMs, expected_minutes = @expectedMinutes,
+             share_output = @shareOutput,
              rev = rev + 1, edited_by = @editedBy
            WHERE id = @id`,
         )
@@ -1190,8 +1191,9 @@ export class Store {
   // ── 捕获提议（M9）────────────────────────────────────────
 
   /**
-   * 记一条捕获提议。dedupKey（如 questionId、lineageKey）在同任务的 pending
-   * 提议里唯一——唯一索引兜底，重复时静默跳过。
+   * 记一条捕获提议。dedupKey（如 questionId、lineageKey、prp:<提议id>）
+   * 在同任务内**跨状态**唯一：处理过（接受/拒绝）的不再重发——底稿提议
+   * 从团队全量重发，靠这条挡住"拒绝后又复活"。
    */
   createLessonOffer(input: {
     taskId: string
@@ -1200,6 +1202,12 @@ export class Store {
     payload: Record<string, unknown>
     dedupKey?: string | null
   }): boolean {
+    if (input.dedupKey != null) {
+      const exists = this.db
+        .prepare('SELECT 1 AS hit FROM lesson_offers WHERE task_id = ? AND kind = ? AND dedup_key = ? LIMIT 1')
+        .get(input.taskId, input.kind, input.dedupKey)
+      if (exists !== undefined) return false
+    }
     try {
       this.db
         .prepare(
@@ -1209,10 +1217,31 @@ export class Store {
         .run(ids.lessonOffer(), input.taskId, input.stepId ?? null, input.kind,
              JSON.stringify(input.payload), input.dedupKey ?? null, Date.now(), Date.now())
       return true
-    } catch {
-      // 唯一索引冲突 = 已有同类 pending 提议，不必再问
-      return false
+    } catch (e) {
+      // 唯一索引冲突 = 并发下别人先建了同类提议；其他错误（外键/磁盘）照抛
+      if ((e as { code?: string }).code?.startsWith('SQLITE_CONSTRAINT') === true) return false
+      throw e
     }
+  }
+
+  /** 按 dedupKey 找提议（任意状态）——下行通知精确落任务用。 */
+  findLessonOfferByDedup(kind: string, dedupKey: string): LessonOfferRow | null {
+    const r = this.db
+      .prepare('SELECT * FROM lesson_offers WHERE kind = ? AND dedup_key = ? LIMIT 1')
+      .get(kind, dedupKey) as Record<string, unknown> | undefined
+    return r === undefined ? null : toLessonOffer(r)
+  }
+
+  /**
+   * 按团队侧提议 id 找提议（任意状态）。接受方是 proposal 提议（dedupKey
+   * 是 prp:<id>），发起方是 deviation 提议（dedupKey 是 dev:…，但送出后
+   * payload 里带了 remoteId）——下行通知两边都要能落到任务上。
+   */
+  findLessonOfferByRemoteId(remoteId: string): LessonOfferRow | null {
+    const r = this.db
+      .prepare(`SELECT * FROM lesson_offers WHERE json_extract(payload_json, '$.remoteId') = ? LIMIT 1`)
+      .get(remoteId) as Record<string, unknown> | undefined
+    return r === undefined ? null : toLessonOffer(r)
   }
 
   listLessonOffers(taskId: string, status: 'pending' | 'accepted' | 'dismissed' | 'all' = 'pending'): LessonOfferRow[] {

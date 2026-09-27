@@ -116,9 +116,13 @@ describe('偏离底稿的检测（捕获时机 3）', () => {
 })
 
 describe('修法里抽命令', () => {
-  it('围栏代码块优先；没有围栏就当整段是命令', () => {
+  it('取最后一个围栏块（"改前/改后"式修法要的是改后）；无围栏时只有单行才算命令', () => {
     expect(fixCommandOf('先改网卡：\n```bash\nexport NCCL_SOCKET_IFNAME=eth0\n```\n然后重跑')).toBe('export NCCL_SOCKET_IFNAME=eth0')
+    expect(fixCommandOf('改前：\n```\nvllm serve\n```\n改后（这样就通了）：\n```\nNCCL_SOCKET_IFNAME=eth0 vllm serve\n```')).toBe('NCCL_SOCKET_IFNAME=eth0 vllm serve')
     expect(fixCommandOf('export X=1')).toBe('export X=1')
     expect(fixCommandOf('```\n```')).toBeNull()
+    // 多行散文（求助回答全文、情况变了的原因）不能当命令执行
+    expect(fixCommandOf('老王说：这台机器要用 eth0。\n另外记得先改防火墙。')).toBeNull()
+    expect(fixCommandOf('见任务时间线')).toBeNull()
   })
 })

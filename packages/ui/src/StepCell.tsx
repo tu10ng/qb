@@ -709,15 +709,18 @@ function LessonList({
               <button
                 className="btn primary"
                 disabled={busy === l.id}
+                title={l.status === 'unverified' ? '来源未验证：只插入修复步骤，你确认后再运行' : '插入修复步骤并运行（跑通自动记"帮上一次"）'}
                 onClick={() =>
                   void act(l.id, async () => {
-                    // 插入修复步骤并立刻运行（sourceRef 记着坑 id，跑通自动记"帮上"）
+                    // 插入修复步骤（sourceRef 记着坑 id，跑通自动记"帮上"）。
+                    // 未验证的坑只插入不自动运行——同事的内容上本机执行，
+                    // 要过人手一道（自己的与已确认的直接跑）。
                     const s = await api.applyLessonFix(l.id, step.id)
-                    await api.runStep(s.id)
+                    if (l.status !== 'unverified') await api.runStep(s.id)
                   })
                 }
               >
-                按这个修
+                按这个修{l.status === 'unverified' ? '（未验证 · 插入不运行）' : ''}
               </button>
               <button className="btn ghost" disabled={busy === l.id} onClick={() => void act(l.id, () => api.lessonMiss(l.id))}>
                 不是这个

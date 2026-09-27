@@ -210,8 +210,8 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
   })
 
   /**
-   * 沉淀成坑：把一次求助-回答对变成 personal 坑。
-   * 界面上出现在发起人回答到达后的 [沉淀成坑] 按钮。
+   * 记个坑（捕获时机 2 的接口）：挂在步骤血缘上，可选共享给团队。
+   * 没有血缘锚点的（复制底稿前手写的步骤）共享无意义，强制 personal。
    */
   router.post('/steps/:id/lesson', (_req, res, ctx) => {
     const stepId = ctx.params.id!
@@ -220,26 +220,35 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       sendJson(res, 404, { error: 'not_found', message: '步骤不存在' })
       return
     }
-    const body = (ctx.body ?? {}) as { symptom?: string; fix?: string; condition?: string }
+    const body = (ctx.body ?? {}) as { symptom?: string; fix?: string; condition?: string; scope?: string }
     if (typeof body.symptom !== 'string' || body.symptom.trim() === '' || typeof body.fix !== 'string' || body.fix.trim() === '') {
       sendJson(res, 400, { error: 'bad_request', message: 'symptom 和 fix 不能为空' })
       return
     }
+    const canShare = step.lineageKey !== null
+    const scope = canShare && body.scope === 'team' ? 'team' : 'personal'
     const taskId = store.taskIdOfStep(stepId)
     const lesson = store.createLesson({
       // 锚到步骤血缘（M9）：同血缘的所有 runbook 复制品都会看到这条坑
-      anchorKind: step.lineageKey !== null ? 'step_lineage' : 'free',
+      anchorKind: canShare ? 'step_lineage' : 'free',
       anchorRef: step.lineageKey,
-      condition: typeof body.condition === 'string' && body.condition !== '' ? body.condition : null,
+      condition: typeof body.condition === 'string' && body.condition !== '' ? redact(body.condition).text : null,
       symptom: redact(body.symptom).text,
       fixMd: redact(body.fix).text,
       authorId: currentUserId(),
       sourceTaskId: taskId,
-      scope: 'personal',
+      scope,
     })
     if (taskId !== null) {
-      store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'lesson_proposed', payload: { lessonId: lesson.id, symptom: lesson.symptom.slice(0, 80) } })
+      store.appendEvent({
+        taskId,
+        stepId,
+        actorId: currentUserId(),
+        kind: 'lesson_proposed',
+        payload: { lessonId: lesson.id, symptom: lesson.symptom.slice(0, 80), shared: scope === 'team' },
+      })
     }
+    if (scope === 'team') sync.pushNow()
     sendJson(res, 201, lesson)
   })
 

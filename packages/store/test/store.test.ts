@@ -762,7 +762,7 @@ describe('坑：血缘锚定 / 共享 / 命中统计（M9）', () => {
 })
 
 describe('捕获提议（M9）', () => {
-  it('dedupKey 在 pending 内唯一，处理后可再提', () => {
+  it('dedupKey 跨状态唯一——处理过的不再复活（底稿提议从团队全量重发）', () => {
     const t = store.createTask({ title: 'x', initiatorId: me })
     expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(true)
     expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(false)
@@ -772,8 +772,17 @@ describe('捕获提议（M9）', () => {
     store.setLessonOfferStatus(offers[0]!.id, 'dismissed')
     expect(store.listLessonOffers(t.id)).toHaveLength(0)
 
-    // dismissed 之后同类事件再发生，还能再问一次
-    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(true)
+    // dismissed 之后同 dedupKey 不再问（fix 的 dedup 含 rev，新编辑=新 key，不受影响）
+    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(false)
+    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q2' }, dedupKey: 'q2' })).toBe(true)
+  })
+
+  it('按 dedupKey 任意状态查提议（下行通知精确落任务）', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.createLessonOffer({ taskId: t.id, kind: 'proposal', payload: { remoteId: 'prp_1' }, dedupKey: 'prp:prp_1' })
+    const found = store.findLessonOfferByDedup('proposal', 'prp:prp_1')
+    expect(found?.taskId).toBe(t.id)
+    expect(store.findLessonOfferByDedup('proposal', 'prp:none')).toBeNull()
   })
 
   it('按步骤取 pending 提议；payload 可打补丁', () => {
@@ -785,5 +794,19 @@ describe('捕获提议（M9）', () => {
     expect(at).toHaveLength(1)
     store.patchLessonOfferPayload(at[0]!.id, { remoteId: 'prp_1' })
     expect(store.lessonOfferById(at[0]!.id)!.payload).toEqual({ before: 'a', remoteId: 'prp_1' })
+  })
+})
+
+describe('share_output 落库（审查修复回归）', () => {
+  it('PATCH 更新 shareOutput 真的写进库里（此前 SET 列缺失，永远不生效）', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: 's', command: 'echo x' }] })
+    const step = steps[0]!
+    const updated = store.updateStep(step.id, { shareOutput: true }, { expectedRev: step.rev, actorId: me })
+    expect(updated.step.shareOutput).toBe(true)
+    expect(store.getStep(step.id)!.shareOutput).toBe(true)
+    // 关掉也生效
+    const again = store.updateStep(updated.step.id, { shareOutput: false }, { expectedRev: updated.step.rev, actorId: me })
+    expect(store.getStep(step.id)!.shareOutput).toBe(false)
   })
 })

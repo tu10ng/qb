@@ -19,38 +19,56 @@ import type { Store } from '@qb/store'
 const SYMPTOM_MAX = 300
 
 /**
- * 某步刚跑通时看一眼：之前失败过、且失败之后命令被改过 → 提议记坑。
+ * 某步刚跑通时看一眼：之前失败过、且失败之后命令被改过或加了一步
+ * （方案 §6.1 时机 1 的两种修法）→ 提议记坑。
  * 事件窗口 60 条足够覆盖"失败几次、改几次"的折腾。
  */
 export function detectFixOffer(store: Store, taskId: string, stepId: string): void {
   const step = store.getStep(stepId)
   if (step === null || step.command === null) return
 
-  const events = store.listEvents(taskId, 60).filter((e) => e.stepId === stepId)
-  // 最近一条失败 + 之后有过命令编辑，才谈得上"失败后修好"
+  const events = store.listEvents(taskId, 60)
+  const mine = events.filter((e) => e.stepId === stepId)
+  // 最近一条失败 + 之后改过，才谈得上"失败后修好"
   let lastFailIdx = -1
-  for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i]!.kind === 'step_failed' || events[i]!.kind === 'step_timeout') {
+  for (let i = mine.length - 1; i >= 0; i--) {
+    if (mine[i]!.kind === 'step_failed' || mine[i]!.kind === 'step_timeout') {
       lastFailIdx = i
       break
     }
   }
   if (lastFailIdx === -1) return
-  const afterFail = events.slice(lastFailIdx + 1)
-  const edits = afterFail.filter((e) => {
+  const failAt = mine[lastFailIdx]!.createdAt
+
+  // 修法一：失败后改了这条命令（取最后一次编辑的改前→改后）
+  const cmdEdits = mine.slice(lastFailIdx + 1).filter((e) => {
     if (e.kind !== 'edit') return false
     const changes = Array.isArray(e.payload.changes) ? (e.payload.changes as Array<{ field: string }>) : []
     return changes.some((c) => c.field === 'command')
   })
-  if (edits.length === 0) return
+  // 修法二：失败后插了一步（插入的步骤可能是修复步骤）
+  const inserted = events.filter(
+    (e) => e.kind === 'insert' && e.createdAt >= failAt && e.stepId !== null && e.stepId !== stepId,
+  )
 
-  // 修法 = 最后一次命令编辑的改前→改后
-  const lastEdit = edits[edits.length - 1]!
-  const changes = lastEdit.payload.changes as Array<{ field: string; before: unknown; after: unknown }>
-  const cmdChange = changes.find((c) => c.field === 'command')!
-  const before = String(cmdChange.before ?? '')
-  const after = String(cmdChange.after ?? '')
-  if (before === after) return
+  if (cmdEdits.length === 0 && inserted.length === 0) return
+
+  let before = step.command
+  let after = step.command
+  if (cmdEdits.length > 0) {
+    const lastEdit = cmdEdits[cmdEdits.length - 1]!
+    const changes = lastEdit.payload.changes as Array<{ field: string; before: unknown; after: unknown }>
+    const cmdChange = changes.find((c) => c.field === 'command')!
+    before = String(cmdChange.before ?? '')
+    after = String(cmdChange.after ?? '')
+  } else {
+    // 用最后插入的那步的命令当修法；插入的是人工说明就别提
+    const ins = [...inserted].reverse().find((e) => e.stepId !== null && (store.getStep(e.stepId!)?.command ?? '') !== '')
+    if (ins === undefined) return
+    const insStep = store.getStep(ins.stepId!)!
+    after = insStep.command ?? ''
+  }
+  if (before === after || after === '') return
 
   // 症状 = 失败那次运行的输出尾部（本次跑通开始前的最后一条证据）
   const runbook = store.getLatestRunbook(taskId)
@@ -92,7 +110,7 @@ export function detectDeviationOffer(store: Store, taskId: string, stepId: strin
     taskId,
     stepId,
     kind: 'deviation',
-    dedupKey: `dev:${stepId}:${after.length}`,
+    dedupKey: `dev:${stepId}:${shortHash(after)}`,
     payload: { before: baseStep.command, after, lineageKey: step.lineageKey, stepTitle: step.title },
   })
 }
@@ -108,12 +126,33 @@ export function onStepOk(store: Store, taskId: string, stepId: string): void {
   detectFixOffer(store, taskId, stepId)
 }
 
-/** 从坑的修法里抽第一条命令（围栏代码块优先），供"按这个修"插入步骤。 */
+/**
+ * 从坑的修法里抽修复命令，供"按这个修"插入步骤：
+ * - 取**最后一个**围栏代码块（"改前/改后"式修法要的是改后）——围栏是人
+ *   明确标的命令，内容不限
+ * - 没有围栏时，只有"单行且不含中文"的文本才当命令：命令几乎不含中文，
+ *   含中文的是散文（"见任务时间线"、求助回答全文），不能拿去执行
+ */
 export function fixCommandOf(fixMd: string): string | null {
-  const fenced = fixMd.match(/```[a-zA-Z]*\r?\n([\s\S]*?)```/)
-  const cmd = (fenced?.[1] ?? fixMd).trim()
-  if (cmd === '') return null
+  const fences = [...fixMd.matchAll(/```[a-zA-Z]*\r?\n([\s\S]*?)```/g)]
+  if (fences.length > 0) {
+    const cmd = fences[fences.length - 1]![1]!.trim()
+    return cmd === '' ? null : redact(cmd).text
+  }
+  const cmd = fixMd.trim()
+  if (cmd === '' || cmd.split(/\r?\n/).length !== 1) return null
+  if (/[一-鿿]/.test(cmd)) return null
   return redact(cmd).text
+}
+
+/** 短哈希（FNV-1a 32bit）：dedup 用，不追求密码学强度。 */
+function shortHash(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
 }
 
 function tailLines(text: string): string {

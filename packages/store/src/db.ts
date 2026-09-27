@@ -48,7 +48,9 @@ function migrate(db: Db): void {
     'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
   )
 
-  for (const m of MIGRATIONS) {
+  // 按版本号升序执行：MIGRATIONS 数组里的书写顺序不作数（历史原因 v6
+  // 写在了 v4 前面），依赖关系只认版本号
+  for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
     if (applied.has(m.version)) continue
 
     // 每个迁移单独一个事务：失败时不会留下半个 schema。

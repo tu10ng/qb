@@ -12,6 +12,7 @@ import type { Store } from '@qb/store'
 import type { Llm } from '../llm/port.ts'
 import { importMaterial } from '../agent/import.ts'
 import { proposeAdapt } from '../agent/adapt.ts'
+import { detectDeviationOffer } from '../agent/capture.ts'
 import { partialSteps } from '../agent/draft.ts'
 import type { Jobs } from './jobs.ts'
 import { errMessage, sendJson, type Router } from './router.ts'
@@ -349,6 +350,9 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
             kind: 'edit',
             payload: { changes: [{ field: 'command', before: step.command, after: e.command }], source: 'adapt' },
           })
+          // 底稿复制来的步骤偏离了底稿 → 提议"带回底稿"（捕获时机 3，
+          // 与手工 PATCH 同一个钩子；差异应用是偏离的主路径）
+          detectDeviationOffer(store, taskId, step.id, step.command ?? '', e.command)
         }
 
         const summary = `应用差异：${body.paramChanges.length} 项参数、${body.stepEdits.length} 处命令${body.reason !== undefined ? `（${body.reason}）` : ''}`

@@ -182,6 +182,13 @@ export function createSync(deps: SyncDeps) {
       }).map((d) => ({ key: d.key, taskId: d.taskId, stepId: d.stepId, level: d.level, type: d.type, message: d.message, at: d.at }))
     })
 
+    // 待共享的坑（M9）：脱敏后整条上传；只有血缘锚定的才值得共享。
+    // 上传名单在 fetch 前定死——事务里重新拉全量会把 fetch 窗口内（最长
+    // 20 秒）新接受的坑误标 uploaded=1，从此永不上传。
+    const lessonsToSend = store
+      .listLessonsToUpload()
+      .filter((l) => l.anchorKind === 'step_lineage' && l.anchorRef !== null)
+
     const res = await fetch(`${cfg.url.replace(/\/+$/, '')}/api/sync/push`, {
       method: 'POST',
       headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
@@ -200,20 +207,17 @@ export function createSync(deps: SyncDeps) {
         })),
         alerts,
         questions: unpushedQuestions.map((q) => ({ id: q.id, taskId: q.taskId, stepId: q.stepId, body: q.bodyMd, createdAt: q.createdAt })),
-        // 待共享的坑（M9）：脱敏后整条上传；只有血缘锚定的才值得共享
-        lessons: store.listLessonsToUpload()
-          .filter((l) => l.anchorKind === 'step_lineage' && l.anchorRef !== null)
-          .map((l) => ({
-            id: l.id,
-            lineageKey: l.anchorRef!,
-            symptom: redact(l.symptom).text,
-            cause: l.cause === null ? null : redact(l.cause).text,
-            fixMd: redact(l.fixMd).text,
-            condition: l.condition === null ? null : redact(l.condition).text,
-            taskId: l.sourceTaskId,
-            taskTitle: l.sourceTaskId !== null ? (store.getTask(l.sourceTaskId)?.title ?? null) : null,
-            createdAt: l.createdAt,
-          })),
+        lessons: lessonsToSend.map((l) => ({
+          id: l.id,
+          lineageKey: l.anchorRef!,
+          symptom: redact(l.symptom).text,
+          cause: l.cause === null ? null : redact(l.cause).text,
+          fixMd: redact(l.fixMd).text,
+          condition: l.condition === null ? null : redact(l.condition).text,
+          taskId: l.sourceTaskId,
+          taskTitle: l.sourceTaskId !== null ? (store.getTask(l.sourceTaskId)?.title ?? null) : null,
+          createdAt: l.createdAt,
+        })),
       }),
       signal: AbortSignal.timeout(20_000),
     })
@@ -227,14 +231,9 @@ export function createSync(deps: SyncDeps) {
     store.inTransaction(() => {
       applyDown(result.down)
       store.markQuestionsPushed(unpushedQuestions.map((q) => q.id))
-      // 上传成功的坑打标记（团队按 id 幂等，重传也安全，但没必要）
-      store.markLessonsUploaded(
-        store
-          .listLessonsToUpload()
-          .filter((l) => l.anchorKind === 'step_lineage')
-          .map((l) => l.id),
-      )
-      setState({ pushedSeq: st.pushedSeq + events.length, downSeq: result.lastDownSeq })
+      // 只标记本次真送出去的那批（团队按 id 幂等，重传安全，但没必要）
+      store.markLessonsUploaded(lessonsToSend.map((l) => l.id))
+      setState({ pushedSeq: events.length > 0 ? events[events.length - 1]!.seq : st.pushedSeq, downSeq: result.lastDownSeq })
     })
 
     if (warnedOffline) {
@@ -344,7 +343,14 @@ export function createSync(deps: SyncDeps) {
       } else if (item.kind === 'lesson') {
         const p = item.payload
         const lessonId = String(p.id ?? '')
-        if (lessonId === '' || store.lessonById(lessonId) !== null) continue // 幂等
+        if (lessonId === '') continue
+        // 被发起人驳回的坑不再进场；已在本地的降回 personal（团队侧已
+        // 过滤，这里兜底重放旧下行的情况）
+        if (String(p.status ?? '') === 'declined') {
+          if (store.lessonById(lessonId) !== null) store.setRemoteLessonStatus(lessonId, 'declined')
+          continue
+        }
+        if (store.lessonById(lessonId) !== null) continue // 幂等
         const lesson = store.upsertRemoteLesson({
           id: lessonId,
           anchorRef: String(p.lineage_key ?? p.lineageKey ?? ''),
@@ -435,24 +441,21 @@ export function createSync(deps: SyncDeps) {
         })
         touchedTasks.add(taskId)
       } else if (item.kind === 'proposal_status') {
-        // 我带回底稿的提议被处理了
+        // 我带回底稿的提议被处理了：按提议 id 精确找落地的任务——接受方
+        // 的 proposal 提议 dedup 是 prp:<id>；发起方的 deviation 提议送出后
+        // payload 里带 remoteId，两条路都试
         const p = item.payload
-        const status = String(p.status ?? '')
-        const stepTitle = String(p.step_title ?? p.stepTitle ?? '')
-        for (const task of store.listTasks({})) {
-          const hit = store.listEvents(task.id, 100).some(
-            (e) => e.kind === 'base_proposal' && typeof e.payload.stepTitle === 'string' && e.payload.stepTitle === stepTitle && e.payload.sent === true,
-          )
-          if (!hit) continue
-          store.appendEvent({
-            taskId: task.id,
-            actorId: null,
-            kind: 'base_proposal',
-            payload: { decided: status, by: String(p.by ?? ''), stepTitle },
-          })
-          touchedTasks.add(task.id)
-          break
-        }
+        const remoteId = String(p.id ?? '')
+        const offer = store.findLessonOfferByDedup('proposal', `prp:${remoteId}`) ?? (remoteId !== '' ? store.findLessonOfferByRemoteId(remoteId) : null)
+        if (offer === null) continue
+        store.appendEvent({
+          taskId: offer.taskId,
+          stepId: offer.stepId,
+          actorId: null,
+          kind: 'base_proposal',
+          payload: { decided: String(p.status ?? ''), by: String(p.by ?? ''), stepTitle: String(offer.payload.stepTitle ?? '') },
+        })
+        touchedTasks.add(offer.taskId)
       } else if (item.kind === 'ack') {
         const p = item.payload
         const taskId = String(p.task_id ?? '')

@@ -60,6 +60,8 @@ export interface StepMirror {
   statusNote: string | null
   /** 步骤血缘：坑与底稿提议都按它路由。 */
   lineageKey?: string | null
+  /** 执行者开了"共享输出"的步骤带最新输出（脱敏+截尾）。 */
+  lastOutput?: string | null
 }
 
 export interface EventMirror {
@@ -290,12 +292,12 @@ export class TeamStore {
           const del = this.db.prepare('DELETE FROM steps WHERE task_id = ?')
           const ins = this.db.prepare(
             `INSERT INTO steps (task_id, id, parent_id, order_key, kind, title, command, status,
-                                expected_minutes, actual_ms, status_note, lineage_key, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                expected_minutes, actual_ms, status_note, lineage_key, last_output, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           del.run(t.id)
           for (const s of t.steps) {
-            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.status, s.expectedMinutes, s.actualMs, s.statusNote, s.lineageKey ?? null, Date.now())
+            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.status, s.expectedMinutes, s.actualMs, s.statusNote, s.lineageKey ?? null, s.lastOutput ?? null, Date.now())
           }
         }
       }
@@ -465,6 +467,8 @@ export class TeamStore {
 
     // 坑（M9）：别人记的、锚在我正在做的步骤血缘上的——"正在做同一步的人
     // 实时收到别人记的坑"就是这条。作者自己不收回自己的。
+    // 被驳回的也照发（带 status）——引擎对"新的跳过、已有的降回 personal"，
+    // 这样已收到的人也能收到驳回结果，而不是揣着"未验证"过期。
     // 不走游标窗口，按状态全量重发：新任务用了旧血缘时，游标早已越过
     // 老坑（B 在有这个血缘的任务之前就在推拉了）。引擎按 id 幂等落库，
     // 重发只是多几个字节；上限兜底防膨胀。
@@ -481,18 +485,20 @@ export class TeamStore {
       .all(userName, userName) as Array<Record<string, unknown>>
     for (const l of lessons.reverse()) down.push({ kind: 'lesson', payload: toLessonMirror(l) })
 
-    // 底稿提议：我手里有同血缘步骤、提议还没被人处理掉
+    // 底稿提议：我手里有同血缘步骤、提议还没被人处理掉。与坑同理由：
+    // 窗口会漏掉"后来才用上该血缘"的引擎，按状态重发；已处理/已拒绝的
+    // 引擎端按 dedup 不再建新提议。
     const proposals = this.db
       .prepare(
         `SELECT p.* FROM base_proposals p
-         WHERE p.down_seq > ? AND p.down_seq <= ? AND p.status = 'pending' AND p.from_name != ?
+         WHERE p.status = 'pending' AND p.from_name != ?
            AND p.lineage_key IN (
              SELECT DISTINCT s.lineage_key FROM steps s
              JOIN tasks t ON t.id = s.task_id
              WHERE t.assignee_name = ? AND s.lineage_key IS NOT NULL)
          ORDER BY p.down_seq`,
       )
-      .all(since, max, userName, userName) as Array<Record<string, unknown>>
+      .all(userName, userName) as Array<Record<string, unknown>>
     for (const p of proposals) down.push({ kind: 'proposal', payload: toProposal(p) })
 
     // 点对点通知（确认/驳回结果回到作者手上）
@@ -853,6 +859,7 @@ function toStep(r: Record<string, unknown>): StepMirror {
     actualMs: (r.actual_ms as number | null) ?? null,
     statusNote: (r.status_note as string | null) ?? null,
     lineageKey: (r.lineage_key as string | null) ?? null,
+    lastOutput: (r.last_output as string | null) ?? null,
   }
 }
 
