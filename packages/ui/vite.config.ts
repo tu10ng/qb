@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   // SPA 挂在 dsh 的 /qb 前缀下，资源路径必须带这个基准
-  base: './',
+  base: '/qb/',
   build: {
     outDir: 'dist',
     emptyOutDir: true,

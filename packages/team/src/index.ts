@@ -58,10 +58,12 @@ const app = createApp({
 // 会让 <script> 因 MIME 不符被浏览器拒载（白屏）。
 const indexHtml = existsSync(join(uiDir, 'index.html')) ? readFileSync(join(uiDir, 'index.html'), 'utf8') : null
 if (existsSync(uiDir)) {
-  // serve-static 的 root 要相对 cwd 的路径
+  // serve-static 的 root 要相对 cwd 的路径。
+  // UI 构建的 base 是 /qb/（绝对路径），所以团队服务也要在 /qb/assets 下
+  // 托管——同一份产物同时服务 "/"（远程首页）和 "/qb/*"（引擎路径）。
   const relRoot = relative(process.cwd(), uiDir).replaceAll('\\', '/')
-  app.use('/assets/*', serveStatic({ root: relRoot }))
-  app.get('/favicon.ico', serveStatic({ root: relRoot }))
+  app.use('/qb/assets/*', serveStatic({ root: relRoot }))
+  app.get('/qb/favicon.ico', serveStatic({ root: relRoot }))
 }
 app.get('*', (c) => {
   if (indexHtml === null) {
@@ -69,6 +71,8 @@ app.get('*', (c) => {
   }
   return c.html(indexHtml)
 })
+// 引擎路径 /qb/ 也要能到达远程 UI（入口选择在 main.tsx 里按 pathname 分流）
+app.get('/qb/*', (c) => c.html(indexHtml))
 
 const server = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
   console.log(`[qb-team] 监听 http://${host}:${info.port}（数据库 ${dbPath}）`)

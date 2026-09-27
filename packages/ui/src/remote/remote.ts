@@ -5,7 +5,8 @@
  * 令牌放 localStorage（团队服务的个人令牌）。
  */
 
-const BASE = location.pathname.startsWith('/qb') ? '/qb/api' : '/api'
+// base 固定 /qb/（vite 配置），团队服务也在 /qb/ 下托管 API
+const BASE = '/qb/api'
 const TOKEN_KEY = 'qb-team-token'
 
 export function getToken(): string {
