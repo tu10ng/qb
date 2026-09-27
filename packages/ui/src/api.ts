@@ -86,6 +86,35 @@ export interface FidelityView {
   materialId: string | null
 }
 
+/** 坑的展示视图（引擎按步骤血缘 + 条件判定分好层）。 */
+export interface LessonView {
+  id: string
+  symptom: string
+  cause: string | null
+  fixMd: string
+  condition: string | null
+  matched: boolean | null
+  author: string
+  mine: boolean
+  status: 'personal' | 'unverified' | 'confirmed'
+  stale: boolean
+  hits: number
+  misses: number
+  createdAt: number
+}
+
+/** 捕获提议（QB 觉得这里有个坑/改动，等人确认）。 */
+export interface LessonOfferView {
+  id: string
+  taskId: string
+  stepId: string | null
+  kind: 'fix' | 'question' | 'deviation' | 'situation' | 'proposal'
+  payload: Record<string, unknown>
+  status: 'pending' | 'accepted' | 'dismissed'
+  createdAt: number
+  stepTitle: string | null
+}
+
 export interface BaseSuggestion {
   taskId: string
   title: string
@@ -354,6 +383,54 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ text }),
     }),
+
+  // ── 坑（M9）──────────────────────────────────────────────
+
+  /** 步骤 → 两层坑（第一层条件匹配，第二层折叠）。 */
+  stepLessons: (taskId: string) =>
+    req<{ steps: Record<string, { layer1: LessonView[]; layer2: LessonView[] }> }>(`/tasks/${taskId}/lessons`).then(
+      (r) => r.steps,
+    ),
+
+  /** 待确认的捕获提议（失败后修好 / 求助回答 / 偏离底稿 / 底稿提议）。 */
+  lessonOffers: (taskId: string) =>
+    req<{ offers: LessonOfferView[] }>(`/tasks/${taskId}/lesson-offers`).then((r) => r.offers),
+
+  acceptLessonOffer: (
+    offerId: string,
+    input: { symptom?: string; fixMd?: string; condition?: string | null; cause?: string | null; scope?: 'personal' | 'team' } = {},
+  ) =>
+    req<{ lesson?: LessonView; sent?: boolean; remoteId?: string; outcome?: string }>(`/lesson-offers/${offerId}/accept`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  dismissLessonOffer: (offerId: string) =>
+    req<{ ok: boolean }>(`/lesson-offers/${offerId}/dismiss`, { method: 'POST' }),
+
+  lessonHit: (lessonId: string) => req<{ ok: boolean }>(`/lessons/${lessonId}/hit`, { method: 'POST' }),
+
+  lessonMiss: (lessonId: string) => req<{ ok: boolean; stale: boolean }>(`/lessons/${lessonId}/miss`, { method: 'POST' }),
+
+  /** 按这个修：在指定步骤后插入修复步骤（返回新步骤，界面接着发起运行）。 */
+  applyLessonFix: (lessonId: string, stepId: string) =>
+    req<{ step: Step }>(`/lessons/${lessonId}/apply`, { method: 'POST', body: JSON.stringify({ stepId }) }).then(
+      (r) => r.step,
+    ),
+
+  /** 手动记个坑（挂在当前步骤上）。 */
+  createStepLesson: (stepId: string, input: { symptom: string; fix: string; condition?: string | null; scope?: 'personal' | 'team' }) =>
+    req<unknown>(`/steps/${stepId}/lesson`, { method: 'POST', body: JSON.stringify(input) }),
+
+  /** 求助回答直接沉淀成坑。 */
+  questionLesson: (questionId: string, input: { symptom?: string; fixMd?: string; condition?: string | null; scope?: 'personal' | 'team' } = {}) =>
+    req<{ lesson: { id: string } }>(`/questions/${questionId}/lesson`, { method: 'POST', body: JSON.stringify(input) }),
+
+  /** 复盘清单：待确认提议 + 已回答没沉淀的求助。 */
+  retro: (taskId: string) =>
+    req<{ offers: LessonOfferView[]; questions: Array<{ id: string; stepId: string | null; bodyMd: string; answerMd: string }> }>(
+      `/tasks/${taskId}/retro`,
+    ),
 
   // ── 设置 · 模型 ─────────────────────────────────────────────
 

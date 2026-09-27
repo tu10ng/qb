@@ -9,6 +9,7 @@
 import { z } from 'zod'
 import { Expectation, ReadinessProbe, StepKind, StepPatch, type StepStatus } from '@qb/core'
 import { RevConflict, type Store } from '@qb/store'
+import { detectDeviationOffer, onStepOk } from '../agent/capture.ts'
 import { errMessage, sendJson, type Router } from './router.ts'
 import type { createWsHandler } from './ws.ts'
 
@@ -78,6 +79,11 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
       if (changes.length > 0) {
         store.markTaskStarted(taskId, currentUserId())
         store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'edit', payload: { changes } })
+        // 底稿复制来的命令改了 → 提议"带回底稿"（M9 捕获时机 3）
+        const cmd = changes.find((c) => c.field === 'command')
+        if (cmd !== undefined) {
+          detectDeviationOffer(store, taskId, stepId, String(cmd.before ?? ''), String(cmd.after ?? ''))
+        }
         changed(taskId, stepId)
       }
       sendJson(res, 200, { step })
@@ -245,6 +251,7 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
     })
 
     ws.broadcast({ type: 'step.status', stepId, status })
+    if (status === 'ok' && step.status !== 'ok') onStepOk(store, taskId, stepId)
     changed(taskId, stepId)
     sendJson(res, 200, { stepId, status })
   })

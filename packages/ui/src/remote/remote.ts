@@ -143,6 +143,10 @@ export const remoteApi = {
 
   ack: (key: string) => req<RemoteAlert>(`/alerts/${encodeURIComponent(key)}/ack`, { method: 'POST' }),
 
+  // 坑确认（M9）：lesson_pending 告警的 [确认有效] / [不用了]
+  confirmLesson: (lessonId: string, accept: boolean) =>
+    req<unknown>(`/lessons/${lessonId}/confirm`, { method: 'POST', body: JSON.stringify({ accept }) }),
+
   // 远程派任务（PL → 执行者）
   users: () => req<{ users: Array<{ name: string; displayName: string; taskCount: number }> }>('/users'),
 

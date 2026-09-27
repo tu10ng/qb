@@ -45,7 +45,7 @@ async function main() {
       '      inject: [webServer, shell, timer]',
       '      config:',
       `        distDir: '${posix(distDir)}'`,
-      `        dbPath: '${posix(join(runDir, 'qb.db'))}'`,
+      `        dbPath: '${posix(join(runDir, process.env.QB_DB ?? 'qb.db'))}'`,
       `        mountPath: '${MOUNT}'`,
       `        userName: '${process.env.QB_USER ?? 'me'}'`,
       '',

@@ -58,6 +58,8 @@ export interface StepMirror {
   expectedMinutes: number | null
   actualMs: number | null
   statusNote: string | null
+  /** 步骤血缘：坑与底稿提议都按它路由。 */
+  lineageKey?: string | null
 }
 
 export interface EventMirror {
@@ -118,8 +120,39 @@ export interface PushChannel {
   enabled: boolean
 }
 
+export interface LessonMirror {
+  id: string
+  lineageKey: string | null
+  symptom: string
+  cause: string | null
+  fixMd: string
+  condition: string | null
+  authorName: string
+  taskId: string | null
+  taskTitle: string | null
+  status: 'unverified' | 'confirmed' | 'declined'
+  confirmedBy: string | null
+  confirmedAt: number | null
+  createdAt: number
+}
+
+export interface BaseProposalRow {
+  id: string
+  lineageKey: string
+  stepTitle: string
+  beforeMd: string
+  afterMd: string
+  fromName: string
+  fromTaskId: string | null
+  fromTaskTitle: string | null
+  status: 'pending' | 'accepted' | 'declined' | 'conflict'
+  decidedBy: string | null
+  decidedAt: number | null
+  createdAt: number
+}
+
 export interface DownItem {
-  kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress'
+  kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress' | 'lesson' | 'lesson_status' | 'proposal' | 'proposal_status'
   payload: unknown
 }
 
@@ -132,6 +165,18 @@ export interface SyncPush {
   /** 这些任务当前的告警决策集（全量）：不在集合里的现存 open 告警解除。 */
   alerts: Array<{ key: string; taskId: string; stepId: string | null; level: 'red' | 'yellow'; type: string; message: string; at: number }>
   questions: Array<{ id: string; taskId: string; stepId: string | null; body: string; createdAt: number }>
+  /** 待共享的坑（M9）：作者已确认共享，脱敏后整条上传。 */
+  lessons: Array<{
+    id: string
+    lineageKey: string | null
+    symptom: string
+    cause: string | null
+    fixMd: string
+    condition: string | null
+    taskId: string | null
+    taskTitle: string | null
+    createdAt: number
+  }>
 }
 
 export interface SyncResult {
@@ -245,12 +290,12 @@ export class TeamStore {
           const del = this.db.prepare('DELETE FROM steps WHERE task_id = ?')
           const ins = this.db.prepare(
             `INSERT INTO steps (task_id, id, parent_id, order_key, kind, title, command, status,
-                                expected_minutes, actual_ms, status_note, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                expected_minutes, actual_ms, status_note, lineage_key, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           del.run(t.id)
           for (const s of t.steps) {
-            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.status, s.expectedMinutes, s.actualMs, s.statusNote, Date.now())
+            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.status, s.expectedMinutes, s.actualMs, s.statusNote, s.lineageKey ?? null, Date.now())
           }
         }
       }
@@ -271,6 +316,38 @@ export class TeamStore {
       )
       for (const q of push.questions) {
         insQ.run(q.id, q.taskId, q.stepId, push.user.name, q.body, q.createdAt)
+      }
+
+      // 坑（M9）：按 id 幂等；新到的排下行序号，并给用同血缘任务的发起人
+      // 挂 🟡"新坑待确认"。作者自己不会被提醒。
+      for (const l of push.lessons) {
+        if (this.lessonById(l.id) !== null) continue
+        this.db
+          .prepare(
+            `INSERT INTO lessons (id, lineage_key, symptom, cause, fix_md, condition,
+                                  author_name, task_id, task_title, status, created_at, down_seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?)`,
+          )
+          .run(l.id, l.lineageKey, l.symptom, l.cause, l.fixMd, l.condition,
+               push.user.name, l.taskId, l.taskTitle, l.createdAt, this.nextDownSeq())
+        if (l.lineageKey !== null) {
+          const rows = this.db
+            .prepare(
+              `SELECT DISTINCT t.id, t.initiator_name FROM tasks t
+               JOIN steps s ON s.task_id = t.id
+               WHERE s.lineage_key = ? AND t.initiator_name != ? AND t.initiator_name != ''`,
+            )
+            .all(l.lineageKey, push.user.name) as Array<{ id: string; initiator_name: string }>
+          const now = Date.now()
+          for (const r of rows) {
+            this.db
+              .prepare(
+                `INSERT OR REPLACE INTO alerts (key, task_id, level, type, message, count, status, created_at, updated_at)
+                 VALUES (?, ?, 'yellow', 'lesson_pending', ?, 1, 'open', ?, ?)`,
+              )
+              .run(`lesson:${l.id}:${r.id}`, r.id, `新坑待确认：${l.symptom.slice(0, 60)}（${push.user.displayName} 记的）`, now, now)
+          }
+        }
       }
 
       // 告警：决策集合并。同 key 存在则更新（count 不减）；这些任务里
@@ -306,7 +383,11 @@ export class TeamStore {
       }
 
       for (const taskId of taskIds) {
-        const open = this.db.prepare("SELECT key FROM alerts WHERE task_id = ? AND status != 'resolved'").all(taskId) as Array<{ key: string }>
+        // 只解除引擎决策集里的告警；lesson: 前缀是团队侧生命周期的坑待确认
+        // 告警，由 confirmLesson 解除——引擎决策集里永远不会有它
+        const open = this.db
+          .prepare("SELECT key FROM alerts WHERE task_id = ? AND status != 'resolved' AND key NOT LIKE 'lesson:%'")
+          .all(taskId) as Array<{ key: string }>
         for (const row of open) {
           if (!seenKeys.has(row.key)) {
             this.db.prepare("UPDATE alerts SET status = 'resolved', updated_at = ? WHERE key = ?").run(Date.now(), row.key)
@@ -382,6 +463,46 @@ export class TeamStore {
       .all(userName, since, max) as Array<Record<string, unknown>>
     for (const pr of progress) down.push({ kind: 'task_progress', payload: pr })
 
+    // 坑（M9）：别人记的、锚在我正在做的步骤血缘上的——"正在做同一步的人
+    // 实时收到别人记的坑"就是这条。作者自己不收回自己的。
+    // 不走游标窗口，按状态全量重发：新任务用了旧血缘时，游标早已越过
+    // 老坑（B 在有这个血缘的任务之前就在推拉了）。引擎按 id 幂等落库，
+    // 重发只是多几个字节；上限兜底防膨胀。
+    const lessons = this.db
+      .prepare(
+        `SELECT l.* FROM lessons l
+         WHERE l.lineage_key IS NOT NULL AND l.author_name != ?
+           AND l.lineage_key IN (
+             SELECT DISTINCT s.lineage_key FROM steps s
+             JOIN tasks t ON t.id = s.task_id
+             WHERE t.assignee_name = ? AND s.lineage_key IS NOT NULL)
+         ORDER BY l.down_seq DESC LIMIT 500`,
+      )
+      .all(userName, userName) as Array<Record<string, unknown>>
+    for (const l of lessons.reverse()) down.push({ kind: 'lesson', payload: toLessonMirror(l) })
+
+    // 底稿提议：我手里有同血缘步骤、提议还没被人处理掉
+    const proposals = this.db
+      .prepare(
+        `SELECT p.* FROM base_proposals p
+         WHERE p.down_seq > ? AND p.down_seq <= ? AND p.status = 'pending' AND p.from_name != ?
+           AND p.lineage_key IN (
+             SELECT DISTINCT s.lineage_key FROM steps s
+             JOIN tasks t ON t.id = s.task_id
+             WHERE t.assignee_name = ? AND s.lineage_key IS NOT NULL)
+         ORDER BY p.down_seq`,
+      )
+      .all(since, max, userName, userName) as Array<Record<string, unknown>>
+    for (const p of proposals) down.push({ kind: 'proposal', payload: toProposal(p) })
+
+    // 点对点通知（确认/驳回结果回到作者手上）
+    const notices = this.db
+      .prepare('SELECT * FROM down_notices WHERE user_name = ? AND down_seq > ? AND down_seq <= ? ORDER BY down_seq')
+      .all(userName, since, max) as Array<{ kind: string; payload_json: string }>
+    for (const n of notices) {
+      down.push({ kind: n.kind as DownItem['kind'], payload: JSON.parse(n.payload_json) as unknown })
+    }
+
     return { down, lastDownSeq: max }
   }
 
@@ -421,6 +542,95 @@ export class TeamStore {
       .prepare(`SELECT u.*, (SELECT count(*) FROM tasks t WHERE t.assignee_name = u.name) AS task_count FROM users u ORDER BY u.created_at`)
       .all() as Array<{ id: string; name: string; display_name: string; is_admin: number; task_count: number }>)
       .map((r) => ({ id: r.id, name: r.name, displayName: r.display_name, isAdmin: r.is_admin === 1, taskCount: r.task_count }))
+  }
+
+  // ── 坑库与底稿提议（M9）──────────────────────────────────
+
+  lessonById(id: string): LessonMirror | null {
+    const r = this.db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return r === undefined ? null : toLessonMirror(r)
+  }
+
+  /** 用着这个血缘的任务的发起人（确认坑的权限判定：发起人=底稿负责人/PL）。 */
+  lineageInitiators(lineageKey: string | null): string[] {
+    if (lineageKey === null) return []
+    return (
+      this.db
+        .prepare(
+          `SELECT DISTINCT t.initiator_name FROM tasks t JOIN steps s ON s.task_id = t.id WHERE s.lineage_key = ?`,
+        )
+        .all(lineageKey) as Array<{ initiator_name: string }>
+    ).map((r) => r.initiator_name)
+  }
+
+  /**
+   * 确认/驳回坑（发起人或底稿负责人的动作）。确认后：
+   * - 相关 🟡 待确认告警解除
+   * - 结果通知作者（他的引擎把它标成已确认/降回 personal）
+   */
+  confirmLesson(id: string, by: TeamUser, accept: boolean): LessonMirror {
+    const l = this.lessonById(id)
+    if (l === null) throw new Error('坑不存在')
+    if (l.status !== 'unverified') throw new Error('这个坑已经处理过了')
+    const status = accept ? 'confirmed' : 'declined'
+    this.db
+      .prepare('UPDATE lessons SET status = ?, confirmed_by = ?, confirmed_at = ? WHERE id = ?')
+      .run(status, by.displayName, Date.now(), id)
+    this.db
+      .prepare("UPDATE alerts SET status = 'resolved', updated_at = ? WHERE key LIKE ? AND status = 'open'")
+      .run(Date.now(), `lesson:${id}:%`)
+    this.addDownNotice(l.authorName, 'lesson_status', { id, status, by: by.displayName })
+    return this.lessonById(id)!
+  }
+
+  /** 执行者把对底稿的偏离带回：所有有该血缘的其他执行者都会收到。 */
+  createProposal(input: {
+    lineageKey: string
+    stepTitle: string
+    beforeMd: string
+    afterMd: string
+    from: TeamUser
+    fromTaskId: string | null
+    fromTaskTitle: string | null
+  }): { id: string } {
+    const id = newId('prp')
+    this.db
+      .prepare(
+        `INSERT INTO base_proposals (id, lineage_key, step_title, before_md, after_md,
+                                     from_name, from_task_id, from_task_title, status, created_at, down_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(id, input.lineageKey, input.stepTitle, input.beforeMd, input.afterMd,
+           input.from.name, input.fromTaskId, input.fromTaskTitle, Date.now(), this.nextDownSeq())
+    return { id }
+  }
+
+  proposalById(id: string): BaseProposalRow | null {
+    const r = this.db.prepare('SELECT * FROM base_proposals WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return r === undefined ? null : toProposal(r)
+  }
+
+  /**
+   * 提议裁定（某个执行者在自己的底稿上应用/拒绝后回报）。第一个裁定生效，
+   * 后来者忽略——底稿只有一份，谁先处理谁定。
+   */
+  decideProposal(id: string, by: TeamUser, outcome: 'accepted' | 'declined' | 'conflict'): BaseProposalRow {
+    const p = this.proposalById(id)
+    if (p === null) throw new Error('提议不存在')
+    if (p.status === 'pending') {
+      this.db
+        .prepare('UPDATE base_proposals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ?')
+        .run(outcome, by.displayName, Date.now(), id)
+      this.addDownNotice(p.fromName, 'proposal_status', { id, status: outcome, by: by.displayName, stepTitle: p.stepTitle })
+    }
+    return this.proposalById(id)!
+  }
+
+  /** 点对点下行通知（带下行序号，引擎按游标增量拉）。 */
+  private addDownNotice(userName: string, kind: string, payload: Record<string, unknown>): void {
+    this.db
+      .prepare('INSERT INTO down_notices (id, user_name, kind, payload_json, down_seq) VALUES (?, ?, ?, ?, ?)')
+      .run(newId('ntc'), userName, kind, JSON.stringify(payload), this.nextDownSeq())
   }
 
   // ── 团队侧写入（评论 / 回答 / 已读）──────────────────────
@@ -555,8 +765,8 @@ export class TeamStore {
     return (this.db
       .prepare(
         `SELECT a.* FROM alerts a JOIN tasks t ON t.id = a.task_id
-         WHERE t.initiator_name = ? AND a.status = 'open' AND a.level = 'red'
-         ORDER BY a.updated_at DESC`,
+         WHERE t.initiator_name = ? AND a.status = 'open'
+         ORDER BY CASE a.level WHEN 'red' THEN 0 ELSE 1 END, a.updated_at DESC`,
       )
       .all(userName) as Array<Record<string, unknown>>).map(toAlert)
   }
@@ -642,6 +852,42 @@ function toStep(r: Record<string, unknown>): StepMirror {
     expectedMinutes: (r.expected_minutes as number | null) ?? null,
     actualMs: (r.actual_ms as number | null) ?? null,
     statusNote: (r.status_note as string | null) ?? null,
+    lineageKey: (r.lineage_key as string | null) ?? null,
+  }
+}
+
+function toLessonMirror(r: Record<string, unknown>): LessonMirror {
+  return {
+    id: r.id as string,
+    lineageKey: (r.lineage_key as string | null) ?? null,
+    symptom: r.symptom as string,
+    cause: (r.cause as string | null) ?? null,
+    fixMd: r.fix_md as string,
+    condition: (r.condition as string | null) ?? null,
+    authorName: r.author_name as string,
+    taskId: (r.task_id as string | null) ?? null,
+    taskTitle: (r.task_title as string | null) ?? null,
+    status: r.status as LessonMirror['status'],
+    confirmedBy: (r.confirmed_by as string | null) ?? null,
+    confirmedAt: (r.confirmed_at as number | null) ?? null,
+    createdAt: r.created_at as number,
+  }
+}
+
+function toProposal(r: Record<string, unknown>): BaseProposalRow {
+  return {
+    id: r.id as string,
+    lineageKey: r.lineage_key as string,
+    stepTitle: r.step_title as string,
+    beforeMd: r.before_md as string,
+    afterMd: r.after_md as string,
+    fromName: r.from_name as string,
+    fromTaskId: (r.from_task_id as string | null) ?? null,
+    fromTaskTitle: (r.from_task_title as string | null) ?? null,
+    status: r.status as BaseProposalRow['status'],
+    decidedBy: (r.decided_by as string | null) ?? null,
+    decidedAt: (r.decided_at as number | null) ?? null,
+    createdAt: r.created_at as number,
   }
 }
 

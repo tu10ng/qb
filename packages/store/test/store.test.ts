@@ -685,3 +685,105 @@ describe('递归委派', () => {
     expect(child.assigneeId).toBe(alice)
   })
 })
+
+describe('坑：血缘锚定 / 共享 / 命中统计（M9）', () => {
+  const linSteps: NewStep[] = [
+    { kind: 'command', title: '起 decode', command: 'vllm serve', lineageKey: 'lin_decode' },
+    { kind: 'command', title: '起 prefill', command: 'vllm serve --port 8100', lineageKey: 'lin_prefill' },
+  ]
+
+  function setup(): { taskId: string; steps: ReturnType<Store['createRunbook']>['steps'] } {
+    const t = store.createTask({ title: 'Y 集群', initiatorId: me })
+    const { steps } = store.createRunbook({ taskId: t.id, createdBy: me, steps: linSteps })
+    return { taskId: t.id, steps }
+  }
+
+  it('lessonsForLineages 只取血缘锚定的坑', () => {
+    const { taskId, steps } = setup()
+    store.createLesson({ anchorKind: 'step_lineage', anchorRef: 'lin_decode', symptom: 'No route to host', fixMd: 'NCCL_SOCKET_IFNAME=eth0', authorId: me, sourceTaskId: taskId })
+    store.createLesson({ anchorKind: 'free', anchorRef: null, symptom: '自由坑', fixMd: '随便', authorId: me })
+
+    const hits = store.lessonsForLineages(['lin_decode', steps[1]!.lineageKey!])
+    expect(hits).toHaveLength(1)
+    expect(hits[0]!.anchorRef).toBe('lin_decode')
+  })
+
+  it('upload 流：team 坑进上传队列，标记后出队', () => {
+    const { taskId } = setup()
+    const personal = store.createLesson({ anchorKind: 'free', symptom: 'p', fixMd: 'f', authorId: me, sourceTaskId: taskId })
+    const team = store.createLesson({ anchorKind: 'step_lineage', anchorRef: 'lin_decode', symptom: 's', fixMd: 'f', authorId: me, sourceTaskId: taskId, scope: 'team' })
+
+    expect(store.listLessonsToUpload().map((l) => l.id)).toEqual([team.id])
+    store.markLessonsUploaded([team.id])
+    expect(store.listLessonsToUpload()).toHaveLength(0)
+    expect(personal.id).not.toBe('')
+  })
+
+  it('upsertRemoteLesson 幂等、不再回传、可补确认', () => {
+    const { taskId } = setup()
+    const input = { id: 'lsn_remote1', anchorRef: 'lin_decode', symptom: '远处的坑', fixMd: '修法', authorName: 'laowang', localAuthorId: me, createdAt: Date.now() }
+    const first = store.upsertRemoteLesson(input)!
+    expect(first.authorName).toBe('laowang')
+    expect(store.listLessonsToUpload()).toHaveLength(0) // 上传标记已置 1
+
+    // 同 id 再来一次（重放）不重复；确认状态补上
+    const again = store.upsertRemoteLesson({ ...input, confirmed: true })!
+    expect(again.id).toBe(first.id)
+    expect(store.lessonById(first.id)!.confirmedAt).not.toBeNull()
+  })
+
+  it('驳回后降回 personal，不再当团队坑', () => {
+    const remote = store.upsertRemoteLesson({ id: 'lsn_r2', anchorRef: 'lin_x', symptom: 's', fixMd: 'f', authorName: 'b', localAuthorId: me, createdAt: Date.now() })!
+    store.setRemoteLessonStatus(remote.id, 'declined')
+    expect(store.lessonById(remote.id)!.scope).toBe('personal')
+  })
+
+  it('两次没帮上且从没帮上 → 疑似过期；帮上一次就解除', () => {
+    const { taskId } = setup()
+    const l = store.createLesson({ anchorKind: 'step_lineage', anchorRef: 'lin_decode', symptom: 's', fixMd: 'f', authorId: me, sourceTaskId: taskId })
+
+    store.recordLessonMiss(l.id)
+    expect(store.lessonById(l.id)!.staleAt).toBeNull()
+    store.recordLessonMiss(l.id)
+    expect(store.lessonById(l.id)!.staleAt).not.toBeNull()
+
+    store.recordLessonHit(l.id)
+    expect(store.lessonById(l.id)!.staleAt).toBeNull()
+    expect(store.lessonById(l.id)!.hitCount).toBe(1)
+  })
+
+  it('searchLessons 不再返回疑似过期的（起草用不到过时坑）', () => {
+    const { taskId } = setup()
+    const l = store.createLesson({ anchorKind: 'free', symptom: '过时的坑', fixMd: 'f', authorId: me, sourceTaskId: taskId })
+    store.recordLessonMiss(l.id)
+    store.recordLessonMiss(l.id)
+    expect(store.searchLessons('过时', 10)).toHaveLength(0)
+  })
+})
+
+describe('捕获提议（M9）', () => {
+  it('dedupKey 在 pending 内唯一，处理后可再提', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(true)
+    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(false)
+
+    const offers = store.listLessonOffers(t.id)
+    expect(offers).toHaveLength(1)
+    store.setLessonOfferStatus(offers[0]!.id, 'dismissed')
+    expect(store.listLessonOffers(t.id)).toHaveLength(0)
+
+    // dismissed 之后同类事件再发生，还能再问一次
+    expect(store.createLessonOffer({ taskId: t.id, kind: 'question', payload: { questionId: 'q1' }, dedupKey: 'q1' })).toBe(true)
+  })
+
+  it('按步骤取 pending 提议；payload 可打补丁', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: 's', command: 'echo' }] })
+    store.createLessonOffer({ taskId: t.id, stepId: steps[0]!.id, kind: 'fix', payload: { before: 'a' } })
+
+    const at = store.pendingOffersForStep(steps[0]!.id)
+    expect(at).toHaveLength(1)
+    store.patchLessonOfferPayload(at[0]!.id, { remoteId: 'prp_1' })
+    expect(store.lessonOfferById(at[0]!.id)!.payload).toEqual({ before: 'a', remoteId: 'prp_1' })
+  })
+})

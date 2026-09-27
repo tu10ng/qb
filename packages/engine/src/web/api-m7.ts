@@ -148,15 +148,17 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
           created.steps.filter((s) => !(s.kind === 'note' && s.parentId === null)).map((s, i) => [i, s.id]),
         )
 
-        // 原文里的坑：存成 personal 的坑（诊断/起草能检索到）；同症状的
-        // 不重复插（重复导入时）；锚定到具体步骤的显示层级是 M9 的事
+        // 原文里的坑：锚到步骤血缘（同血缘的复制品都看得见，M9）；
+        // 锚不上的自由挂载，条件里带步骤名。同症状的不重复插（重复导入时）。
         for (const l of imported.lessons) {
           if (store.hasLesson(taskId, l.symptom)) continue
           const stepId = l.stepIndex !== undefined ? lessonStep.get(l.stepIndex) : undefined
-          const stepTitle = stepId !== undefined ? created.steps.find((s) => s.id === stepId)?.title : undefined
+          const stepObj = stepId !== undefined ? created.steps.find((s) => s.id === stepId) : undefined
+          const stepTitle = stepObj?.title
           store.createLesson({
-            anchorKind: 'free',
-            condition: stepTitle !== undefined ? `步骤「${stepTitle}」` : null,
+            anchorKind: stepObj?.lineageKey != null ? 'step_lineage' : 'free',
+            anchorRef: stepObj?.lineageKey ?? null,
+            condition: stepObj?.lineageKey == null && stepTitle !== undefined ? `步骤「${stepTitle}」` : null,
             symptom: l.symptom,
             fixMd: l.fix,
             authorId: currentUserId(),
@@ -351,6 +353,15 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
 
         const summary = `应用差异：${body.paramChanges.length} 项参数、${body.stepEdits.length} 处命令${body.reason !== undefined ? `（${body.reason}）` : ''}`
         store.appendEvent({ taskId, actorId: currentUserId(), kind: 'replanned', payload: { reason: summary, by: 'user' } })
+        // "情况变了"的原因 → 复盘时的沉淀候选（M9 捕获时机 4）
+        if (body.reason !== undefined && body.reason !== '') {
+          store.createLessonOffer({
+            taskId,
+            kind: 'situation',
+            dedupKey: `sit:v${latest.runbook.version}:${body.reason}`,
+            payload: { reason: body.reason },
+          })
+        }
         return summary
       })
       changed(taskId)

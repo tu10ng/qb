@@ -258,6 +258,8 @@ export const EventKind = z.enum([
   'alert_acked',
   'lesson_proposed',
   'lesson_confirmed',
+  'lesson_shared',
+  'base_proposal',
   'replanned',
   'task_created',
   'task_started',
@@ -314,8 +316,11 @@ export type SkillVersion = z.infer<typeof SkillVersion>
 
 // ── 坑 ─────────────────────────────────────────────────────────────
 
-/** 坑锚定在哪：优先锚到 skill 的具体某步，其次环境，最后自由。 */
-export const LessonAnchor = z.enum(['skill_step', 'environment', 'free'])
+/**
+ * 坑锚定在哪：优先锚到步骤血缘（M9 主路径——同血缘的所有复制品都看得见），
+ * 其次 skill 步骤 / 环境，最后自由。
+ */
+export const LessonAnchor = z.enum(['skill_step', 'environment', 'free', 'step_lineage'])
 export type LessonAnchor = z.infer<typeof LessonAnchor>
 
 /** personal = 作者自己立即生效；team = 负责人确认后全队可见。 */
@@ -325,7 +330,7 @@ export type LessonScope = z.infer<typeof LessonScope>
 export const Lesson = z.object({
   id: Id,
   anchorKind: LessonAnchor,
-  /** skill_step → "skillId:stepTitle"；environment → envId；free → null。 */
+  /** skill_step → "skillId:stepTitle"；step_lineage → lineageKey；environment → envId；free → null。 */
   anchorRef: z.string().nullable(),
   condition: z.string().nullable(),
   symptom: z.string(),
@@ -334,6 +339,8 @@ export const Lesson = z.object({
   /** 下次起草时该怎么改计划。 */
   nextTimeMd: z.string().nullable(),
   authorId: Id,
+  /** 远程（团队同步下来）的坑带作者名；本地的为 null，界面查 users 表。 */
+  authorName: z.string().nullable().default(null),
   sourceTaskId: Id.nullable(),
   scope: LessonScope,
   confirmedBy: Id.nullable(),

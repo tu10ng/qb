@@ -6,9 +6,11 @@ import type { Llm } from '../llm/port.ts'
 import type { LlmSettings } from '../settings/llm-settings.ts'
 import { Router, sendJson, errMessage } from './router.ts'
 import { Jobs } from './jobs.ts'
+import { onStepOk } from '../agent/capture.ts'
 import { registerEditRoutes } from './api-edit.ts'
 import { registerSettingsRoutes } from './api-settings.ts'
 import { fidelityFor, registerM7Routes } from './api-m7.ts'
+import { registerM9Routes } from './api-m9.ts'
 import { registerTeamRoutes } from './api-team.ts'
 import { AttachmentError, type Attachments } from './attachments.ts'
 import type { LocalGuard } from './local-guard.ts'
@@ -466,6 +468,8 @@ export function buildApi(deps: ApiDeps): Router {
               durationMs: outcome.result.durationMs,
             },
           })
+          // 跑通两件小事（M9）：修复步骤 → 坑帮上一次；失败后修好 → 提议记坑
+          if (outcome.verdict === 'pass') onStepOk(store, taskId, stepId)
         }
 
         ws.broadcast({
@@ -608,6 +612,7 @@ export function buildApi(deps: ApiDeps): Router {
           payload: { source: imageName !== null && !hasText ? 'image' : 'manual', verdict, reason },
         })
       }
+      if (status === 'ok' && step.status !== 'ok') onStepOk(store, taskId, stepId)
       ws.broadcast({ type: 'runbook.changed', taskId, stepId })
     }
 
@@ -774,6 +779,7 @@ export function buildApi(deps: ApiDeps): Router {
   registerEditRoutes(router, { store, ws, currentUserId, isRunning: (id) => running.has(id) })
   registerSettingsRoutes(router, { settings, llm, jobs })
   registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
+  registerM9Routes(router, { store, ws, currentUserId, team: deps.team.settings, sync: deps.team.sync })
   registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, currentUserId, userName: () => deps.userName() })
 
   return router

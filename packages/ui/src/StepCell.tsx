@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Event, Evidence, Expectation, Param, Step, StepKind } from '@qb/core'
 import { isSection, PARAM_RE, renderCommand, type MoveDirection } from '@qb/core'
-import { ApiError, api, evidenceImageUrl, type Diagnosis, type FidelityView, type Job, type StepPatchInput } from './api.ts'
+import { ApiError, api, evidenceImageUrl, type Diagnosis, type FidelityView, type Job, type LessonOfferView, type LessonView, type StepPatchInput } from './api.ts'
 import { Editable } from './Editable.tsx'
 
 export interface StepRunState {
@@ -44,6 +44,12 @@ interface Props {
   /** 刚插入的新步骤：直接进入标题编辑。 */
   autoEdit: boolean
   canMove: Record<MoveDirection, boolean>
+  /** 这一步的坑（按血缘锚定，第一层/第二层分好）。 */
+  lessons?: { layer1: LessonView[]; layer2: LessonView[] }
+  /** 挂在这一步上的捕获提议（失败后修好 / 偏离底稿）。 */
+  offers?: LessonOfferView[]
+  /** 全局"只看主线"：藏起第一二层，失败时照常浮出。 */
+  mainlineOnly?: boolean
   actions: StepActions
   onFocus: () => void
   onChanged: () => void
@@ -92,7 +98,7 @@ function SectionHead({ step, current, autoEdit, canMove, actions, onFocus }: Pro
   )
 }
 
-function StepBody({ step, current, runState, evidence, params, fidelity, job, lastEdit, autoEdit, canMove, actions, onFocus, onChanged }: Props) {
+function StepBody({ step, current, runState, evidence, params, fidelity, job, lastEdit, autoEdit, canMove, lessons, offers, mainlineOnly, actions, onFocus, onChanged }: Props) {
   const [confirmed, setConfirmed] = useState(false)
   const [danger, setDanger] = useState<string[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -101,6 +107,7 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
   const [noteFor, setNoteFor] = useState<'skipped' | 'failed' | null>(null)
   const [splitOffer, setSplitOffer] = useState<string[] | null>(null)
   const [dragOver, setDragOver] = useState(false)
+  const [showLessonForm, setShowLessonForm] = useState(false)
 
   // 命令改了，之前那条命令的破坏性确认就不作数了
   useEffect(() => {
@@ -231,7 +238,7 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
           />
           {hintTail(step, runState)}
         </span>
-        <MoreMenu step={step} canMove={canMove} actions={actions} />
+        <MoreMenu step={step} canMove={canMove} actions={actions} onRecordLesson={() => setShowLessonForm(true)} />
       </div>
 
       <div className="step-why">
@@ -247,8 +254,7 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
 
       <div className="step-body">
         {step.command !== null || current ? (
-          <>
-            <div className={`cmd${isDangerous ? ' destructive' : ''}${step.command === null ? ' placeholder' : ''}`}>
+          <>            <div className={`cmd${isDangerous ? ' destructive' : ''}${step.command === null ? ' placeholder' : ''}`}>
               <pre>
                 <Editable
                   value={step.command ?? ''}
@@ -351,6 +357,36 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
             )}
           </>
         ) : null}
+
+        {/* 坑（M9）：第一层一行预警，第二层折叠；失败时全部浮出（第三层） */}
+        {lessons !== undefined && (
+          <LessonList
+            step={step}
+            failed={step.status === 'failed' || runState?.verdict === 'fail'}
+            data={lessons}
+            mainlineOnly={mainlineOnly === true}
+            onChanged={onChanged}
+          />
+        )}
+
+        {/* 捕获提议：失败后修好 / 偏离底稿，预填好等人点 */}
+        {(offers ?? []).filter((o) => o.kind === 'fix' || o.kind === 'deviation').map((o) => (
+          <CaptureCard key={o.id} offer={o} onChanged={onChanged} />
+        ))}
+
+        {/* 手动记个坑（捕获时机 2） */}
+        {showLessonForm && (
+          <LessonForm
+            defaultSymptom={lastFailTail(evidence)}
+            defaultFix={step.command ?? ''}
+            onCancel={() => setShowLessonForm(false)}
+            onSaved={() => {
+              setShowLessonForm(false)
+              onChanged()
+            }}
+            onSubmit={(input, scope) => api.createStepLesson(step.id, { symptom: input.symptom, fix: input.fixMd, condition: input.condition, scope })}
+          />
+        )}
 
         {step.probe !== null && (
           <div className="expectation">
@@ -516,7 +552,7 @@ function NoteForm({
 }
 
 /** ⋯ 菜单：不常用但要找得到的操作，都附上快捷键。 */
-function MoreMenu({ step, canMove, actions }: { step: Step; canMove: Record<MoveDirection, boolean>; actions: StepActions }) {
+function MoreMenu({ step, canMove, actions, onRecordLesson }: { step: Step; canMove: Record<MoveDirection, boolean>; actions: StepActions; onRecordLesson?: () => void }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLSpanElement>(null)
 
@@ -559,6 +595,7 @@ function MoreMenu({ step, canMove, actions }: { step: Step; canMove: Record<Move
           {item('下移', 'Alt+↓', () => actions.move('down'), canMove.down)}
           {!section && item('移进上一章', 'Tab', () => actions.move('indent'), canMove.indent)}
           {!section && item('移出章节', 'Shift+Tab', () => actions.move('outdent'), canMove.outdent)}
+          {!section && onRecordLesson !== undefined && item('记个坑', '', onRecordLesson)}
           {!section && step.delegateTaskId === null && (
             <DelegateItem onDelegate={(name) => { setOpen(false); void actions.delegate(name) }} />
           )}
@@ -588,6 +625,285 @@ function MoreMenu({ step, canMove, actions }: { step: Step; canMove: Record<Move
       )}
     </span>
   )
+}
+
+// ── 坑（M9）：三层显示、捕获卡片、记坑表单 ─────────────────
+
+/** 坑的尾注：作者 · 确认状态 · 帮过几次。 */
+function lessonTail(l: LessonView): string {
+  const bits = [
+    l.mine ? '我记的' : l.author,
+    l.status === 'confirmed' ? '已确认' : l.status === 'unverified' ? '未验证' : '',
+    l.stale ? '疑似过期' : '',
+    l.hits > 0 ? `帮过 ${l.hits} 次` : '',
+  ]
+  return bits.filter(Boolean).join(' · ')
+}
+
+/**
+ * 三层显示（宪法 14：坑在该出现的时候出现）：
+ * - 第一层：条件匹配的一行预警
+ * - 第二层：条件不符/未验证/疑似过期的，折叠计数
+ * - 第三层：失败时全部展开，带 [按这个修] [不是这个]
+ * "只看主线"时藏起一二层，第三层照常浮出。
+ */
+function LessonList({
+  step,
+  failed,
+  data,
+  mainlineOnly,
+  onChanged,
+}: {
+  step: Step
+  failed: boolean
+  data: { layer1: LessonView[]; layer2: LessonView[] }
+  mainlineOnly: boolean
+  onChanged: () => void
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [fold2, setFold2] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  if (data.layer1.length === 0 && data.layer2.length === 0) return null
+  // 只看主线：平时藏一二层；失败时第三层照常
+  if (mainlineOnly && !failed) return null
+
+  const act = async (id: string, fn: () => Promise<unknown>): Promise<void> => {
+    setBusy(id)
+    setError(null)
+    try {
+      await fn()
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const row = (l: LessonView, layer: 1 | 2): ReactNode => {
+    const open = failed || expanded[l.id] === true
+    return (
+      <div key={l.id} className={`lesson-row${layer === 2 ? ' dim' : ''}`}>
+        <button
+          className="lesson-warn"
+          title={l.condition !== null ? `条件：${l.condition}` : undefined}
+          onClick={() => setExpanded((m) => ({ ...m, [l.id]: !open }))}
+        >
+          ⚠ {l.symptom.split('\n')[0]}
+          <span className="lesson-tail">{lessonTail(l)}</span>
+          {open ? ' ▴' : ' ▸'}
+        </button>
+        {open && (
+          <div className="lesson-detail">
+            {l.condition !== null && (
+              <div className="line">
+                条件：{l.condition}
+                {l.matched === false ? '（当前不匹配）' : l.matched === null ? '（无法判定）' : ''}
+              </div>
+            )}
+            {l.cause !== null && <div className="line">原因：{l.cause}</div>}
+            <pre className="lesson-fix">{l.fixMd}</pre>
+            <div className="lesson-actions">
+              <button
+                className="btn primary"
+                disabled={busy === l.id}
+                onClick={() =>
+                  void act(l.id, async () => {
+                    // 插入修复步骤并立刻运行（sourceRef 记着坑 id，跑通自动记"帮上"）
+                    const s = await api.applyLessonFix(l.id, step.id)
+                    await api.runStep(s.id)
+                  })
+                }
+              >
+                按这个修
+              </button>
+              <button className="btn ghost" disabled={busy === l.id} onClick={() => void act(l.id, () => api.lessonMiss(l.id))}>
+                不是这个
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="lesson-list" onClick={(e) => e.stopPropagation()}>
+      {data.layer1.map((l) => row(l, 1))}
+      {data.layer2.length > 0 &&
+        (failed ? (
+          data.layer2.map((l) => row(l, 2))
+        ) : (
+          <button className="lesson-fold" onClick={() => setFold2((v) => !v)}>
+            另有 {data.layer2.length} 个坑（条件不符 / 未验证）{fold2 ? ' ▴' : ' ▸'}
+          </button>
+        ))}
+      {fold2 && !failed && data.layer2.map((l) => row(l, 2))}
+      {error !== null && <div className="verdict fail">{error}</div>}
+    </div>
+  )
+}
+
+/** 捕获提议卡片：失败后修好（预填症状/diff/条件）或偏离底稿（带回）。 */
+function CaptureCard({ offer, onChanged }: { offer: LessonOfferView; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const accept = async (input: Record<string, unknown> = {}): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    try {
+      await api.acceptLessonOffer(offer.id, input)
+      onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (offer.kind === 'deviation') {
+    return (
+      <div className="capture-card" onClick={(e) => e.stopPropagation()}>
+        <div className="cap-title">这步改得和底稿不一样了——要把这个改动带回底稿吗？</div>
+        <pre className="cap-diff">
+          <span className="del">- {String(offer.payload.before ?? '')}</span>
+          {'\n'}
+          <span className="add">+ {String(offer.payload.after ?? '')}</span>
+        </pre>
+        {error !== null && <div className="verdict fail">{error}</div>}
+        <div className="cap-actions">
+          <button className="btn primary" disabled={busy} onClick={() => void accept()}>
+            带回底稿
+          </button>
+          <button className="btn ghost" disabled={busy} onClick={() => void api.dismissLessonOffer(offer.id).then(onChanged)}>
+            不用
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="capture-card" onClick={(e) => e.stopPropagation()}>
+      <div className="cap-title">刚才是失败后改了命令才跑通的——记成坑？</div>
+      <LessonForm
+        defaultSymptom={String(offer.payload.symptom ?? '')}
+        defaultFix={String(offer.payload.after ?? '')}
+        defaultCondition={typeof offer.payload.condition === 'string' ? offer.payload.condition : null}
+        compact
+        submitLabel="记成坑"
+        onCancel={() => void api.dismissLessonOffer(offer.id).then(onChanged)}
+        cancelLabel="不用"
+        onSaved={onChanged}
+        onSubmit={(input, scope) => api.acceptLessonOffer(offer.id, { ...input, scope })}
+      />
+      {error !== null && <div className="verdict fail">{error}</div>}
+    </div>
+  )
+}
+
+/** 记坑表单：症状/修法/条件三个字段，预填好，人最多改两行。 */
+function LessonForm({
+  defaultSymptom,
+  defaultFix,
+  defaultCondition = null,
+  compact = false,
+  submitLabel = '记成坑',
+  cancelLabel = '取消',
+  onCancel,
+  onSaved,
+  onSubmit,
+}: {
+  defaultSymptom: string
+  defaultFix: string
+  defaultCondition?: string | null
+  compact?: boolean
+  submitLabel?: string
+  cancelLabel?: string
+  onCancel: () => void
+  onSaved: () => void
+  onSubmit: (input: { symptom: string; fixMd: string; condition?: string | null }, scope: 'personal' | 'team') => Promise<unknown>
+}) {
+  const [symptom, setSymptom] = useState(defaultSymptom)
+  const [fixMd, setFixMd] = useState(defaultFix)
+  const [condition, setCondition] = useState(defaultCondition ?? '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const save = async (scope: 'personal' | 'team'): Promise<void> => {
+    if (symptom.trim() === '' || fixMd.trim() === '') {
+      setError('症状和修法都要填')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await onSubmit({ symptom: symptom.trim(), fixMd: fixMd.trim(), condition: condition.trim() === '' ? null : condition.trim() }, scope)
+      onSaved()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="lesson-form" onClick={(e) => e.stopPropagation()}>
+      <div className="field">
+        <span className="label">症状</span>
+        <textarea
+          className="inline-edit"
+          rows={compact ? 2 : 3}
+          value={symptom}
+          onChange={(e) => setSymptom(e.target.value)}
+          placeholder="当时看到了什么（报错尾部）"
+        />
+      </div>
+      <div className="field">
+        <span className="label">修法</span>
+        <textarea
+          className="inline-edit"
+          rows={compact ? 2 : 3}
+          value={fixMd}
+          onChange={(e) => setFixMd(e.target.value)}
+          placeholder="怎么修好的（命令用 ``` 围起来，[按这个修] 能直接用）"
+        />
+      </div>
+      <div className="field">
+        <span className="label">条件（可选）</span>
+        <input
+          className="inline-edit"
+          value={condition}
+          onChange={(e) => setCondition(e.target.value)}
+          placeholder="如 DECODE_HOST == gpu-18 AND 环境.GPU 包含 H800"
+        />
+      </div>
+      {error !== null && <div className="verdict fail">{error}</div>}
+      <div className="cap-actions">
+        <button className="btn primary" disabled={busy} onClick={() => void save('team')}>
+          {submitLabel}并共享
+        </button>
+        <button className="btn" disabled={busy} onClick={() => void save('personal')}>
+          只记给自己
+        </button>
+        <button className="btn ghost" disabled={busy} onClick={onCancel}>
+          {cancelLabel}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** 失败输出尾部：记坑表单的症状预填。 */
+function lastFailTail(evidence: Evidence[]): string {
+  const last = [...evidence].reverse().find((e) => e.imagePath === null && e.text !== null)
+  if (last?.text == null) return ''
+  const lines = last.text.trimEnd().split(/\r?\n/)
+  const tail = lines.slice(-6).join('\n')
+  return tail.length > 300 ? tail.slice(tail.length - 300) : tail
 }
 
 /**

@@ -72,7 +72,10 @@ app.get('*', (c) => {
   return c.html(indexHtml)
 })
 // 引擎路径 /qb/ 也要能到达远程 UI（入口选择在 main.tsx 里按 pathname 分流）
-app.get('/qb/*', (c) => c.html(indexHtml))
+app.get('/qb/*', (c) => {
+  if (indexHtml === null) return c.text('远程 UI 未找到', 500)
+  return c.html(indexHtml)
+})
 
 const server = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
   console.log(`[qb-team] 监听 http://${host}:${info.port}（数据库 ${dbPath}）`)

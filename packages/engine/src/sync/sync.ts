@@ -159,6 +159,8 @@ export function createSync(deps: SyncDeps) {
             expectedMinutes: s.expectedMinutes,
             actualMs: s.actualMs,
             statusNote: s.statusNote,
+            // 血缘必须随快照走：团队按它把坑路由给正在做同一步的人（M9）
+            ...(s.lineageKey !== null ? { lineageKey: s.lineageKey } : {}),
             ...(lastOutput !== null ? { lastOutput } : {}),
           }
         }),
@@ -198,12 +200,26 @@ export function createSync(deps: SyncDeps) {
         })),
         alerts,
         questions: unpushedQuestions.map((q) => ({ id: q.id, taskId: q.taskId, stepId: q.stepId, body: q.bodyMd, createdAt: q.createdAt })),
+        // 待共享的坑（M9）：脱敏后整条上传；只有血缘锚定的才值得共享
+        lessons: store.listLessonsToUpload()
+          .filter((l) => l.anchorKind === 'step_lineage' && l.anchorRef !== null)
+          .map((l) => ({
+            id: l.id,
+            lineageKey: l.anchorRef!,
+            symptom: redact(l.symptom).text,
+            cause: l.cause === null ? null : redact(l.cause).text,
+            fixMd: redact(l.fixMd).text,
+            condition: l.condition === null ? null : redact(l.condition).text,
+            taskId: l.sourceTaskId,
+            taskTitle: l.sourceTaskId !== null ? (store.getTask(l.sourceTaskId)?.title ?? null) : null,
+            createdAt: l.createdAt,
+          })),
       }),
       signal: AbortSignal.timeout(20_000),
     })
     if (!res.ok) throw new Error(`团队服务返回 HTTP ${res.status}`)
     const result = (await res.json()) as {
-      down: Array<{ kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress'; payload: Record<string, unknown> }>
+      down: Array<{ kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress' | 'lesson' | 'lesson_status' | 'proposal' | 'proposal_status'; payload: Record<string, unknown> }>
       lastDownSeq: number
     }
 
@@ -211,6 +227,13 @@ export function createSync(deps: SyncDeps) {
     store.inTransaction(() => {
       applyDown(result.down)
       store.markQuestionsPushed(unpushedQuestions.map((q) => q.id))
+      // 上传成功的坑打标记（团队按 id 幂等，重传也安全，但没必要）
+      store.markLessonsUploaded(
+        store
+          .listLessonsToUpload()
+          .filter((l) => l.anchorKind === 'step_lineage')
+          .map((l) => l.id),
+      )
       setState({ pushedSeq: st.pushedSeq + events.length, downSeq: result.lastDownSeq })
     })
 
@@ -305,8 +328,130 @@ export function createSync(deps: SyncDeps) {
               kind: 'question_answered',
               payload: { answer, by: String(p.answered_by_name ?? '发起人'), questionId: qid },
             })
+            // 捕获时机 5：发起人回答到达 → 提议沉淀成坑（M9）
+            if (q.answerMd !== null) {
+              store.createLessonOffer({
+                taskId: q.taskId,
+                stepId: q.stepId,
+                kind: 'question',
+                dedupKey: qid,
+                payload: { questionId: qid, question: q.bodyMd, answer },
+              })
+            }
             touchedTasks.add(q.taskId)
           }
+        }
+      } else if (item.kind === 'lesson') {
+        const p = item.payload
+        const lessonId = String(p.id ?? '')
+        if (lessonId === '' || store.lessonById(lessonId) !== null) continue // 幂等
+        const lesson = store.upsertRemoteLesson({
+          id: lessonId,
+          anchorRef: String(p.lineage_key ?? p.lineageKey ?? ''),
+          symptom: redact(String(p.symptom ?? '')).text,
+          cause: p.cause == null ? null : redact(String(p.cause)).text,
+          fixMd: redact(String(p.fix_md ?? p.fixMd ?? '')).text,
+          condition: p.condition == null ? null : String(p.condition),
+          authorName: String(p.author_name ?? p.authorName ?? '同事'),
+          localAuthorId: userNameAsId(),
+          confirmed: p.status === 'confirmed',
+          createdAt: Number(p.created_at ?? p.createdAt ?? Date.now()),
+        })
+        // 挂到含该血缘的任务上：时间线可见"谁在这一步记了个坑"（宪法 15：透明）
+        if (lesson !== null && lesson.anchorRef !== '') {
+          for (const task of store.listTasks({})) {
+            const latest = store.getLatestRunbook(task.id)
+            if (latest === null) continue
+            const step = latest.steps.find((s) => s.lineageKey === lesson.anchorRef)
+            if (step === undefined) continue
+            store.appendEvent({
+              taskId: task.id,
+              stepId: step.id,
+              actorId: null,
+              kind: 'lesson_shared',
+              payload: { lessonId: lesson.id, by: lesson.authorName, symptom: lesson.symptom.slice(0, 80) },
+            })
+            touchedTasks.add(task.id)
+          }
+        }
+      } else if (item.kind === 'lesson_status') {
+        // 我传的坑被确认/驳回了：确认 → 打戳；驳回 → 降回 personal
+        const p = item.payload
+        const lessonId = String(p.id ?? '')
+        if (store.lessonById(lessonId) !== null) {
+          store.setRemoteLessonStatus(lessonId, p.status === 'confirmed' ? 'confirmed' : 'declined')
+          const lesson = store.lessonById(lessonId)
+          if (lesson?.sourceTaskId != null) {
+            store.appendEvent({
+              taskId: lesson.sourceTaskId,
+              actorId: null,
+              kind: 'lesson_confirmed',
+              payload: { lessonId, status: String(p.status ?? ''), by: String(p.by ?? '') },
+            })
+            touchedTasks.add(lesson.sourceTaskId)
+          }
+        }
+      } else if (item.kind === 'proposal') {
+        // 别人把他对底稿的偏离提议带回来：落成本地提议，持有底稿的人处理
+        const p = item.payload
+        const proposalId = String(p.id ?? '')
+        const lineageKey = String(p.lineage_key ?? p.lineageKey ?? '')
+        if (proposalId === '' || lineageKey === '') continue
+        // 找到自己哪个任务有该血缘（提议挂在那个任务下）
+        let taskId: string | null = null
+        let stepId: string | null = null
+        for (const task of store.listTasks({})) {
+          const latest = store.getLatestRunbook(task.id)
+          if (latest === null) continue
+          const step = latest.steps.find((s) => s.lineageKey === lineageKey)
+          if (step !== undefined) {
+            taskId = task.id
+            stepId = step.id
+            break
+          }
+        }
+        if (taskId === null) continue
+        store.createLessonOffer({
+          taskId,
+          stepId,
+          kind: 'proposal',
+          dedupKey: `prp:${proposalId}`,
+          payload: {
+            remoteId: proposalId,
+            lineageKey,
+            stepTitle: String(p.step_title ?? p.stepTitle ?? ''),
+            before: String(p.before_md ?? p.beforeMd ?? ''),
+            after: String(p.after_md ?? p.afterMd ?? ''),
+            fromName: String(p.from_name ?? p.fromName ?? ''),
+            fromTaskTitle: String(p.from_task_title ?? p.fromTaskTitle ?? ''),
+          },
+        })
+        store.appendEvent({
+          taskId,
+          stepId,
+          actorId: null,
+          kind: 'base_proposal',
+          payload: { from: String(p.from_name ?? p.fromName ?? ''), stepTitle: String(p.step_title ?? p.stepTitle ?? '') },
+        })
+        touchedTasks.add(taskId)
+      } else if (item.kind === 'proposal_status') {
+        // 我带回底稿的提议被处理了
+        const p = item.payload
+        const status = String(p.status ?? '')
+        const stepTitle = String(p.step_title ?? p.stepTitle ?? '')
+        for (const task of store.listTasks({})) {
+          const hit = store.listEvents(task.id, 100).some(
+            (e) => e.kind === 'base_proposal' && typeof e.payload.stepTitle === 'string' && e.payload.stepTitle === stepTitle && e.payload.sent === true,
+          )
+          if (!hit) continue
+          store.appendEvent({
+            taskId: task.id,
+            actorId: null,
+            kind: 'base_proposal',
+            payload: { decided: status, by: String(p.by ?? ''), stepTitle },
+          })
+          touchedTasks.add(task.id)
+          break
         }
       } else if (item.kind === 'ack') {
         const p = item.payload

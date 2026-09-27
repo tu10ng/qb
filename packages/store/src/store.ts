@@ -696,6 +696,16 @@ export class Store {
     return run()
   }
 
+  /** 在某份 runbook 里按血缘找步骤（底稿对比、按坑修复都用它）。 */
+  stepByLineage(runbookId: string, lineageKey: string): Step | null {
+    const row = this.db
+      .prepare('SELECT * FROM steps WHERE runbook_id = ? AND lineage_key = ? AND deleted_at IS NULL LIMIT 2')
+      .all(runbookId, lineageKey) as StepRow[]
+    // 血缘在同一份 runbook 里理应唯一；万一重复（历史数据），宁可找不到
+    // 也不要改错地方
+    return row.length === 1 ? toStep(row[0]!) : null
+  }
+
   /** 移动一步到新的父节点下、某个兄弟之后（afterId=null 表示最前面）。 */
   moveStep(
     stepId: string,
@@ -1019,6 +1029,8 @@ export class Store {
     fixMd: string
     nextTimeMd?: string | null
     authorId: string
+    /** 远程坑的作者名（本机的为 null，展示时查 users）。 */
+    authorName?: string | null
     sourceTaskId?: string | null
     scope?: LessonScope
   }): Lesson {
@@ -1032,6 +1044,7 @@ export class Store {
       fixMd: input.fixMd,
       nextTimeMd: input.nextTimeMd ?? null,
       authorId: input.authorId,
+      authorName: input.authorName ?? null,
       sourceTaskId: input.sourceTaskId ?? null,
       // 默认 personal：作者自己立即生效，团队级要负责人确认
       scope: input.scope ?? 'personal',
@@ -1047,13 +1060,200 @@ export class Store {
       .prepare(
         `INSERT INTO lessons
          (id, anchor_kind, anchor_ref, condition, symptom, cause, fix_md, next_time_md,
-          author_id, source_task_id, scope, created_at)
+          author_id, author_name, source_task_id, scope, created_at)
          VALUES (@id, @anchorKind, @anchorRef, @condition, @symptom, @cause, @fixMd,
-                 @nextTimeMd, @authorId, @sourceTaskId, @scope, @createdAt)`,
+                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, @createdAt)`,
       )
       .run(lesson)
 
     return lesson
+  }
+
+  // ── 坑：血缘锚定 / 共享 / 命中统计（M9）────────────────────
+
+  lessonById(id: string): Lesson | null {
+    const row = this.db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) as LessonRow | undefined
+    return row === undefined ? null : toLesson(row)
+  }
+
+  /** 锚在这些血缘上的坑（三层显示的数据源；疑似过期的也带，界面降级展示）。 */
+  lessonsForLineages(lineageKeys: string[]): Lesson[] {
+    const out: Lesson[] = []
+    for (let i = 0; i < lineageKeys.length; i += 100) {
+      const chunk = lineageKeys.slice(i, i + 100)
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM lessons
+           WHERE anchor_kind = 'step_lineage' AND anchor_ref IN (${chunk.map(() => '?').join(',')})
+           ORDER BY hit_count DESC, created_at DESC`,
+        )
+        .all(...chunk) as LessonRow[]
+      out.push(...rows.map(toLesson))
+    }
+    return out
+  }
+
+  /** 待上传团队服务的坑（scope=team 且没传过）。 */
+  listLessonsToUpload(): Lesson[] {
+    const rows = this.db
+      .prepare("SELECT * FROM lessons WHERE scope = 'team' AND uploaded = 0 ORDER BY created_at")
+      .all() as LessonRow[]
+    return rows.map(toLesson)
+  }
+
+  markLessonsUploaded(ids: string[]): void {
+    if (ids.length === 0) return
+    const stmt = this.db.prepare('UPDATE lessons SET uploaded = 1 WHERE id = ?')
+    this.inTransaction(() => ids.forEach((id) => stmt.run(id)))
+  }
+
+  /** 团队侧确认/驳回后回流的坑：确认 → 打确认戳；驳回 → 降回 personal（不再当团队坑传播）。 */
+  setRemoteLessonStatus(id: string, status: 'confirmed' | 'declined'): void {
+    if (status === 'confirmed') {
+      this.db.prepare('UPDATE lessons SET confirmed_at = ? WHERE id = ?').run(Date.now(), id)
+    } else {
+      this.db.prepare("UPDATE lessons SET scope = 'personal' WHERE id = ?").run(id)
+    }
+  }
+
+  /**
+   * 团队同步下来的坑：按 id 幂等落库。作者的 user 行拿不到（对方不在本机），
+   * 用本机用户兜底只为满足外键；展示一律走 author_name。
+   */
+  upsertRemoteLesson(l: {
+    id: string
+    anchorRef: string
+    symptom: string
+    cause?: string | null
+    fixMd: string
+    condition?: string | null
+    authorName: string
+    localAuthorId: string
+    confirmed?: boolean
+    createdAt: number
+  }): Lesson | null {
+    const exists = this.lessonById(l.id)
+    if (exists !== null) {
+      if (l.confirmed === true && exists.confirmedAt === null) this.setRemoteLessonStatus(l.id, 'confirmed')
+      return exists
+    }
+    // id 必须沿用团队侧的：确认/驳回按 id 回流
+    const lesson: Lesson = {
+      id: l.id,
+      anchorKind: 'step_lineage',
+      anchorRef: l.anchorRef,
+      condition: l.condition ?? null,
+      symptom: l.symptom,
+      cause: l.cause ?? null,
+      fixMd: l.fixMd,
+      nextTimeMd: null,
+      authorId: l.localAuthorId,
+      authorName: l.authorName,
+      sourceTaskId: null,
+      scope: 'team',
+      confirmedBy: null,
+      confirmedAt: null,
+      hitCount: 0,
+      missCount: 0,
+      staleAt: null,
+      createdAt: l.createdAt,
+    }
+    this.db
+      .prepare(
+        `INSERT INTO lessons
+         (id, anchor_kind, anchor_ref, condition, symptom, cause, fix_md, next_time_md,
+          author_id, author_name, source_task_id, scope, uploaded, created_at)
+         VALUES (@id, @anchorKind, @anchorRef, @condition, @symptom, @cause, @fixMd,
+                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, 1, @createdAt)`,
+      )
+      .run(lesson)
+    if (l.confirmed === true) this.setRemoteLessonStatus(lesson.id, 'confirmed')
+    return lesson
+  }
+
+  /** 帮上了：hit+1，并解除"疑似过期"。 */
+  recordLessonHit(id: string): void {
+    this.db.prepare('UPDATE lessons SET hit_count = hit_count + 1, stale_at = NULL WHERE id = ?').run(id)
+  }
+
+  /** 没帮上：miss+1；两次"不是这个"且一次都没帮上 → 疑似过期（不再进起草检索）。 */
+  recordLessonMiss(id: string): Lesson | null {
+    this.db
+      .prepare('UPDATE lessons SET miss_count = miss_count + 1 WHERE id = ?')
+      .run(id)
+    this.db
+      .prepare('UPDATE lessons SET stale_at = ? WHERE id = ? AND hit_count = 0 AND miss_count >= 2')
+      .run(Date.now(), id)
+    return this.lessonById(id)
+  }
+
+  // ── 捕获提议（M9）────────────────────────────────────────
+
+  /**
+   * 记一条捕获提议。dedupKey（如 questionId、lineageKey）在同任务的 pending
+   * 提议里唯一——唯一索引兜底，重复时静默跳过。
+   */
+  createLessonOffer(input: {
+    taskId: string
+    stepId?: string | null
+    kind: 'fix' | 'question' | 'deviation' | 'situation' | 'proposal'
+    payload: Record<string, unknown>
+    dedupKey?: string | null
+  }): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO lesson_offers (id, task_id, step_id, kind, payload_json, dedup_key, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        )
+        .run(ids.lessonOffer(), input.taskId, input.stepId ?? null, input.kind,
+             JSON.stringify(input.payload), input.dedupKey ?? null, Date.now(), Date.now())
+      return true
+    } catch {
+      // 唯一索引冲突 = 已有同类 pending 提议，不必再问
+      return false
+    }
+  }
+
+  listLessonOffers(taskId: string, status: 'pending' | 'accepted' | 'dismissed' | 'all' = 'pending'): LessonOfferRow[] {
+    const where = status === 'all' ? '' : 'AND status = ?'
+    const args: unknown[] = [taskId]
+    if (status !== 'all') args.push(status)
+    const rows = this.db
+      .prepare(`SELECT * FROM lesson_offers WHERE task_id = ? ${where} ORDER BY created_at`)
+      .all(...args) as Array<Record<string, unknown>>
+    return rows.map(toLessonOffer)
+  }
+
+  /** 步骤上挂着的 pending 提议（失败后修好的卡片就在那一步下方）。 */
+  pendingOffersForStep(stepId: string): LessonOfferRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM lesson_offers WHERE step_id = ? AND status = 'pending' ORDER BY created_at")
+      .all(stepId) as Array<Record<string, unknown>>
+    return rows.map(toLessonOffer)
+  }
+
+  lessonOfferById(id: string): LessonOfferRow | null {
+    const r = this.db.prepare('SELECT * FROM lesson_offers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return r === undefined ? null : toLessonOffer(r)
+  }
+
+  setLessonOfferStatus(id: string, status: 'accepted' | 'dismissed'): void {
+    this.db.prepare('UPDATE lesson_offers SET status = ?, updated_at = ? WHERE id = ?').run(status, Date.now(), id)
+  }
+
+  /** 提议内容更新（底稿提议带回了团队侧 id / 冲突标记）。 */
+  patchLessonOfferPayload(id: string, patch: Record<string, unknown>): void {
+    const offer = this.lessonOfferById(id)
+    if (offer === null) return
+    this.db
+      .prepare('UPDATE lesson_offers SET payload_json = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify({ ...offer.payload, ...patch }), Date.now(), id)
+  }
+
+  /** 求助沉淀成坑后回写关联（界面显示"已沉淀"）。 */
+  updateQuestionLesson(questionId: string, lessonId: string): void {
+    this.db.prepare('UPDATE questions SET lesson_id = ? WHERE id = ?').run(lessonId, questionId)
   }
 
   /**
@@ -1262,6 +1462,15 @@ export class Store {
       .prepare('SELECT id, task_id, step_id, body_md, created_at FROM questions WHERE pushed = 0 ORDER BY created_at')
       .all() as Row[]
     return rows.map((r) => ({ id: r.id, taskId: r.task_id, stepId: r.step_id, bodyMd: r.body_md, createdAt: r.created_at }))
+  }
+
+  /** 任务的全部求助（复盘用：找已回答但还没沉淀成坑的）。 */
+  questionsOfTask(taskId: string): Array<{ id: string; stepId: string | null; bodyMd: string; answerMd: string | null; lessonId: string | null; createdAt: number }> {
+    type Row = { id: string; step_id: string | null; body_md: string; answer_md: string | null; lesson_id: string | null; created_at: number }
+    const rows = this.db
+      .prepare('SELECT id, step_id, body_md, answer_md, lesson_id, created_at FROM questions WHERE task_id = ? ORDER BY created_at')
+      .all(taskId) as Row[]
+    return rows.map((r) => ({ id: r.id, stepId: r.step_id, bodyMd: r.body_md, answerMd: r.answer_md, lessonId: r.lesson_id, createdAt: r.created_at }))
   }
 
   markQuestionsPushed(ids: string[]): void {
@@ -1531,6 +1740,7 @@ interface LessonRow {
   fix_md: string
   next_time_md: string | null
   author_id: string
+  author_name: string | null
   source_task_id: string | null
   scope: string
   confirmed_by: string | null
@@ -1538,6 +1748,7 @@ interface LessonRow {
   hit_count: number
   miss_count: number
   stale_at: number | null
+  uploaded: number
   created_at: number
 }
 
@@ -1575,6 +1786,7 @@ function toLesson(r: LessonRow): Lesson {
     fixMd: r.fix_md,
     nextTimeMd: r.next_time_md,
     authorId: r.author_id,
+    authorName: r.author_name,
     sourceTaskId: r.source_task_id,
     scope: r.scope as LessonScope,
     confirmedBy: r.confirmed_by,
@@ -1583,6 +1795,32 @@ function toLesson(r: LessonRow): Lesson {
     missCount: r.miss_count,
     staleAt: r.stale_at,
     createdAt: r.created_at,
+  }
+}
+
+export interface LessonOfferRow {
+  id: string
+  taskId: string
+  stepId: string | null
+  kind: 'fix' | 'question' | 'deviation' | 'situation' | 'proposal'
+  payload: Record<string, unknown>
+  dedupKey: string | null
+  status: 'pending' | 'accepted' | 'dismissed'
+  createdAt: number
+  updatedAt: number
+}
+
+function toLessonOffer(r: Record<string, unknown>): LessonOfferRow {
+  return {
+    id: r.id as string,
+    taskId: r.task_id as string,
+    stepId: (r.step_id as string | null) ?? null,
+    kind: r.kind as LessonOfferRow['kind'],
+    payload: JSON.parse(r.payload_json as string) as Record<string, unknown>,
+    dedupKey: (r.dedup_key as string | null) ?? null,
+    status: r.status as LessonOfferRow['status'],
+    createdAt: r.created_at as number,
+    updatedAt: r.updated_at as number,
   }
 }
 

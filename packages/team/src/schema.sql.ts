@@ -199,4 +199,65 @@ CREATE TABLE task_progress (
 CREATE INDEX idx_task_progress_down ON task_progress(assignee_name, down_seq);
 `,
   },
+  {
+    version: 3,
+    name: 'lessons-and-base-proposals',
+    sql: `
+-- M9：步骤血缘随快照镜像（坑按它路由给正在做同一步的人）
+ALTER TABLE steps ADD COLUMN lineage_key TEXT;
+CREATE INDEX idx_steps_lineage ON steps(lineage_key);
+
+-- 坑库：执行引擎上传（脱敏后），按血缘共享。unverified = 传上来还没人确认；
+-- confirmed / declined 由发起人或底稿负责人裁定。
+CREATE TABLE lessons (
+  id           TEXT PRIMARY KEY,
+  lineage_key  TEXT,
+  symptom      TEXT NOT NULL,
+  cause        TEXT,
+  fix_md       TEXT NOT NULL,
+  condition    TEXT,
+  author_name  TEXT NOT NULL,
+  task_id      TEXT,
+  task_title   TEXT,
+  status       TEXT NOT NULL DEFAULT 'unverified',
+  confirmed_by TEXT,
+  confirmed_at INTEGER,
+  created_at   INTEGER NOT NULL,
+  down_seq     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_lessons_lineage ON lessons(lineage_key);
+CREATE INDEX idx_lessons_down ON lessons(down_seq);
+
+-- 底稿更新提议：执行者偏离底稿后"把这个改动带回底稿"，底稿负责人确认。
+-- 路由到所有有该血缘步骤的其他执行者——谁手里有底稿谁处理，先接受者生效。
+CREATE TABLE base_proposals (
+  id              TEXT PRIMARY KEY,
+  lineage_key     TEXT NOT NULL,
+  step_title      TEXT NOT NULL,
+  before_md       TEXT NOT NULL,
+  after_md        TEXT NOT NULL,
+  from_name       TEXT NOT NULL,
+  from_task_id    TEXT,
+  from_task_title TEXT,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  decided_by      TEXT,
+  decided_at      INTEGER,
+  created_at      INTEGER NOT NULL,
+  down_seq        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_proposals_lineage ON base_proposals(lineage_key);
+CREATE INDEX idx_proposals_down ON base_proposals(down_seq);
+
+-- 点对点下行通知：确认/驳回结果只发给作者、提议裁定只发给提议人。
+-- 血缘广播（坑/提议本体）走各自的表按血缘路由，这里只放定向消息。
+CREATE TABLE down_notices (
+  id           TEXT PRIMARY KEY,
+  user_name    TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  down_seq     INTEGER NOT NULL UNIQUE
+);
+CREATE INDEX idx_down_notices_user ON down_notices(user_name, down_seq);
+`,
+  },
 ]

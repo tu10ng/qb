@@ -17,6 +17,8 @@ import {
   type AdaptProposal,
   type BaseSuggestion,
   type Job,
+  type LessonOfferView,
+  type LessonView,
   type NewStepInput,
   type PartialStep,
   type PurposeStatus,
@@ -57,6 +59,10 @@ export function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const [llmStatus, setLlmStatus] = useState<PurposeStatus | null>(null)
   const [teamEnabled, setTeamEnabled] = useState(false)
+  // 坑（M9）：步骤 → 两层坑；待确认的捕获提议；只看主线开关
+  const [stepLessons, setStepLessons] = useState<Record<string, { layer1: LessonView[]; layer2: LessonView[] }>>({})
+  const [lessonOffers, setLessonOffers] = useState<LessonOfferView[]>([])
+  const [mainlineOnly, setMainlineOnly] = useState(() => localStorage.getItem('qb-mainline-only') === '1')
   const history = useHistory()
 
   const detailRef = useRef<TaskDetail | null>(null)
@@ -78,6 +84,19 @@ export function App() {
     const d = await api.taskDetail(taskId)
     if (activeRef.current !== taskId) return
     setDetail(d)
+    // 坑（M9）：分层显示与捕获提议跟 detail 一起刷；失败不影响主界面
+    void api
+      .stepLessons(taskId)
+      .then((steps) => {
+        if (activeRef.current === taskId) setStepLessons(steps)
+      })
+      .catch(() => undefined)
+    void api
+      .lessonOffers(taskId)
+      .then((offers) => {
+        if (activeRef.current === taskId) setLessonOffers(offers)
+      })
+      .catch(() => undefined)
     // 刷新页面后接回进行中的后台任务
     if (d.jobs.length > 0) setJobs((m) => ({ ...m, ...Object.fromEntries(d.jobs.map((j) => [j.subjectId, j])) }))
   }, [])
@@ -105,9 +124,18 @@ export function App() {
 
   useEffect(() => {
     setDetail(null)
+    setStepLessons({})
+    setLessonOffers([])
     if (activeId === null) return
     void refreshDetail(activeId)
   }, [activeId, refreshDetail])
+
+  const toggleMainline = useCallback((): void => {
+    setMainlineOnly((v) => {
+      localStorage.setItem('qb-mainline-only', v ? '0' : '1')
+      return !v
+    })
+  }, [])
 
   // 事件流：步骤输出、完成、编辑、重规划、后台任务
   useEffect(() => {
@@ -615,6 +643,10 @@ export function App() {
           onOpenSettings={() => setView('settings')}
           teamEnabled={teamEnabled}
           toast={toast}
+          lessons={stepLessons}
+          offers={lessonOffers}
+          mainlineOnly={mainlineOnly}
+          onToggleMainline={toggleMainline}
         />
       )}
 
@@ -661,6 +693,11 @@ interface TaskPageProps {
   /** 配好团队服务时"问发起人"走真实发送。 */
   teamEnabled: boolean
   toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
+  /** M9：步骤 → 两层坑；待确认提议；只看主线。 */
+  lessons: Record<string, { layer1: LessonView[]; layer2: LessonView[] }>
+  offers: LessonOfferView[]
+  mainlineOnly: boolean
+  onToggleMainline: () => void
 }
 
 function TaskPage({
@@ -681,6 +718,10 @@ function TaskPage({
   onOpenSettings,
   teamEnabled,
   toast,
+  lessons,
+  offers,
+  mainlineOnly,
+  onToggleMainline,
 }: TaskPageProps) {
   const { task, runbook, steps } = detail
   const currentRef = useRef<HTMLDivElement>(null)
@@ -690,6 +731,7 @@ function TaskPage({
   const [situationOpen, setSituationOpen] = useState(false)
   const [transcriptOpen, setTranscriptOpen] = useState(false)
   const [askOpen, setAskOpen] = useState(false)
+  const [retroOpen, setRetroOpen] = useState(false)
 
   useEffect(() => {
     currentRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -739,6 +781,14 @@ function TaskPage({
         <button className="btn ghost" onClick={onToggleFocus}>
           {focusMode ? '退出专注 (f)' : '专注模式 (f)'}
         </button>
+        <button className="btn ghost" title="藏起坑的预警和折叠行，失败时照常浮出" onClick={onToggleMainline}>
+          {mainlineOnly ? '⚠ 显示坑提示' : '只看主线'}
+        </button>
+        {(task.status === 'done' || offers.length > 0) && (
+          <button className="btn ghost" onClick={() => setRetroOpen(true)}>
+            复盘{offers.length > 0 ? `（${offers.length}）` : ''}
+          </button>
+        )}
       </header>
 
       <div className={`task-body${focusMode ? ' focus-mode' : ''}`}>
@@ -769,7 +819,10 @@ function TaskPage({
               }${dragId === s.id ? ' dragging' : ''}`}
               onClick={() => onSelectStep(s.id)}
             >
-              <span>{isSection(s) ? '§' : outlineMark(s)}</span>
+              <span title={lessons[s.id] !== undefined ? '这一步有坑记录' : undefined}>
+                {isSection(s) ? '§' : outlineMark(s)}
+                {!isSection(s) && lessons[s.id] !== undefined && <span className="lesson-dot">⚠</span>}
+              </span>
               <span className="t">{s.title}</span>
             </button>
           ))}
@@ -865,6 +918,9 @@ function TaskPage({
                 lastEdit={lastEdits[s.id]}
                 autoEdit={s.id === editTarget}
                 canMove={canMoveOf(s)}
+                lessons={lessons[s.id]}
+                offers={offers.filter((o) => o.stepId === s.id)}
+                mainlineOnly={mainlineOnly}
                 actions={actionsFor(s)}
                 onFocus={() => onSelectStep(s.id)}
                 onChanged={onChanged}
@@ -929,6 +985,10 @@ function TaskPage({
               }
             }}
           />
+        )}
+
+        {retroOpen && (
+          <RetroDialog taskId={task.id} onDone={() => { setRetroOpen(false); onChanged() }} toast={toast} />
         )}
 
         {askOpen && (
@@ -1077,6 +1137,122 @@ function TranscriptDialog({ onDone }: { onDone: (text: string | null) => void })
 }
 
 /** 单元之间的插入条：悬停时出现"＋"。 */
+/**
+ * 复盘清单（捕获时机 7）：任务收尾时把沉淀候选列一遍——
+ * 待确认的提议（失败后修好/情况变了/别人的底稿提议）+
+ * 已回答但还没沉淀成坑的求助。逐条勾选，不想记的跳过。
+ */
+function RetroDialog({
+  taskId,
+  onDone,
+  toast,
+}: {
+  taskId: string
+  onDone: () => void
+  toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
+}) {
+  const [data, setData] = useState<{ offers: LessonOfferView[]; questions: Array<{ id: string; stepId: string | null; bodyMd: string; answerMd: string }> } | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  useEffect(() => {
+    api.retro(taskId).then(setData).catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+  }, [taskId, toast])
+
+  const act = async (id: string, fn: () => Promise<unknown>): Promise<void> => {
+    setBusy(id)
+    try {
+      await fn()
+      setData(await api.retro(taskId))
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const offerText = (o: LessonOfferView): string => {
+    const at = o.stepTitle !== null ? `（${o.stepTitle}）` : ''
+    switch (o.kind) {
+      case 'fix':
+        return `失败后改了命令才跑通${at}——记成坑`
+      case 'question':
+        return `发起人的回答${at}——沉淀成坑`
+      case 'situation':
+        return `情况变了：${String(o.payload.reason ?? '')}`
+      case 'proposal':
+        return `${String(o.payload.fromName ?? '')} 提议把「${String(o.payload.stepTitle ?? '')}」改回他那样`
+      default:
+        return `偏离底稿${at}——带回底稿`
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onDone}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <h3>复盘 · 沉淀候选</h3>
+        {data === null ? (
+          <p className="dim">整理中……</p>
+        ) : data.offers.length + data.questions.length === 0 ? (
+          <p className="dim">没有待沉淀的候选。这次执行的过程已经都留在时间线里了。</p>
+        ) : (
+          <>
+            {data.offers.map((o) => (
+              <div key={o.id} className="retro-item">
+                <span>{offerText(o)}</span>
+                <span className="retro-actions">
+                  {(o.kind === 'fix' || o.kind === 'question' || o.kind === 'situation') && (
+                    <>
+                      <button className="btn primary" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id, { scope: 'team' }))}>
+                        记成坑并共享
+                      </button>
+                      <button className="btn" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id, { scope: 'personal' }))}>
+                        只记给自己
+                      </button>
+                    </>
+                  )}
+                  {o.kind === 'deviation' && (
+                    <button className="btn primary" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id))}>
+                      带回底稿
+                    </button>
+                  )}
+                  {o.kind === 'proposal' && (
+                    <button className="btn primary" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id))}>
+                      应用到我手里的底稿
+                    </button>
+                  )}
+                  <button className="btn ghost" disabled={busy === o.id} onClick={() => void act(o.id, () => api.dismissLessonOffer(o.id))}>
+                    跳过
+                  </button>
+                </span>
+              </div>
+            ))}
+            {data.questions.map((q) => (
+              <div key={q.id} className="retro-item">
+                <span>
+                  求助「{q.bodyMd.slice(0, 40)}{q.bodyMd.length > 40 ? '…' : ''}」已回答——沉淀成坑
+                </span>
+                <span className="retro-actions">
+                  <button className="btn primary" disabled={busy === q.id} onClick={() => void act(q.id, () => api.questionLesson(q.id, { scope: 'team' }))}>
+                    记成坑并共享
+                  </button>
+                  <button className="btn ghost" disabled={busy === q.id} onClick={() => void act(q.id, () => api.questionLesson(q.id, { scope: 'personal' }))}>
+                    只记给自己
+                  </button>
+                </span>
+              </div>
+            ))}
+          </>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button className="btn" onClick={onDone}>
+            完成复盘
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function InsertBar({ onClick }: { onClick: () => void }) {
   return (
     <div className="insert-bar" onClick={onClick} title="在这里插入一步（/）">
@@ -1527,6 +1703,26 @@ function eventText(e: Event, steps: Step[]): string {
     }
     case 'alert_acked':
       return '发起人知道了'
+    case 'lesson_proposed':
+      return payload.shared === true ? '记了个坑（已共享给团队）' : '记了个坑'
+    case 'lesson_confirmed':
+      return payload.status === 'confirmed'
+        ? `${typeof payload.by === 'string' && payload.by !== '' ? payload.by : '发起人'} 确认了这个坑`
+        : `这个坑被判定无效，降回只给自己`
+    case 'lesson_shared': {
+      const by = typeof payload.by === 'string' ? payload.by : '同事'
+      const symptom = typeof payload.symptom === 'string' ? payload.symptom : ''
+      return `${by} 在这一步记了个坑：${symptom}`
+    }
+    case 'base_proposal': {
+      const from = typeof payload.from === 'string' && payload.from !== '' ? payload.from : null
+      const title = typeof payload.stepTitle === 'string' ? payload.stepTitle : '某一步'
+      if (payload.sent === true) return `把「${title}」的改动发给底稿负责人`
+      if (payload.applied === 'accepted') return `底稿提议已应用：「${title}」`
+      if (payload.applied === 'conflict') return `底稿提议冲突（自己的命令已改过）：「${title}」`
+      if (payload.decided !== undefined) return `${typeof payload.by === 'string' && payload.by !== '' ? payload.by : '对方'}处理了你的底稿提议（${String(payload.decided)}）`
+      return `${from !== null ? from : '同事'} 提议把「${title}」的命令改回底稿`
+    }
     default:
       return e.kind
   }

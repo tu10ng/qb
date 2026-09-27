@@ -170,14 +170,16 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
 function LetterStack({ alerts, onOpen }: { alerts: RemoteAlert[]; onOpen: (taskId: string) => void }) {
   const [open, setOpen] = useState(true)
   if (alerts.length === 0) return null
+  const red = alerts.filter((a) => a.level === 'red').length
+  const yellow = alerts.length - red
   return (
     <div className="letter-stack">
       <button className="letter-toggle" onClick={() => setOpen((v) => !v)}>
-        {open ? '▼' : '▲'} 🔴 {alerts.length}
+        {open ? '▼' : '▲'} {red > 0 && `🔴 ${red}`} {yellow > 0 && `🟡 ${yellow}`}
       </button>
       {open &&
         alerts.map((a) => (
-          <div key={a.key} className="letter red">
+          <div key={a.key} className={`letter ${a.level}`}>
             <span>{a.message}</span>
             <div className="letter-actions">
               <button className="btn ghost" onClick={() => onOpen(a.taskId)}>
@@ -278,26 +280,50 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
               </div>
             ))}
 
-          {/* 打开的告警 */}
+          {/* 打开的告警。坑待确认（lesson_pending）给 [确认有效]/[不用了] 而不是"知道了" */}
           {detail.alerts
             .filter((a) => a.status === 'open')
-            .map((a) => (
-              <div key={a.key} className={`adapt-card${a.level === 'red' ? '' : ' dim-alert'}`}>
-                <div className="adapt-head">
-                  <strong>{a.level === 'red' ? '🔴 需要你' : '🟡 值得一看'}</strong>
-                  <span className="dim">{a.message}</span>
-                  <span className="spacer" />
-                  <button
-                    className="btn ghost"
-                    onClick={() => {
-                      remoteApi.ack(a.key).then(refresh).catch(() => undefined)
-                    }}
-                  >
-                    知道了
-                  </button>
+            .map((a) => {
+              const lessonMatch = a.type === 'lesson_pending' ? /^lesson:([^:]+):/.exec(a.key) : null
+              return (
+                <div key={a.key} className={`adapt-card${a.level === 'red' ? '' : ' dim-alert'}`}>
+                  <div className="adapt-head">
+                    <strong>{a.level === 'red' ? '🔴 需要你' : '🟡 值得一看'}</strong>
+                    <span className="dim">{a.message}</span>
+                    <span className="spacer" />
+                    {lessonMatch !== null ? (
+                      <>
+                        <button
+                          className="btn primary"
+                          onClick={() => {
+                            remoteApi.confirmLesson(lessonMatch[1]!, true).then(refresh).catch(() => undefined)
+                          }}
+                        >
+                          确认有效
+                        </button>
+                        <button
+                          className="btn ghost"
+                          onClick={() => {
+                            remoteApi.confirmLesson(lessonMatch[1]!, false).then(refresh).catch(() => undefined)
+                          }}
+                        >
+                          不用了
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        className="btn ghost"
+                        onClick={() => {
+                          remoteApi.ack(a.key).then(refresh).catch(() => undefined)
+                        }}
+                      >
+                        知道了
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
 
           {steps.map((s) =>
             s.kind === 'note' ? (

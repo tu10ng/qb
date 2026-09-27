@@ -112,6 +112,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
               expectedMinutes: z.number().nullable(),
               actualMs: z.number().int().nullable(),
               statusNote: z.string().nullable(),
+              // 步骤血缘（M9）：坑按它路由给同血缘的执行者
+              lineageKey: z.string().nullable().optional(),
             }),
           )
           .optional(),
@@ -148,6 +150,20 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
         createdAt: z.number().int(),
       }),
     ),
+    lessons: z.array(
+      z.object({
+        id: z.string(),
+        lineageKey: z.string().nullable(),
+        symptom: z.string(),
+        cause: z.string().nullable(),
+        fixMd: z.string(),
+        condition: z.string().nullable(),
+        taskId: z.string().nullable(),
+        taskTitle: z.string().nullable(),
+        createdAt: z.number().int(),
+      }),
+      // 老版本引擎推送里没有 lessons 字段
+    ).default([]),
   })
 
   app.post('/api/sync/push', async (c) => {
@@ -236,6 +252,72 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
       const alert = store.ackAlert(key, c.get('user'))
       opts.onAck?.(alert.taskId)
       return c.json(alert)
+    } catch (e) {
+      return c.json({ error: 'not_found', message: e instanceof Error ? e.message : String(e) }, 404)
+    }
+  })
+
+  // ── 坑库与底稿提议（M9）─────────────────────────────────
+
+  /**
+   * 确认/驳回一个坑。谁能确认：管理员，或任何一个用着同血缘任务的发起人
+   * （发起人=底稿负责人/PL，方案 §6.2）。结果通知作者。
+   */
+  app.post('/api/lessons/:id/confirm', async (c) => {
+    const me = c.get('user')
+    const lesson = store.lessonById(c.req.param('id'))
+    if (lesson === null) return c.json({ error: 'not_found' }, 404)
+    if (!me.isAdmin) {
+      const related = store.lineageInitiators(lesson.lineageKey)
+      if (!related.includes(me.name)) {
+        return c.json({ error: 'forbidden', message: '只有发起人（或管理员）能确认坑' }, 403)
+      }
+    }
+    const body = await c.req.json().catch(() => ({}))
+    const parsed = z.object({ accept: z.boolean() }).safeParse(body)
+    if (!parsed.success) return c.json({ error: 'bad_request', message: '要给 accept 布尔值' }, 400)
+    try {
+      const out = store.confirmLesson(lesson.id, me, parsed.data.accept)
+      opts.onIngest?.(lesson.taskId !== null ? [lesson.taskId] : [])
+      return c.json(out)
+    } catch (e) {
+      return c.json({ error: 'conflict', message: e instanceof Error ? e.message : String(e) }, 409)
+    }
+  })
+
+  /** 执行引擎把对底稿的偏离上传为提议（推送身份必须是本人）。 */
+  app.post('/api/proposals', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const parsed = z
+      .object({
+        lineageKey: z.string().min(1),
+        stepTitle: z.string().trim().min(1),
+        beforeMd: z.string(),
+        afterMd: z.string().min(1),
+        fromTaskId: z.string().nullable().optional(),
+        fromTaskTitle: z.string().nullable().optional(),
+      })
+      .safeParse(body)
+    if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('；') }, 400)
+    const out = store.createProposal({
+      lineageKey: parsed.data.lineageKey,
+      stepTitle: parsed.data.stepTitle,
+      beforeMd: parsed.data.beforeMd,
+      afterMd: parsed.data.afterMd,
+      from: c.get('user'),
+      fromTaskId: parsed.data.fromTaskId ?? null,
+      fromTaskTitle: parsed.data.fromTaskTitle ?? null,
+    })
+    return c.json(out, 201)
+  })
+
+  /** 持有底稿的执行者应用/拒绝提议后回报。先到先得，后来的不再改状态。 */
+  app.post('/api/proposals/:id/decide', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const parsed = z.object({ outcome: z.enum(['accepted', 'declined', 'conflict']) }).safeParse(body)
+    if (!parsed.success) return c.json({ error: 'bad_request', message: 'outcome 要是 accepted/declined/conflict' }, 400)
+    try {
+      return c.json(store.decideProposal(c.req.param('id'), c.get('user'), parsed.data.outcome))
     } catch (e) {
       return c.json({ error: 'not_found', message: e instanceof Error ? e.message : String(e) }, 404)
     }

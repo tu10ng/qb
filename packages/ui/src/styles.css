@@ -1344,6 +1344,11 @@ kbd {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
 }
 
+/* 黄告警（超时/新坑待确认）走警示色而不是危险色 */
+.letter.yellow {
+  border-left-color: var(--warn);
+}
+
 .letter-actions {
   display: flex;
   gap: 6px;
@@ -1366,4 +1371,161 @@ kbd {
 
 .step.failed-cell {
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+/* ── 坑（M9）：三层显示、捕获卡片、记坑表单、复盘 ─────────── */
+
+.lesson-list {
+  margin: 6px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.lesson-warn {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  padding: 3px 8px;
+  border-left: 2px solid var(--warn);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--bg-subtle);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--warn);
+  box-sizing: border-box;
+}
+.lesson-warn:hover {
+  background: var(--border);
+}
+
+.lesson-tail {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  margin-left: 6px;
+}
+
+.lesson-row.dim .lesson-warn {
+  border-left-color: var(--border-strong);
+  color: var(--text-dim);
+}
+
+.lesson-fold {
+  all: unset;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: 2px 8px;
+}
+.lesson-fold:hover {
+  color: var(--text-dim);
+}
+
+.lesson-detail {
+  padding: 6px 9px;
+  border-left: 2px solid var(--warn);
+  margin-left: 0;
+  background: var(--bg-subtle);
+  font-size: 12.5px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.lesson-detail .line {
+  color: var(--text-dim);
+}
+.lesson-fix {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.lesson-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.lesson-dot {
+  color: var(--warn);
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+.capture-card {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+
+.cap-title {
+  font-size: 12.5px;
+  color: var(--warn);
+  margin-bottom: 6px;
+}
+
+.cap-diff {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.cap-diff .del {
+  color: var(--danger);
+  display: block;
+}
+.cap-diff .add {
+  color: var(--ok);
+  display: block;
+}
+
+.cap-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.lesson-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.lesson-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lesson-form .label {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.retro-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.retro-actions {
+  display: flex;
+  gap: 5px;
+  flex-shrink: 0;
 }

@@ -51,6 +51,7 @@ function pushBody(over: Partial<SyncPush> = {}): SyncPush {
       { key: 'fail_streak:s2', taskId: 'tsk_1', stepId: 's2', level: 'red', type: 'fail_streak', message: '「起 decode」连续失败 3 次', at: 2000 },
     ],
     questions: [],
+    lessons: [],
     ...over,
   }
 }
@@ -209,5 +210,163 @@ describe('免打扰与渠道过滤', () => {
     expect(channelWants({ enabled: true, minLevel: 'red' } as never, { level: 'red' } as never)).toBe(true)
     expect(channelWants({ enabled: true, minLevel: 'red' } as never, { level: 'yellow' } as never)).toBe(false)
     expect(channelWants({ enabled: true, minLevel: 'yellow' } as never, { level: 'yellow' } as never)).toBe(true)
+  })
+})
+
+describe('坑库与底稿提议（M9）', () => {
+  const linSteps = [
+    { taskId: 'tsk_1', id: 's1', parentId: null, orderKey: 'V', kind: 'note', title: '1 启动', command: null, status: 'pending', expectedMinutes: null, actualMs: null, statusNote: null, lineageKey: null },
+    { taskId: 'tsk_1', id: 's2', parentId: 's1', orderKey: 'k', kind: 'command', title: '起 decode', command: 'vllm serve', status: 'failed', expectedMinutes: 8, actualMs: 90000, statusNote: null, lineageKey: 'lin_decode' },
+  ]
+
+  function withLineage(): SyncPush {
+    return pushBody({ tasks: [{ ...pushBody().tasks[0]!, steps: linSteps }] })
+  }
+
+  function lessonPush(over: Partial<SyncPush> = {}): SyncPush {
+    return {
+      ...withLineage(),
+      lessons: [
+        {
+          id: 'lsn_1',
+          lineageKey: 'lin_decode',
+          symptom: 'No route to host',
+          cause: 'NCCL 走了 docker0',
+          fixMd: 'export NCCL_SOCKET_IFNAME=eth0',
+          condition: 'DECODE_HOST == gpu-18',
+          taskId: 'tsk_1',
+          taskTitle: '在 Y 集群部署 PD 分离',
+          createdAt: 3000,
+        },
+      ],
+      ...over,
+    }
+  }
+
+  it('上传的坑：给同血缘其他执行者排下行；发起人拿到 🟡 待确认告警；作者不收回自己的', () => {
+    const { store, app } = fresh()
+    setupUsers(store)
+    // 第二位执行者小B，也在做同血缘的步骤
+    const b = store.createUser('xiaob', '小B')
+    store.issueToken(b.id)
+    store.ingestPush(
+      pushBody({
+        tasks: [
+          {
+            id: 'tsk_2',
+            title: '小B 的 Y 集群',
+            briefMd: '',
+            initiatorName: 'laowang',
+            assigneeName: 'xiaob',
+            status: 'active',
+            expectedMinutes: 60,
+            startedAt: null,
+            endedAt: null,
+            runbookVersion: 1,
+            steps: linSteps.map((s) => ({ ...s, taskId: 'tsk_2' })),
+          },
+        ],
+        events: [],
+        alerts: [],
+      }),
+    )
+
+    // 走 store 直测（ingestPush 与 API 路径等价）
+    const result = store.ingestPush(lessonPush())
+
+    // 发起人视角：黄告警出现
+    const alerts = store.openAlertsForUser('laowang')
+    expect(alerts.some((a) => a.type === 'lesson_pending' && a.taskId === 'tsk_1')).toBe(true)
+
+    // 作者（小A）不收回自己的坑；小B 的下行里有它
+    expect(result.down.filter((d) => d.kind === 'lesson')).toHaveLength(0)
+    const bDown = store.ingestPush(pushBody({
+      user: { name: 'xiaob', displayName: '小B' },
+      tasks: [{ id: 'tsk_2', title: '小B 的 Y 集群', briefMd: '', initiatorName: 'laowang', assigneeName: 'xiaob', status: 'active', expectedMinutes: 60, startedAt: null, endedAt: null, runbookVersion: 1, steps: linSteps.map((s) => ({ ...s, taskId: 'tsk_2' })) }],
+      events: [], alerts: [], questions: [], lessons: [],
+      sinceDownSeq: 0,
+    }))
+    const lessonDown = bDown.down.filter((d) => d.kind === 'lesson')
+    expect(lessonDown).toHaveLength(1)
+    expect((lessonDown[0]!.payload as { lineageKey: string }).lineageKey).toBe('lin_decode')
+  })
+
+  it('重推同一个坑幂等；确认后告警解除、作者收到通知、再确认被拒', async () => {
+    const { store, app } = fresh()
+    const { initiatorToken, engineToken } = setupUsers(store)
+    store.ingestPush(lessonPush())
+    store.ingestPush(lessonPush()) // 重推：不重复
+
+    expect(store.openAlertsForUser('laowang').filter((a) => a.type === 'lesson_pending')).toHaveLength(1)
+
+    // 非发起人不能确认
+    const denied = await app.request('/api/lessons/lsn_1/confirm', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${engineToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ accept: true }),
+    })
+    expect(denied.status).toBe(403)
+
+    // 发起人（管理员）确认
+    const ok = await app.request('/api/lessons/lsn_1/confirm', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${initiatorToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ accept: true }),
+    })
+    expect(ok.status).toBe(200)
+    expect(store.openAlertsForUser('laowang').filter((a) => a.type === 'lesson_pending')).toHaveLength(0)
+    expect(store.lessonById('lsn_1')!.status).toBe('confirmed')
+
+    // 作者拉下行：拿到确认状态
+    const mine = store.ingestPush(lessonPush())
+    const status = mine.down.filter((d) => d.kind === 'lesson_status')
+    expect(status).toHaveLength(1)
+    expect((status[0]!.payload as { status: string }).status).toBe('confirmed')
+
+    // 重复确认 → 409
+    const again = await app.request('/api/lessons/lsn_1/confirm', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${initiatorToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ accept: false }),
+    })
+    expect(again.status).toBe(409)
+  })
+
+  it('底稿提议：创建 → 有同血缘的执行者收到 → 裁定后提议人收到通知', async () => {
+    const { store, app } = fresh()
+    setupUsers(store)
+    store.ingestPush(withLineage())
+
+    const created = await app.request('/api/proposals', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${store.issueToken(store.userByName('tu10ng')!.id)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ lineageKey: 'lin_decode', stepTitle: '起 decode', beforeMd: 'vllm serve', afterMd: 'NCCL_SOCKET_IFNAME=eth0 vllm serve', fromTaskId: 'tsk_1', fromTaskTitle: '在 Y 集群部署 PD 分离' }),
+    })
+    expect(created.status).toBe(201)
+    const { id } = (await created.json()) as { id: string }
+
+    // 小A 自己不该收到自己的提议；先把小A 的游标推过去
+    store.ingestPush(withLineage())
+    // 小B 在做同血缘 → 下行里有提议
+    const bDown = store.ingestPush(pushBody({
+      user: { name: 'xiaob', displayName: '小B' },
+      tasks: [{ id: 'tsk_2', title: '小B 的', briefMd: '', initiatorName: 'laowang', assigneeName: 'xiaob', status: 'active', expectedMinutes: null, startedAt: null, endedAt: null, runbookVersion: 1, steps: linSteps.map((s) => ({ ...s, taskId: 'tsk_2' })) }],
+      events: [], alerts: [], questions: [], lessons: [], sinceDownSeq: 0,
+    }))
+    const proposals = bDown.down.filter((d) => d.kind === 'proposal')
+    expect(proposals).toHaveLength(1)
+
+    // 小B 接受 → 小A 收到通知
+    const decided = await app.request(`/api/proposals/${id}/decide`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${store.issueToken(store.userByName('xiaob')!.id)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ outcome: 'accepted' }),
+    })
+    expect(decided.status).toBe(200)
+
+    const aDown = store.ingestPush(withLineage())
+    const notice = aDown.down.filter((d) => d.kind === 'proposal_status')
+    expect(notice).toHaveLength(1)
+    expect((notice[0]!.payload as { status: string }).status).toBe('accepted')
   })
 })

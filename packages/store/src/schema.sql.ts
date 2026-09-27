@@ -384,4 +384,34 @@ CREATE TABLE sync_state (
 );
 `,
   },
+  {
+    version: 7,
+    name: 'lesson-lineage-and-offers',
+    sql: `
+-- M9：坑锚定到步骤血缘（anchor_kind='step_lineage'，anchor_ref=lineage_key），
+-- 同血缘的所有 runbook 复制品都看得见。远程下发的坑带作者名；
+-- uploaded=1 表示已上传团队服务（远程下发的也置 1，防止回环再传）。
+ALTER TABLE lessons ADD COLUMN author_name TEXT;
+ALTER TABLE lessons ADD COLUMN uploaded INTEGER NOT NULL DEFAULT 0;
+
+-- 捕获提议：QB 觉得"这里可能有个坑/改动该带回底稿"，等人确认。
+-- kind: fix=失败后修好 / question=求助回答待沉淀 / deviation=偏离底稿 /
+--       proposal=别人带回底稿的提议 / situation=情况变了的原因
+CREATE TABLE lesson_offers (
+  id          TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  step_id     TEXT REFERENCES steps(id) ON DELETE SET NULL,
+  kind        TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  -- 同类提议的去重键（如 questionId / lineageKey），pending 状态下不重发
+  dedup_key   TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_lesson_offers_task ON lesson_offers(task_id, status, created_at);
+CREATE UNIQUE INDEX idx_lesson_offers_dedup ON lesson_offers(task_id, kind, dedup_key, status)
+  WHERE dedup_key IS NOT NULL AND status = 'pending';
+`,
+  },
 ]

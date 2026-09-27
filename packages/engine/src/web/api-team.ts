@@ -227,7 +227,9 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
     }
     const taskId = store.taskIdOfStep(stepId)
     const lesson = store.createLesson({
-      anchorKind: 'free',
+      // 锚到步骤血缘（M9）：同血缘的所有 runbook 复制品都会看到这条坑
+      anchorKind: step.lineageKey !== null ? 'step_lineage' : 'free',
+      anchorRef: step.lineageKey,
       condition: typeof body.condition === 'string' && body.condition !== '' ? body.condition : null,
       symptom: redact(body.symptom).text,
       fixMd: redact(body.fix).text,

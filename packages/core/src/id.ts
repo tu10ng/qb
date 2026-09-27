@@ -19,6 +19,7 @@ export const ids = {
   skill: () => newId('skl'),
   skillVersion: () => newId('skv'),
   lesson: () => newId('lsn'),
+  lessonOffer: () => newId('lof'),
   environment: () => newId('env'),
   question: () => newId('qst'),
   user: () => newId('usr'),
