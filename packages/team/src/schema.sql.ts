@@ -161,4 +161,42 @@ CREATE TABLE down_seq (
 INSERT INTO down_seq (id, seq) VALUES (1, 0);
 `,
   },
+  {
+    version: 2,
+    name: 'dispatch-and-delegation',
+    sql: `
+-- 远程派的任务：PL（或委派者）在远程 UI 创建，排队等目标执行者的引擎
+-- 拉走。引擎落地后按正常镜像回传，发起人那边就能看到它。
+CREATE TABLE dispatched_tasks (
+  id                TEXT PRIMARY KEY,
+  title             TEXT NOT NULL,
+  brief_md          TEXT NOT NULL DEFAULT '',
+  initiator_name    TEXT NOT NULL,
+  assignee_name     TEXT NOT NULL,
+  parent_step_id    TEXT,
+  expected_minutes  INTEGER,
+  definition_of_done TEXT,
+  created_at        INTEGER NOT NULL,
+  down_seq          INTEGER NOT NULL
+);
+CREATE INDEX idx_dispatched_down ON dispatched_tasks(assignee_name, down_seq);
+
+-- 委派行需要：父步骤 → 子任务的映射（镜像里带过来）
+ALTER TABLE tasks ADD COLUMN parent_step_id TEXT;
+
+-- 委派进度：子任务快照更新时给父任务执行者一条下行
+CREATE TABLE task_progress (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id        TEXT NOT NULL,
+  parent_step_id TEXT NOT NULL,
+  assignee_name  TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  done           INTEGER NOT NULL DEFAULT 0,
+  total          INTEGER NOT NULL DEFAULT 0,
+  updated_at     INTEGER NOT NULL,
+  down_seq       INTEGER NOT NULL
+);
+CREATE INDEX idx_task_progress_down ON task_progress(assignee_name, down_seq);
+`,
+  },
 ]

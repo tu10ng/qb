@@ -79,6 +79,7 @@ export function apply(ctx: DshContext, config: Config): void {
     ws,
     mount,
     currentUserId: () => me.id,
+    userName: () => config.userName ?? 'me',
     prompts,
     llm,
     settings,

@@ -142,6 +142,12 @@ export const remoteApi = {
 
   ack: (key: string) => req<RemoteAlert>(`/alerts/${encodeURIComponent(key)}/ack`, { method: 'POST' }),
 
+  // 远程派任务（PL → 执行者）
+  users: () => req<{ users: Array<{ name: string; displayName: string; taskCount: number }> }>('/users'),
+
+  dispatch: (input: { title: string; briefMd?: string; assigneeName: string; expectedMinutes?: number | null; definitionOfDone?: string | null }) =>
+    req<{ taskId: string }>('/dispatch', { method: 'POST', body: JSON.stringify(input) }),
+
   // 推送渠道（通用 webhook / 外部命令如 python 脚本）
   channels: () => req<{ channels: Array<{ id: string; name: string; kind: 'webhook' | 'command'; config: Record<string, unknown>; minLevel: 'red' | 'yellow'; enabled: boolean }> }>('/push/channels'),
 

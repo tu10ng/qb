@@ -80,6 +80,15 @@ describe('literalSuggestions', () => {
     expect(s[0]!.count).toBeGreaterThanOrEqual(ip.count)
   })
 
+  it('端口不像端口的上下文不认：ulimit -n 1024、版本号 1024.5', () => {
+    const s = literalSuggestions(['ulimit -n 1024', 'ulimit -n 1024', 'ulimit -n 1024'])
+    expect(s.map((x) => x.value)).not.toContain('1024')
+    // 冒号/空格后跟的 4-5 位数仍是端口（minCount=2，各出现两次）
+    const ok = literalSuggestions(['--port 8200', 'ss -tlnp | grep 8200', 'curl :10001', 'curl :10001/v1'])
+    expect(ok.map((x) => x.value)).toContain('8200')
+    expect(ok.map((x) => x.value)).toContain('10001')
+  })
+
   it('给得出合法的参数名', () => {
     const s = literalSuggestions(['ssh gpu-18', 'gpu-18 hostname'])
     expect(s.find((x) => x.value === 'gpu-18')!.suggestedName).toBe('GPU_18')

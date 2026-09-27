@@ -37,6 +37,8 @@ export interface TaskMirror {
   initiatorName: string
   assigneeName: string
   status: string
+  /** 委派产生的子任务：指向父步骤（引擎的 step id）。 */
+  parentStepId: string | null
   expectedMinutes: number | null
   startedAt: number | null
   endedAt: number | null
@@ -117,7 +119,7 @@ export interface PushChannel {
 }
 
 export interface DownItem {
-  kind: 'comment' | 'answer' | 'ack'
+  kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress'
   payload: unknown
 }
 
@@ -237,7 +239,7 @@ export class TeamStore {
                started_at = excluded.started_at, ended_at = excluded.ended_at,
                runbook_version = excluded.runbook_version, updated_at = excluded.updated_at`,
           )
-          .run({ ...t, updatedAt: Date.now() })
+          .run({ ...t, parentStepId: t.parentStepId ?? null, updatedAt: Date.now() })
 
         if (t.steps !== undefined) {
           const del = this.db.prepare('DELETE FROM steps WHERE task_id = ?')
@@ -313,31 +315,72 @@ export class TeamStore {
         }
       }
 
-      const down = this.pullDown(push.sinceDownSeq)
+      // 委派进度：子任务（有 parent_step_id）有快照更新时，给父任务执行者
+      // 生成一条下行——他在自己界面上看到委派行的进度
+      for (const t of push.tasks) {
+        if (t.parentStepId === null || t.parentStepId === undefined) continue
+        const parent = this.db
+          .prepare('SELECT assignee_name FROM tasks WHERE id = (SELECT task_id FROM steps WHERE id = ?)')
+          .get(t.parentStepId) as { assignee_name: string } | undefined
+        if (parent === undefined) continue
+        this.db
+          .prepare('INSERT INTO task_progress (task_id, parent_step_id, assignee_name, status, done, total, updated_at, down_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(t.id, t.parentStepId, parent.assignee_name, t.status,
+               (t.steps ?? []).filter((x) => x.kind !== 'note' && (x.status === 'ok' || x.status === 'skipped')).length,
+               (t.steps ?? []).filter((x) => x.kind !== 'note').length,
+               Date.now(), this.nextDownSeq())
+      }
+
+      const down = this.pullDown(push.sinceDownSeq, push.user.name)
       return { newRedAlerts: newRed, resolvedAlerts: resolved, ...down }
     })
     return tx()
   }
 
   /** 下行项（评论 / 回答 / 已读确认），带序号供引擎做游标。 */
-  private pullDown(since: number): { down: DownItem[]; lastDownSeq: number } {
+  /**
+   * 下行项（评论 / 回答 / 已读 / 派来的任务 / 委派进度），按执行者过滤。
+   *
+   * 每台引擎只收自己任务上的东西——不按用户过滤的话，多引擎会互相
+   * 收到别人的评论，落到不存在的任务上直接外键崩。
+   */
+  private pullDown(since: number, userName: string): { down: DownItem[]; lastDownSeq: number } {
     const max = (this.db.prepare('SELECT seq FROM down_seq WHERE id = 1').get() as { seq: number }).seq
     const down: DownItem[] = []
 
+    const dispatched = this.db
+      .prepare('SELECT * FROM dispatched_tasks WHERE assignee_name = ? AND down_seq > ? AND down_seq <= ? ORDER BY down_seq')
+      .all(userName, since, max) as Array<Record<string, unknown>>
+    for (const t of dispatched) down.push({ kind: 'task', payload: t })
+
     const comments = this.db
-      .prepare('SELECT * FROM comments WHERE down_seq > ? AND down_seq <= ? ORDER BY down_seq')
-      .all(since, max) as Array<Record<string, unknown>>
+      .prepare(
+        `SELECT c.* FROM comments c JOIN tasks t ON t.id = c.task_id
+         WHERE t.assignee_name = ? AND c.down_seq > ? AND c.down_seq <= ? ORDER BY c.down_seq`,
+      )
+      .all(userName, since, max) as Array<Record<string, unknown>>
     for (const c of comments) down.push({ kind: 'comment', payload: c })
 
     const questions = this.db
-      .prepare('SELECT * FROM questions WHERE down_seq > ? AND down_seq <= ? AND answer IS NOT NULL ORDER BY down_seq')
-      .all(since, max) as Array<Record<string, unknown>>
+      .prepare(
+        `SELECT q.* FROM questions q JOIN tasks t ON t.id = q.task_id
+         WHERE q.asker_name = ? AND q.down_seq > ? AND q.down_seq <= ? AND q.answer IS NOT NULL ORDER BY q.down_seq`,
+      )
+      .all(userName, since, max) as Array<Record<string, unknown>>
     for (const q of questions) down.push({ kind: 'answer', payload: q })
 
     const acks = this.db
-      .prepare('SELECT key, task_id, acked_by, acked_at FROM alerts WHERE down_seq IS NOT NULL AND down_seq > ? AND down_seq <= ? ORDER BY down_seq')
-      .all(since, max) as Array<Record<string, unknown>>
+      .prepare(
+        `SELECT a.key, a.task_id, a.acked_by, a.acked_at FROM alerts a JOIN tasks t ON t.id = a.task_id
+         WHERE t.assignee_name = ? AND a.down_seq IS NOT NULL AND a.down_seq > ? AND a.down_seq <= ? ORDER BY a.down_seq`,
+      )
+      .all(userName, since, max) as Array<Record<string, unknown>>
     for (const a of acks) down.push({ kind: 'ack', payload: a })
+
+    const progress = this.db
+      .prepare('SELECT * FROM task_progress WHERE assignee_name = ? AND down_seq > ? AND down_seq <= ? ORDER BY down_seq')
+      .all(userName, since, max) as Array<Record<string, unknown>>
+    for (const pr of progress) down.push({ kind: 'task_progress', payload: pr })
 
     return { down, lastDownSeq: max }
   }
@@ -345,6 +388,39 @@ export class TeamStore {
   private nextDownSeq(): number {
     this.db.prepare('UPDATE down_seq SET seq = seq + 1 WHERE id = 1').run()
     return (this.db.prepare('SELECT seq FROM down_seq WHERE id = 1').get() as { seq: number }).seq
+  }
+
+  // ── 远程派任务（PL / 委派者 → 执行者）─────────────────────
+
+  /** PL 或委派者派一个任务给某人：排队等对方引擎拉走。 */
+  dispatchTask(input: {
+    title: string
+    briefMd?: string
+    initiator: TeamUser
+    assigneeName: string
+    parentStepId?: string | null
+    expectedMinutes?: number | null
+    definitionOfDone?: string | null
+  }): { id: string; downSeq: number } {
+    const id = newId('tsk')
+    const downSeq = this.nextDownSeq()
+    this.db
+      .prepare(
+        `INSERT INTO dispatched_tasks (id, title, brief_md, initiator_name, assignee_name,
+                                        parent_step_id, expected_minutes, definition_of_done, created_at, down_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, input.title, input.briefMd ?? '', input.initiator.name, input.assigneeName,
+           input.parentStepId ?? null, input.expectedMinutes ?? null, input.definitionOfDone ?? null,
+           Date.now(), downSeq)
+    return { id, downSeq }
+  }
+
+  listUsers(): Array<TeamUser & { taskCount: number }> {
+    return (this.db
+      .prepare(`SELECT u.*, (SELECT count(*) FROM tasks t WHERE t.assignee_name = u.name) AS task_count FROM users u ORDER BY u.created_at`)
+      .all() as Array<{ id: string; name: string; display_name: string; is_admin: number; task_count: number }>)
+      .map((r) => ({ id: r.id, name: r.name, displayName: r.display_name, isAdmin: r.is_admin === 1, taskCount: r.task_count }))
   }
 
   // ── 团队侧写入（评论 / 回答 / 已读）──────────────────────
@@ -544,6 +620,7 @@ function toTask(r: Record<string, unknown>): TaskMirror {
     initiatorName: r.initiator_name as string,
     assigneeName: r.assignee_name as string,
     status: r.status as string,
+    parentStepId: (r.parent_step_id as string | null) ?? null,
     expectedMinutes: (r.expected_minutes as number | null) ?? null,
     startedAt: (r.started_at as number | null) ?? null,
     endedAt: (r.ended_at as number | null) ?? null,

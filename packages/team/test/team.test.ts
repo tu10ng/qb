@@ -70,6 +70,20 @@ describe('认证', () => {
   })
 })
 
+describe('引擎同步的写者校验', () => {
+  it('推送身份与令牌不一致 → 403', async () => {
+    const { app, store } = fresh()
+    const { engineToken } = setupUsers(store)
+    const H = { authorization: `Bearer ${engineToken}`, 'content-type': 'application/json' }
+    const r = await app.request('/api/sync/push', {
+      method: 'POST',
+      headers: H,
+      body: JSON.stringify(pushBody({ user: { name: 'laowang', displayName: '老王' } })),
+    })
+    expect(r.status).toBe(403)
+  })
+})
+
 describe('引擎同步', () => {
   it('推快照 + 事件 + 告警；重推幂等；条件消失告警解除；复发重新通知', async () => {
     const { app, store } = fresh()

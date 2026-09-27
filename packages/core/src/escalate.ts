@@ -24,6 +24,8 @@ export interface AlertThresholds {
   stalledAfterMs: number
   /** 运行中超过预计耗时的多少倍算失控。 */
   runAwayFactor: number
+  /** 运行中多长时间没有输出算失控（配合 runAwayFactor）。 */
+  runAwayNoOutputMs: number
   /** 某步实际耗时超过预计的多少倍值得一看。 */
   stepOvertimeFactor: number
   /** 任务总耗时超过预计的多少倍值得一看。 */
@@ -34,6 +36,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   failStreak: 3,
   stalledAfterMs: 20 * 60_000,
   runAwayFactor: 3,
+  runAwayNoOutputMs: 10 * 60_000,
   stepOvertimeFactor: 2,
   taskOvertimeFactor: 1.5,
 }
@@ -62,8 +65,10 @@ export interface EscalateInput {
   task: Task
   /** 当前 runbook 的步骤（先序）。 */
   steps: Step[]
-  /** 该任务最近的事件（时间正序；给最近 50 条就够）。 */
+  /** 该任务最近的事件（时间正序；给最近 200 条）。 */
   events: Event[]
+  /** 运行中步骤的最近输出时间（引擎内存跟踪；没有输出的步骤不传）。 */
+  lastOutputAt?: ReadonlyMap<string, number>
   thresholds?: Partial<AlertThresholds>
 }
 
@@ -143,21 +148,23 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
     })
   }
 
-  // 🔴 失控：正在跑的步骤远超预计耗时
+  // 🔴 失控：正在跑的步骤远超预计耗时**且**最近 10 分钟没有任何输出。
+  // 只看耗时不管输出会把正常的"长任务"（起 vLLM 要 8 分钟）误报。
   for (const step of steps) {
     if (step.status !== 'running' || step.expectedMinutes === null || step.startedAt === null) continue
     const expectedMs = step.expectedMinutes * 60_000
-    if (now - step.startedAt >= expectedMs * t.runAwayFactor) {
-      out.push({
-        key: `runaway:${step.id}`,
-        taskId: task.id,
-        stepId: step.id,
-        level: 'red',
-        type: 'runaway',
-        message: `「${step.title}」已运行 ${Math.round((now - step.startedAt) / 60_000)} 分钟，预计 ${step.expectedMinutes} 分钟`,
-        at: step.startedAt,
-      })
-    }
+    if (now - step.startedAt < expectedMs * t.runAwayFactor) continue
+    const lastSeen = input.lastOutputAt?.get(step.id) ?? step.startedAt
+    if (now - lastSeen < t.runAwayNoOutputMs) continue
+    out.push({
+      key: `runaway:${step.id}`,
+      taskId: task.id,
+      stepId: step.id,
+      level: 'red',
+      type: 'runaway',
+      message: `「${step.title}」已运行 ${Math.round((now - step.startedAt) / 60_000)} 分钟（预计 ${step.expectedMinutes} 分钟），${Math.round((now - lastSeen) / 60_000)} 分钟没有输出`,
+      at: lastSeen,
+    })
   }
 
   // 🟡 某步超预计（已结束）

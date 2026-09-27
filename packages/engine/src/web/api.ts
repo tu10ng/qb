@@ -34,6 +34,8 @@ export interface ApiDeps {
   settings: LlmSettings
   attachments: Attachments
   guard: LocalGuard
+  /** 本机用户名（委派等场景要标"是谁干的"）。 */
+  userName: () => string
   team: { settings: import('../sync/sync.ts').TeamSettings; sync: import('../sync/sync.ts').Sync }
 }
 
@@ -159,7 +161,7 @@ export function buildApi(deps: ApiDeps): Router {
       title: body.title.trim(),
       initiatorId,
       ...(body.briefMd !== undefined ? { briefMd: body.briefMd } : {}),
-      ...(body.assigneeId !== undefined ? { assigneeId: body.assigneeId } : {}),
+      assigneeId: body.assigneeId !== undefined ? body.assigneeId : currentUserId(),
       ...(body.expectedMinutes !== undefined ? { expectedMinutes: body.expectedMinutes } : {}),
       ...(body.dueAt !== undefined ? { dueAt: body.dueAt } : {}),
       ...(body.definitionOfDone !== undefined ? { definitionOfDone: body.definitionOfDone } : {}),
@@ -772,7 +774,7 @@ export function buildApi(deps: ApiDeps): Router {
   registerEditRoutes(router, { store, ws, currentUserId, isRunning: (id) => running.has(id) })
   registerSettingsRoutes(router, { settings, llm, jobs })
   registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
-  registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, currentUserId })
+  registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, currentUserId, userName: () => deps.userName() })
 
   return router
 }

@@ -11,7 +11,7 @@
  * - 透明：谁替执行者发了什么，都有一条本地事件
  */
 
-import { evaluateAlerts, redact } from '@qb/core'
+import { evaluateAlerts, redact, tailCap } from '@qb/core'
 import type { Store } from '@qb/store'
 
 export interface TeamConfig {
@@ -63,6 +63,11 @@ export type Sync = ReturnType<typeof createSync>
 
 export function createSync(deps: SyncDeps) {
   const { store, userName, broadcast, log } = deps
+
+  /** 本机用户 id（"派给自己的任务"的 initiator 兜底） */
+  function userNameAsId(): string {
+    return store.getUserByName(userName())?.id ?? ''
+  }
   let warnedOffline = false
   // 重入锁：一拍 2 秒而 fetch 超时 20 秒——不锁的话最多十个并发推送，
   // 各自拿旧游标，完成乱序时会把 downSeq 写回旧值
@@ -134,19 +139,29 @@ export function createSync(deps: SyncDeps) {
         startedAt: task.startedAt,
         endedAt: task.endedAt,
         runbookVersion: latest?.runbook.version ?? null,
-        steps: (latest?.steps ?? []).map((s) => ({
-          taskId,
-          id: s.id,
-          parentId: s.parentId,
-          orderKey: s.orderKey,
-          kind: s.kind,
-          title: s.title,
-          command: s.command === null ? null : redact(s.command).text,
-          status: s.status,
-          expectedMinutes: s.expectedMinutes,
-          actualMs: s.actualMs,
-          statusNote: s.statusNote,
-        })),
+        steps: (latest?.steps ?? []).map((s) => {
+          // share_output 开启时带上最新输出（脱敏 + 4KB 截尾）
+          let lastOutput: string | null = null
+          if (s.shareOutput === true) {
+            const evs = store.listEvidence(s.id)
+            const last = evs.length > 0 ? evs[evs.length - 1]! : null
+            if (last?.text != null) lastOutput = tailCap(redact(last.text).text, 4096).text
+          }
+          return {
+            taskId,
+            id: s.id,
+            parentId: s.parentId,
+            orderKey: s.orderKey,
+            kind: s.kind,
+            title: s.title,
+            command: s.command === null ? null : redact(s.command).text,
+            status: s.status,
+            expectedMinutes: s.expectedMinutes,
+            actualMs: s.actualMs,
+            statusNote: s.statusNote,
+            ...(lastOutput !== null ? { lastOutput } : {}),
+          }
+        }),
       }
     })
 
@@ -188,7 +203,7 @@ export function createSync(deps: SyncDeps) {
     })
     if (!res.ok) throw new Error(`团队服务返回 HTTP ${res.status}`)
     const result = (await res.json()) as {
-      down: Array<{ kind: 'comment' | 'answer' | 'ack'; payload: Record<string, unknown> }>
+      down: Array<{ kind: 'comment' | 'answer' | 'ack' | 'task' | 'task_progress'; payload: Record<string, unknown> }>
       lastDownSeq: number
     }
 
@@ -205,10 +220,62 @@ export function createSync(deps: SyncDeps) {
     }
   }
 
-  /** 下行落地：评论 / 回答 / 已读都成为本地事件（透明，QB 面板可见）。 */
+  /** 下行落地：派来的任务 / 评论 / 回答 / 已读 / 委派进度，都成为本地可见的东西。 */
   function applyDown(items: Array<{ kind: string; payload: Record<string, unknown> }>): void {
-    let touchedTasks = new Set<string>()
+    const touchedTasks = new Set<string>()
     for (const item of items) {
+      if (item.kind === 'task') {
+        const p = item.payload
+        const taskId = String(p.id ?? '')
+        if (taskId === '' || store.getTask(taskId) !== null) continue // 幂等
+        const initiatorName = String(p.initiator_name ?? '')
+        const initiator = initiatorName !== '' ? store.ensureUser(initiatorName) : null
+        const task = store.createTask({
+          id: taskId,
+          title: String(p.title ?? ''),
+          briefMd: String(p.brief_md ?? ''),
+          initiatorId: initiator !== null ? initiator.id : userNameAsId(),
+          // 派来的任务归本机执行者
+          parentStepId: p.parent_step_id !== undefined && p.parent_step_id !== null ? String(p.parent_step_id) : null,
+          expectedMinutes: p.expected_minutes !== undefined && p.expected_minutes !== null ? Number(p.expected_minutes) : null,
+          definitionOfDone: p.definition_of_done !== undefined && p.definition_of_done !== null ? String(p.definition_of_done) : null,
+        })
+        store.appendEvent({ taskId: task.id, actorId: null, kind: 'task_created', payload: { by: initiatorName, remote: true } })
+        touchedTasks.add(task.id)
+        continue
+      }
+      if (item.kind === 'task_progress') {
+        const p = item.payload
+        // 委派出去的子任务的进度：更新本地子任务状态 + 事件
+        const childId = String(p.task_id ?? '')
+        const child = store.getTask(childId)
+        if (child === null) continue
+        const remoteStatus = String(p.status ?? 'active')
+        const done = Number(p.done ?? 0)
+        const total = Number(p.total ?? 0)
+        const progressText = `${done}/${total}`
+        // 只更新 status（引擎侧只关心子任务是否完成）
+        if (remoteStatus === 'done' && child.status !== 'done') {
+          store.updateTaskStatus(childId, 'done', null)
+          // 父步骤标 ok
+          if (child.parentStepId !== null) {
+            const step = store.getStep(child.parentStepId)
+            if (step !== null && step.status !== 'ok') {
+              store.updateStepStatus(step.id, 'ok', { endedAt: Date.now() })
+            }
+          }
+          store.appendEvent({ taskId: childId, actorId: null, kind: 'task_done', payload: { remote: true } })
+          touchedTasks.add(childId)
+        } else if (child.status !== remoteStatus && remoteStatus === 'blocked') {
+          store.updateTaskStatus(childId, 'blocked', null)
+          store.appendEvent({ taskId: childId, actorId: null, kind: 'delegate_progress', payload: { status: remoteStatus, progress: progressText } })
+          touchedTasks.add(childId)
+        } else {
+          store.appendEvent({ taskId: childId, actorId: null, kind: 'delegate_progress', payload: { status: remoteStatus, progress: progressText } })
+          touchedTasks.add(childId)
+        }
+        continue
+      }
       if (item.kind === 'comment') {
         const p = item.payload
         const taskId = String(p.task_id ?? '')

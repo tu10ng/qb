@@ -156,6 +156,7 @@ export function testChannel(ch: PushChannel): Promise<PushOutcome> {
     initiatorName: '',
     assigneeName: '',
     status: 'active',
+    parentStepId: null,
     expectedMinutes: null,
     startedAt: null,
     endedAt: null,

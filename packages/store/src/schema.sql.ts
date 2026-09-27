@@ -342,6 +342,25 @@ INSERT INTO tasks_fts(rowid, title, brief_md) SELECT rowid, title, brief_md FROM
 `,
   },
   {
+    version: 6,
+    name: 'share-output-and-alert-snooze',
+    sql: `
+-- 步骤级"共享输出"开关：默认关（隐私优先）；打开后该步的最新输出
+-- （脱敏 + 截尾）随快照同步到团队服务，发起人远程 UI 能看到
+ALTER TABLE steps ADD COLUMN share_output INTEGER NOT NULL DEFAULT 0;
+
+-- 告警静音：执行者"我能搞定"，30 分钟内不出声
+CREATE TABLE alert_snooze (
+  key        TEXT NOT NULL,
+  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  snoozed_by TEXT REFERENCES users(id),
+  until      INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (key, task_id)
+);
+`,
+  },
+  {
     version: 4,
     name: 'runbook-material-link',
     sql: `

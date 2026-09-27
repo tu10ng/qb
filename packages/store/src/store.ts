@@ -139,9 +139,11 @@ export class Store {
     expectedMinutes?: number | null
     dueAt?: number | null
     definitionOfDone?: string | null
+    /** 远程派来的任务用团队服务生成的 id（幂等：重放不重复建） */
+    id?: string
   }): Task {
     const task: Task = {
-      id: ids.task(),
+      id: input.id ?? ids.task(),
       title: input.title,
       briefMd: input.briefMd ?? '',
       initiatorId: input.initiatorId,
@@ -475,6 +477,7 @@ export class Store {
       editedBy: null,
       sourceRef: node.sourceRef ?? null,
       statusNote: null,
+      shareOutput: false,
     }
 
     this.db
@@ -653,6 +656,7 @@ export class Store {
           probeJson: next.probe === null ? null : JSON.stringify(next.probe),
           timeoutMs: next.timeoutMs,
           expectedMinutes: next.expectedMinutes,
+          shareOutput: next.shareOutput ? 1 : 0,
           editedBy: opts.actorId,
         })
 
@@ -1306,6 +1310,25 @@ export class Store {
     })
   }
 
+    /** 告警静音（"我能搞定"）。 */
+  snoozeAlert(taskId: string, key: string, by: string, minutes: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO alert_snooze (key, task_id, snoozed_by, until, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(key, task_id) DO UPDATE SET until = excluded.until, snoozed_by = excluded.snoozed_by`,
+      )
+      .run(key, taskId, by, Date.now() + minutes * 60_000, Date.now())
+  }
+
+  /** 某个告警 key 当前是否被静音。 */
+  isSnoozed(taskId: string, key: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS hit FROM alert_snooze WHERE task_id = ? AND key = ? AND until > ?')
+      .get(taskId, key, Date.now()) as { hit: number } | undefined
+    return row !== undefined
+  }
+
   /** 把一串 store 操作包进单个事务：中途失败整体回滚，不留半套参数/半数改动。 */
   inTransaction<T>(fn: () => T): T {
     return this.db.transaction(fn)()
@@ -1437,6 +1460,7 @@ interface StepRow {
   edited_by: string | null
   source_ref: string | null
   status_note: string | null
+  share_output: number
 }
 
 interface EventRow {
@@ -1628,6 +1652,7 @@ function toStep(r: StepRow): Step {
     editedBy: r.edited_by,
     sourceRef: r.source_ref,
     statusNote: r.status_note,
+    shareOutput: r.share_output === 1,
   }
 }
 

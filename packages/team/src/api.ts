@@ -93,6 +93,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
         initiatorName: z.string().default(''),
         assigneeName: z.string().default(''),
         status: z.string(),
+        parentStepId: z.string().nullable().optional(),
         expectedMinutes: z.number().int().positive().nullable(),
         startedAt: z.number().int().nullable(),
         endedAt: z.number().int().nullable(),
@@ -152,6 +153,12 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   app.post('/api/sync/push', async (c) => {
     const parsed = SyncBody.safeParse(await c.req.json().catch(() => ({})))
     if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('；') }, 400)
+
+    // 单写者落地：只能以自己的身份推数据。否则任何个人令牌都能伪造
+    // 别人的任务/事件/告警。
+    if (parsed.data.user.name !== c.get('user').name) {
+      return c.json({ error: 'forbidden', message: `推送身份（${parsed.data.user.name}）与令牌持有者（${c.get('user').name}）不一致` }, 403)
+    }
 
     const result = store.ingestPush(parsed.data as SyncPush)
 
@@ -248,6 +255,41 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   const requireAdmin = (c: { get(k: 'user'): { isAdmin: boolean } }): boolean => c.get('user').isAdmin
 
   app.get('/api/push/channels', (c) => c.json({ channels: store.listChannels() }))
+
+  // ── 远程派任务（PL → 执行者）─────────────────────────────
+  app.get('/api/users', (c) => c.json({ users: store.listUsers() }))
+
+  app.post('/api/dispatch', async (c) => {
+    const body = await c.req.json().catch(() => ({}))
+    const parsed = z
+      .object({
+        title: z.string().trim().min(1, '标题不能为空').max(200),
+        briefMd: z.string().max(20_000).default(''),
+        assigneeName: z.string().trim().min(1, '要选执行者'),
+        parentStepId: z.string().nullable().optional(),
+        expectedMinutes: z.number().int().positive().nullable().optional(),
+        definitionOfDone: z.string().max(2000).nullable().optional(),
+      })
+      .safeParse(body)
+    if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') }, 400)
+
+    const assignee = store.userByName(parsed.data.assigneeName)
+    if (assignee === null) return c.json({ error: 'bad_request', message: `执行者「${parsed.data.assigneeName}」还没注册过` }, 400)
+    if (assignee.name === c.get('user').name) {
+      return c.json({ error: 'bad_request', message: '派给自己就不用派了——直接在执行端建任务即可' }, 400)
+    }
+
+    const r = store.dispatchTask({
+      title: parsed.data.title,
+      briefMd: parsed.data.briefMd,
+      initiator: c.get('user'),
+      assigneeName: assignee.name,
+      parentStepId: parsed.data.parentStepId ?? null,
+      expectedMinutes: parsed.data.expectedMinutes ?? null,
+      definitionOfDone: parsed.data.definitionOfDone ?? null,
+    })
+    return c.json({ taskId: r.id }, 201)
+  })
 
   // 管理员续发邀请（首张邀请用尽后新人从这进来）
   app.post('/api/invites', (c) => {

@@ -254,6 +254,13 @@ export const api = {
   cancelStep: (stepId: string) =>
     req<{ stepId: string; killed: boolean }>(`/steps/${stepId}/cancel`, { method: 'POST' }),
 
+  /** 委派这步给别人（生成对方任务，经团队服务派出去）。 */
+  delegateStep: (stepId: string, assigneeName: string) =>
+    req<{ taskId: string }>(`/steps/${stepId}/delegate`, {
+      method: 'POST',
+      body: JSON.stringify({ assigneeName }),
+    }),
+
   // ── 编辑（原地修改）─────────────────────────────────────────
 
   updateStep: (stepId: string, rev: number, patch: StepPatchInput) =>

@@ -444,6 +444,22 @@ export function App() {
     }
   }, [history, toast])
 
+  /** 委派：把这步变成 delegate + 派一个子任务给对方（经团队服务）。 */
+  const delegateStep = useCallback(
+    async (step: Step, name: string): Promise<void> => {
+      try {
+        await withFreshRev(step.id, (rev) =>
+          api.updateStep(step.id, rev, { kind: 'delegate', title: `→ ${name}: ${step.title}` }),
+        )
+        await api.delegateStep(step.id, name)
+        await reload()
+      } catch (e) {
+        toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+      }
+    },
+    [withFreshRev, reload, toast],
+  )
+
   const actionsFor = useCallback(
     (step: Step): StepActions => ({
       edit: (patch) => editStep(step, patch),
@@ -453,8 +469,9 @@ export function App() {
       setStatus: (status, note) => void setStatus(step, status, note),
       split: (lines) => void splitStep(step, lines),
       uploadImage: (file) => void uploadImage(step, file),
+      delegate: (name) => delegateStep(step, name),
     }),
-    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage],
+    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage, delegateStep],
   )
 
   // ── 键盘与粘贴 ───────────────────────────────────────────────

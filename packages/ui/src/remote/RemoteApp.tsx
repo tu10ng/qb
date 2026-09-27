@@ -103,6 +103,7 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
   const [overview, setOverview] = useState<{ initiated: RemoteTask[]; assigned: RemoteTask[]; openAlerts: RemoteAlert[] } | null>(null)
   const [openTask, setOpenTask] = useState<string | null>(null)
   const [pushOpen, setPushOpen] = useState(false)
+  const [dispatchOpen, setDispatchOpen] = useState(false)
 
   const refresh = useCallback(() => {
     remoteApi
@@ -120,6 +121,9 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
         <div className="sidebar-head">
           <span className="brand">QB</span>
           <span style={{ flex: 1 }} />
+          <button className="btn ghost" title="派任务给同事" onClick={() => setDispatchOpen(true)}>
+            ＋ 派任务
+          </button>
           <span className="dim">{me}</span>
         </div>
         <div className="task-list">
@@ -157,6 +161,7 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
 
       {overview !== null && overview.openAlerts.length > 0 && <LetterStack alerts={overview.openAlerts} onOpen={setOpenTask} />}
       {pushOpen && <PushChannelsDialog onClose={() => setPushOpen(false)} />}
+      {dispatchOpen && <DispatchDialog onClose={() => setDispatchOpen(false)} onDispatched={() => { refresh(); setTimeout(refresh, 4000); setTimeout(refresh, 8000) }} />}
     </div>
   )
 }
@@ -535,6 +540,79 @@ function PushChannelsDialog({ onClose }: { onClose: () => void }) {
             关闭
           </button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+
+/** 派任务：PL 在远程 UI 直接派活给执行者（他要先在团队服务注册）。 */
+function DispatchDialog({ onClose, onDispatched }: { onClose: () => void; onDispatched: () => void }) {
+  const [users, setUsers] = useState<Array<{ name: string; displayName: string; taskCount: number }>>([])
+  const [assignee, setAssignee] = useState('')
+  const [title, setTitle] = useState('')
+  const [brief, setBrief] = useState('')
+  const [minutes, setMinutes] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    remoteApi
+      .users()
+      .then((r) => {
+        setUsers(r.users)
+        if (r.users.length > 0) setAssignee(r.users[0]!.name)
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+  }, [])
+
+  const submit = (): void => {
+    setBusy(true)
+    setError(null)
+    const mins = minutes.trim() === '' ? undefined : Number(minutes)
+    remoteApi
+      .dispatch({
+        title: title.trim(),
+        briefMd: brief,
+        assigneeName: assignee,
+        ...(mins !== undefined && Number.isFinite(mins) && mins > 0 ? { expectedMinutes: mins } : {}),
+      })
+      .then(() => {
+        onClose()
+        onDispatched()
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>派任务</h3>
+        <p className="dim">像写 prompt 一样写目标。对方引擎几秒内收到，你这边实时看到进度与告警。</p>
+        <label>
+          派给
+          <select value={assignee} onChange={(e) => setAssignee(e.target.value)}>
+            {users.map((u) => (
+              <option key={u.name} value={u.name}>
+                {u.displayName}（{u.taskCount} 个任务）
+              </option>
+            ))}
+          </select>
+        </label>
+        <input placeholder="标题：如「在 Y 集群把 vLLM PD 分离跑通」" value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
+        <textarea placeholder="详细说明（目标、约束、已知的坑——就像给 agent 写 prompt）" value={brief} onChange={(e) => setBrief(e.target.value)} rows={4} />
+        <input placeholder="预计耗时（分钟，可选）" value={minutes} onChange={(e) => setMinutes(e.target.value)} style={{ maxWidth: 200 }} />
+        <div className="row">
+          <button className="btn primary" disabled={busy || title.trim() === '' || assignee === ''} onClick={submit}>
+            {busy ? '派出…' : '派给他'}
+          </button>
+          <button className="btn ghost" onClick={onClose}>
+            取消
+          </button>
+        </div>
+        {users.length === 0 && <p className="dim">还没有注册的执行者。让对方先打开团队服务的邀请链接注册。</p>}
+        {error !== null && <div className="verdict fail">{error}</div>}
       </div>
     </div>
   )

@@ -167,6 +167,17 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
               }}
               disabled={busy}
             />
+            <button
+              className={`chip secret-toggle${p.secret ? ' on' : ''}`}
+              title={p.secret ? '点击取消 secret（值会上传）' : '点击标为 secret（只存本机、打码、永不上传）'}
+              onClick={() => {
+                const next = list.map((x) => (x.name === p.name ? { ...x, secret: !x.secret } : x))
+                setList(next)
+                void api.updateParams(taskId, next)
+              }}
+            >
+              {p.secret ? '🔒' : '🔓'}
+            </button>
             <span className="param-source" title={p.description ?? ''}>
               {SOURCE_LABEL[p.source]}
             </span>

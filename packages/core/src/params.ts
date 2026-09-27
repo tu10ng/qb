@@ -82,9 +82,11 @@ const PATTERNS: Array<{ kind: LiteralKind; re: RegExp; nameHint: (v: string) => 
     minCount: 2,
   },
   {
-    // 4–5 位端口（10001 这种 5 位的也要认出来）
+    // 4–5 位端口（10001 这种 5 位的也要认出来）。
+    // 前后不能贴着字母/数字/点/横杠；前面是 'n '（ulimit -n 1024）或
+    // '-n'（rlimit）的不算端口。仍会漏认少数写法——提取建议只是建议。
     kind: 'port',
-    re: /(?<![=\w])((?:8|9|3|1)\d{3,4})(?![\w])/g,
+    re: /(?<![\w.\-])(?<!n\s)((?:8|9|3|1)\d{3,4})(?![\w.])/g,
     nameHint: (v) => `PORT_${v}`,
     minCount: 2,
   },

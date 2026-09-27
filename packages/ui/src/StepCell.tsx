@@ -23,6 +23,8 @@ export interface StepActions {
   /** 把多行命令拆成多步：第一行留在这一步，其余各成一步。 */
   split(lines: string[]): void
   uploadImage(file: File): void
+  /** 委派给别人：生成对方的任务（需要团队同步）。 */
+  delegate(name: string): Promise<void>
 }
 
 interface Props {
@@ -164,6 +166,26 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
   // 缺值与写错名字的（未声明）参数都挡运行
   const blockedParams = [...rendered.missing, ...rendered.undeclared]
   const badge = originBadge(step, lastEdit)
+
+  // 委派步骤：显示对方进度，不显示命令/输出
+  if (step.kind === 'delegate') {
+    return (
+      <div className={`step${current ? ' current' : ''}`} onClick={onFocus}>
+        <div className="step-head">
+          <span className={`step-mark ${markClass(step, running)}`}>{mark(step, running)}</span>
+          <span className="step-title">{step.title}</span>
+          <span className="step-hint">{hintTail(step, runState)}</span>
+          <MoreMenu step={step} canMove={canMove} actions={actions} />
+        </div>
+        {step.whyMd !== null && <div className="step-why">{step.whyMd}</div>}
+        <div className="step-body">
+          <div className="cmd-note">
+            → 已委派{step.delegateTaskId !== null ? '（对方引擎在执行，进度会出现在这里）' : '（未连接——需要配置「设置 · 团队」）'}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div
@@ -537,6 +559,9 @@ function MoreMenu({ step, canMove, actions }: { step: Step; canMove: Record<Move
           {item('下移', 'Alt+↓', () => actions.move('down'), canMove.down)}
           {!section && item('移进上一章', 'Tab', () => actions.move('indent'), canMove.indent)}
           {!section && item('移出章节', 'Shift+Tab', () => actions.move('outdent'), canMove.outdent)}
+          {!section && step.delegateTaskId === null && (
+            <DelegateItem onDelegate={(name) => { setOpen(false); void actions.delegate(name) }} />
+          )}
           {!section && (
             <div className="menu-group">
               <span className="menu-label">类型</span>
@@ -785,6 +810,32 @@ function renderWithParams(template: string, params: Param[]): ReactNode {
   }
   if (last < template.length) out.push(template.slice(last))
   return <>{out}</>
+}
+
+/** 委派项：输入对方名字，一步搞定。 */
+function DelegateItem({ onDelegate }: { onDelegate: (name: string) => void }) {
+  const [name, setName] = useState('')
+  return (
+    <div className="delegate-item" style={{ padding: '4px 8px' }}>
+      <span className="dim" style={{ fontSize: 12 }}>委派给（团队服务里的名字）</span>
+      <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+        <input
+          className="inline-edit"
+          placeholder="如 laowang"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation()
+            if (e.key === 'Enter' && name.trim() !== '') onDelegate(name.trim())
+          }}
+          style={{ flex: 1, fontSize: 12 }}
+        />
+        <button className="btn ghost" disabled={name.trim() === ''} onClick={() => onDelegate(name.trim())}>
+          委派
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function mark(step: Step, running: boolean): string {

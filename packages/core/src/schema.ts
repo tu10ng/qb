@@ -198,6 +198,8 @@ export const Step = z.object({
   sourceRef: z.string().nullable(),
   /** 跳过或标记失败时写的一句原因。 */
   statusNote: z.string().nullable(),
+  /** 共享输出给发起人（默认关；开启后最新输出随快照同步）。 */
+  shareOutput: z.boolean().default(false),
 })
 export type Step = z.infer<typeof Step>
 
@@ -211,6 +213,7 @@ export const StepPatch = z.object({
   probe: ReadinessProbe.nullable().optional(),
   timeoutMs: z.number().int().positive().nullable().optional(),
   expectedMinutes: z.number().positive().nullable().optional(),
+  shareOutput: z.boolean().optional(),
 })
 export type StepPatch = z.infer<typeof StepPatch>
 
