@@ -1,7 +1,20 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { Event, Evidence, Expectation, Param, Step, StepKind } from '@qb/core'
 import { isSection, PARAM_RE, renderCommand, type MoveDirection } from '@qb/core'
-import { ApiError, api, evidenceImageUrl, type Diagnosis, type FidelityView, type Job, type LessonOfferView, type LessonView, type StepPatchInput } from './api.ts'
+import {
+  ApiError,
+  api,
+  evidenceImageUrl,
+  type Delegation,
+  type DelegationMirror,
+  type Diagnosis,
+  type FidelityView,
+  type Job,
+  type LessonOfferView,
+  type LessonView,
+  type StepPatchInput,
+  type TeamUser,
+} from './api.ts'
 import { Editable } from './Editable.tsx'
 
 export interface StepRunState {
@@ -23,8 +36,10 @@ export interface StepActions {
   /** 把多行命令拆成多步：第一行留在这一步，其余各成一步。 */
   split(lines: string[]): void
   uploadImage(file: File): void
-  /** 委派给别人：生成对方的任务（需要团队同步）。 */
-  delegate(name: string): Promise<void>
+  /** 委派给别人：经团队服务派给对方（需要团队同步）。 */
+  delegate(input: { assigneeName: string; displayName?: string; note?: string }): Promise<void>
+  /** 命令里写了却没声明的参数：一键声明（值先空着）。 */
+  declareParams(names: string[]): void
 }
 
 interface Props {
@@ -48,8 +63,15 @@ interface Props {
   lessons?: { layer1: LessonView[]; layer2: LessonView[] }
   /** 挂在这一步上的捕获提议（失败后修好 / 偏离底稿）。 */
   offers?: LessonOfferView[]
-  /** 全局"只看主线"：藏起第一二层，失败时照常浮出。 */
-  mainlineOnly?: boolean
+  /** 发起人/同事在这一步上的评论。 */
+  comments?: Event[]
+  /** 委派出去的步骤：交给了谁、对方进度。 */
+  delegation?: Delegation | undefined
+  /** wait 步骤"盯着"时的最近一次探测。 */
+  probe?: { attempt: number; detail: string } | undefined
+  /** 团队里的人（委派选人）；没配团队时为空。 */
+  teamUsers?: TeamUser[]
+  teamEnabled?: boolean
   actions: StepActions
   onFocus: () => void
   onChanged: () => void
@@ -98,7 +120,7 @@ function SectionHead({ step, current, autoEdit, canMove, actions, onFocus }: Pro
   )
 }
 
-function StepBody({ step, current, runState, evidence, params, fidelity, job, lastEdit, autoEdit, canMove, lessons, offers, mainlineOnly, actions, onFocus, onChanged }: Props) {
+function StepBody({ step, current, runState, evidence, params, fidelity, job, lastEdit, autoEdit, canMove, lessons, offers, comments, delegation, probe, teamUsers, teamEnabled, actions, onFocus, onChanged }: Props) {
   const [confirmed, setConfirmed] = useState(false)
   const [danger, setDanger] = useState<string[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -173,6 +195,8 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
   // 缺值与写错名字的（未声明）参数都挡运行
   const blockedParams = [...rendered.missing, ...rendered.undeclared]
   const badge = originBadge(step, lastEdit)
+  // wait 步骤带就绪条件：运行即"运行并盯着"，就绪了自动打勾
+  const isWatch = step.kind === 'wait' && step.probe !== null
 
   // 委派步骤：显示对方进度，不显示命令/输出
   if (step.kind === 'delegate') {
@@ -182,13 +206,16 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
           <span className={`step-mark ${markClass(step, running)}`}>{mark(step, running)}</span>
           <span className="step-title">{step.title}</span>
           <span className="step-hint">{hintTail(step, runState)}</span>
-          <MoreMenu step={step} canMove={canMove} actions={actions} />
+          <MoreMenu step={step} canMove={canMove} actions={actions} delegated={delegation !== undefined} />
         </div>
         {step.whyMd !== null && <div className="step-why">{step.whyMd}</div>}
         <div className="step-body">
-          <div className="cmd-note">
-            → 已委派{step.delegateTaskId !== null ? '（对方引擎在执行，进度会出现在这里）' : '（未连接——需要配置「设置 · 团队」）'}
-          </div>
+          <DelegationRow
+            step={step}
+            delegation={delegation}
+            displayName={teamUsers?.find((u) => u.name === delegation?.assigneeName)?.displayName ?? delegation?.assigneeName ?? ''}
+          />
+          <StepComments comments={comments} />
         </div>
       </div>
     )
@@ -223,6 +250,11 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
             {badge.label}
           </span>
         )}
+        {step.shareOutput && (
+          <span className="origin-badge" title="这一步的最新输出（脱敏、截尾 4KB）会随同步给发起人看">
+            输出已共享
+          </span>
+        )}
         <span className="step-hint">
           <Editable
             value={step.expectedMinutes === null ? '' : String(step.expectedMinutes)}
@@ -238,7 +270,14 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
           />
           {hintTail(step, runState)}
         </span>
-        <MoreMenu step={step} canMove={canMove} actions={actions} onRecordLesson={() => setShowLessonForm(true)} />
+        <MoreMenu
+          step={step}
+          canMove={canMove}
+          actions={actions}
+          onRecordLesson={() => setShowLessonForm(true)}
+          teamUsers={teamUsers ?? []}
+          teamEnabled={teamEnabled === true}
+        />
       </div>
 
       <div className="step-why">
@@ -277,7 +316,7 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
                     }}
                     disabled={running || (isDangerous && !confirmed) || blockedParams.length > 0}
                   >
-                    {running ? '运行中' : '▶ 运行'}
+                    {running ? (isWatch ? '盯着中' : '运行中') : isWatch ? '▶ 运行并盯着' : '▶ 运行'}
                   </button>
                   <button
                     className="btn"
@@ -293,8 +332,18 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
             </div>
 
             {step.command !== null && blockedParams.length > 0 && (
-              <div className="cmd-note">
-                {rendered.undeclared.length > 0 ? '未声明的参数（模板写错了名字）' : '缺参数'}：{blockedParams.join('、')} —— 在上面的参数面板里补上
+              <div className="cmd-note" onClick={(e) => e.stopPropagation()}>
+                {rendered.undeclared.length > 0 ? (
+                  <>
+                    命令里用到了还没声明的参数：{rendered.undeclared.join('、')}{' '}
+                    <button className="btn ghost" onClick={() => actions.declareParams(rendered.undeclared)}>
+                      声明为参数
+                    </button>
+                    （声明后在上面的参数面板里填值）
+                  </>
+                ) : (
+                  <>缺参数：{rendered.missing.join('、')} —— 在上面的参数面板里填上值</>
+                )}
               </div>
             )}
 
@@ -364,7 +413,6 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
             step={step}
             failed={step.status === 'failed' || runState?.verdict === 'fail'}
             data={lessons}
-            mainlineOnly={mainlineOnly === true}
             onChanged={onChanged}
           />
         )}
@@ -389,9 +437,31 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
         )}
 
         {step.probe !== null && (
-          <div className="expectation">
+          <div className="expectation" onClick={(e) => e.stopPropagation()}>
             <span className="label">就绪条件：</span>
             {describeProbe(step.probe)}
+            {running && probe !== undefined && (
+              <div className="probe-line">
+                QB 在盯着 · 第 {probe.attempt} 次探测：{probe.detail} · 你先看下一步
+              </div>
+            )}
+            {!running && step.status !== 'ok' && step.probe.kind !== 'logPattern' && (
+              <div className="probe-line">
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setError(null)
+                    api
+                      .watchStep(step.id)
+                      .then(onChanged)
+                      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+                  }}
+                >
+                  👀 只盯着
+                </button>{' '}
+                <span className="dim">命令在 SecureCRT/Xshell 里跑的话点这个：QB 在本机轮询，就绪了自动打勾</span>
+              </div>
+            )}
           </div>
         )}
 
@@ -467,6 +537,8 @@ function StepBody({ step, current, runState, evidence, params, fidelity, job, la
             )}
           </div>
         )}
+
+        <StepComments comments={comments} />
 
         {step.statusNote !== null && (step.status === 'skipped' || step.status === 'failed') && (
           <div className={`verdict ${step.status === 'failed' ? 'fail' : 'unclear'}`}>
@@ -552,7 +624,23 @@ function NoteForm({
 }
 
 /** ⋯ 菜单：不常用但要找得到的操作，都附上快捷键。 */
-function MoreMenu({ step, canMove, actions, onRecordLesson }: { step: Step; canMove: Record<MoveDirection, boolean>; actions: StepActions; onRecordLesson?: () => void }) {
+function MoreMenu({
+  step,
+  canMove,
+  actions,
+  onRecordLesson,
+  delegated = false,
+  teamUsers = [],
+  teamEnabled = false,
+}: {
+  step: Step
+  canMove: Record<MoveDirection, boolean>
+  actions: StepActions
+  onRecordLesson?: () => void
+  delegated?: boolean
+  teamUsers?: TeamUser[]
+  teamEnabled?: boolean
+}) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLSpanElement>(null)
 
@@ -596,8 +684,18 @@ function MoreMenu({ step, canMove, actions, onRecordLesson }: { step: Step; canM
           {!section && item('移进上一章', 'Tab', () => actions.move('indent'), canMove.indent)}
           {!section && item('移出章节', 'Shift+Tab', () => actions.move('outdent'), canMove.outdent)}
           {!section && onRecordLesson !== undefined && item('记个坑', '', onRecordLesson)}
-          {!section && step.delegateTaskId === null && (
-            <DelegateItem onDelegate={(name) => { setOpen(false); void actions.delegate(name) }} />
+          {!section &&
+            step.kind !== 'delegate' &&
+            item(step.shareOutput ? '✓ 输出共享给发起人（点击取消）' : '把输出共享给发起人', '', () => void actions.edit({ shareOutput: !step.shareOutput }))}
+          {!section && step.kind !== 'delegate' && !delegated && (
+            <DelegateItem
+              users={teamUsers}
+              enabled={teamEnabled}
+              onDelegate={(input) => {
+                setOpen(false)
+                void actions.delegate(input)
+              }}
+            />
           )}
           {!section && (
             <div className="menu-group">
@@ -645,19 +743,16 @@ function lessonTail(l: LessonView): string {
  * - 第一层：条件匹配的一行预警
  * - 第二层：条件不符/未验证/疑似过期的，折叠计数
  * - 第三层：失败时全部展开，带 [按这个修] [不是这个]
- * "只看主线"时藏起一二层，第三层照常浮出。
  */
 function LessonList({
   step,
   failed,
   data,
-  mainlineOnly,
   onChanged,
 }: {
   step: Step
   failed: boolean
   data: { layer1: LessonView[]; layer2: LessonView[] }
-  mainlineOnly: boolean
   onChanged: () => void
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
@@ -666,8 +761,6 @@ function LessonList({
   const [error, setError] = useState<string | null>(null)
 
   if (data.layer1.length === 0 && data.layer2.length === 0) return null
-  // 只看主线：平时藏一二层；失败时第三层照常
-  if (mainlineOnly && !failed) return null
 
   const act = async (id: string, fn: () => Promise<unknown>): Promise<void> => {
     setBusy(id)
@@ -1131,28 +1224,167 @@ function renderWithParams(template: string, params: Param[]): ReactNode {
   return <>{out}</>
 }
 
-/** 委派项：输入对方名字，一步搞定。 */
-function DelegateItem({ onDelegate }: { onDelegate: (name: string) => void }) {
+/** 委派项：从团队成员里选人，可以交代一句。 */
+function DelegateItem({
+  users,
+  enabled,
+  onDelegate,
+}: {
+  users: TeamUser[]
+  enabled: boolean
+  onDelegate: (input: { assigneeName: string; displayName?: string; note?: string }) => void
+}) {
   const [name, setName] = useState('')
+  const [note, setNote] = useState('')
+  if (!enabled) {
+    return (
+      <div className="delegate-item dim" style={{ padding: '4px 8px' }}>
+        委派给别人需要团队服务（设置 · 团队）
+      </div>
+    )
+  }
+  const chosen = users.find((u) => u.name === name)
+  const submit = (): void => {
+    if (chosen === undefined) return
+    onDelegate({ assigneeName: chosen.name, displayName: chosen.displayName, ...(note.trim() !== '' ? { note: note.trim() } : {}) })
+  }
   return (
-    <div className="delegate-item" style={{ padding: '4px 8px' }}>
-      <span className="dim" style={{ fontSize: 12 }}>委派给（团队服务里的名字）</span>
-      <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+    <div className="delegate-item" style={{ padding: '4px 8px' }} onKeyDown={(e) => e.stopPropagation()}>
+      <span className="dim" style={{ fontSize: 12 }}>委派给</span>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 2 }}>
+        <select value={name} onChange={(e) => setName(e.target.value)} style={{ fontSize: 12 }}>
+          <option value="">选一个人…</option>
+          {users.map((u) => (
+            <option key={u.name} value={u.name}>
+              {u.displayName}（手上 {u.taskCount} 个任务）
+            </option>
+          ))}
+        </select>
         <input
           className="inline-edit"
-          placeholder="如 laowang"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
+          placeholder="交代一句（可选）"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
           onKeyDown={(e) => {
-            e.stopPropagation()
-            if (e.key === 'Enter' && name.trim() !== '') onDelegate(name.trim())
+            if (e.key === 'Enter') submit()
           }}
-          style={{ flex: 1, fontSize: 12 }}
+          style={{ fontSize: 12 }}
         />
-        <button className="btn ghost" disabled={name.trim() === ''} onClick={() => onDelegate(name.trim())}>
-          委派
+        <button className="btn primary" disabled={chosen === undefined} onClick={submit}>
+          委派给{chosen?.displayName ?? '…'}
         </button>
       </div>
+    </div>
+  )
+}
+
+/** 委派行：交给了谁、对方做到第几步、有没有卡住；可以打开对方的 runbook、留言。 */
+function DelegationRow({ step, delegation, displayName }: { step: Step; delegation: Delegation | undefined; displayName: string }) {
+  const [mirror, setMirror] = useState<{ data: DelegationMirror | null; note?: string } | null>(null)
+  const [comment, setComment] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  if (delegation === undefined) {
+    return <div className="cmd-note">这一步是委派类型，但没有委派记录（旧数据）——可以改回普通步骤再重新委派。</div>
+  }
+  const statusText =
+    step.status === 'ok'
+      ? '已完成'
+      : step.status === 'failed'
+        ? '没做成'
+        : delegation.status === 'blocked'
+          ? '卡住了'
+          : delegation.status === 'draft'
+            ? '还没开始'
+            : '进行中'
+  const open = (): void => {
+    setError(null)
+    api
+      .delegationMirror(step.id)
+      .then((r) => setMirror({ data: r.mirror, ...(r.note !== undefined ? { note: r.note } : {}) }))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+  }
+  const send = (): void => {
+    if (comment.trim() === '') return
+    setBusy(true)
+    setError(null)
+    api
+      .delegationComment(step.id, comment.trim())
+      .then(() => setComment(''))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <div className="delegation-row" onClick={(e) => e.stopPropagation()}>
+      <div>
+        <span className={`gem ${delegation.worstAlert === 'red' ? 'stuck' : delegation.worstAlert === 'yellow' ? 'wobble' : 'ok'}`}>
+          {delegation.worstAlert === 'red' ? '○' : delegation.worstAlert === 'yellow' ? '◐' : '●'}
+        </span>{' '}
+        {displayName} · {statusText}
+        {delegation.total > 0 && ` · ${delegation.done}/${delegation.total} 步`}
+        {delegation.worstAlert === 'red' && <span className="verdict fail"> · 对方卡住了，需要你看一眼</span>}
+        <span className="dim"> · 更新于 {new Date(delegation.updatedAt).toLocaleTimeString('zh-CN')}</span>
+      </div>
+      <div className="step-actions">
+        <button className="btn" onClick={open}>
+          打开对方 runbook
+        </button>
+        <input
+          className="inline-edit"
+          placeholder="给对方留言（会出现在对方的时间线里）"
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation()
+            if (e.key === 'Enter') send()
+          }}
+          style={{ flex: 1, fontSize: 12.5 }}
+        />
+        <button className="btn ghost" disabled={busy || comment.trim() === ''} onClick={send}>
+          留言
+        </button>
+      </div>
+      {error !== null && <div className="verdict fail">{error}</div>}
+      {mirror !== null && (
+        <div className="mirror">
+          {mirror.data === null ? (
+            <div className="dim">{mirror.note ?? '对方还没同步上来'}</div>
+          ) : (
+            <>
+              <div className="dim">
+                {mirror.data.task.assigneeName} 的 runbook（只读）{' '}
+                <button className="btn ghost" onClick={() => setMirror(null)}>
+                  收起
+                </button>
+              </div>
+              {mirror.data.steps.length === 0 && <div className="dim">对方还没写 runbook。</div>}
+              {mirror.data.steps.map((s) => (
+                <div key={s.id} className={`mirror-step${s.parentId !== null ? ' depth-1' : ''}`}>
+                  <span className="step-mark">{s.kind === 'note' ? '§' : mark({ status: s.status } as Step, false)}</span> {s.title}
+                  {s.statusNote !== null && <span className="dim"> —— {s.statusNote}</span>}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 这一步上的评论（发起人/同事在远程界面针对这一步说的话）。 */
+function StepComments({ comments }: { comments: Event[] | undefined }) {
+  if (comments === undefined || comments.length === 0) return null
+  return (
+    <div className="step-comments">
+      {comments.map((c) => (
+        <div key={c.id} className="remote-comment">
+          <strong>{typeof c.payload.author === 'string' && c.payload.author !== '' ? c.payload.author : '发起人'}</strong>：
+          {typeof c.payload.body === 'string' ? c.payload.body : ''}
+          <span className="dim"> · {new Date(c.createdAt).toLocaleTimeString('zh-CN')}</span>
+        </div>
+      ))}
     </div>
   )
 }

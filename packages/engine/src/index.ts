@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { AlertThresholds } from '@qb/core'
 import { openDb, Store } from '@qb/store'
 import { createDshHostPort, type DshContext } from './dsh/host-port.ts'
 import { collectEnvironment } from './agent/environment.ts'
@@ -61,17 +62,25 @@ export function apply(ctx: DshContext, config: Config): void {
     adapt: readPrompt('adapt.md'),
   }
 
+  // 运行中步骤的最近输出时间：api 写、sync 读（失控告警分清"在跑"和"卡死"）
+  const activity = new Map<string, number>()
+
   // M8：团队同步（见下方 interval 注释）。
   const team = new TeamSettings(store)
   const sync = createSync({
     store,
     userName: () => config.userName ?? 'me',
+    currentUserId: () => me.id,
     broadcast: (data) => ws.broadcast(data),
     log: (msg) => console.warn(`[qb] ${msg}`),
+    lastOutputAt: () => activity,
+    thresholds: alertThresholdsFromEnv(process.env),
   })
   // 2 秒一拍：方案验收要求"PL 的评论 2 秒内到达执行者"。
   // 无上行时是 pull-only（很轻），这个频率没有负担。
   ctx.setInterval(() => sync.pushNow(), 2000)
+  // 告警定时重算：人卡住不动时没有事件，停滞/失控/没有动静只能靠它发现
+  ctx.setInterval(() => sync.evaluateNow(), positiveInt(process.env.QB_ALERT_EVAL_MS) ?? 30_000)
 
   const api = buildApi({
     host,
@@ -86,6 +95,7 @@ export function apply(ctx: DshContext, config: Config): void {
     attachments,
     guard,
     team: { settings: team, sync },
+    activity,
   })
 
   ctx.webServer.register({ kind: 'prefix', path: `${mount}/api`, handler: api.handle })
@@ -115,4 +125,30 @@ export function apply(ctx: DshContext, config: Config): void {
 
 function readPrompt(name: string): string {
   return readFileSync(join(HERE, '..', 'prompts', name), 'utf8')
+}
+
+function positiveInt(v: string | undefined): number | undefined {
+  const n = v === undefined ? NaN : Number(v)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+ * 告警阈值的环境变量覆盖（默认值见 @qb/core 的 DEFAULT_THRESHOLDS）。
+ * 主要给 e2e 用短阈值；团队想调整默认节奏也走这里。
+ */
+function alertThresholdsFromEnv(env: NodeJS.ProcessEnv): Partial<AlertThresholds> {
+  const out: Partial<AlertThresholds> = {}
+  const set = <K extends keyof AlertThresholds>(key: K, name: string): void => {
+    const n = positiveInt(env[name])
+    if (n !== undefined) out[key] = n as AlertThresholds[K]
+  }
+  set('failStreak', 'QB_ALERT_FAIL_STREAK')
+  set('stalledAfterMs', 'QB_ALERT_STALLED_MS')
+  set('runAwayFactor', 'QB_ALERT_RUNAWAY_FACTOR')
+  set('runAwayNoOutputMs', 'QB_ALERT_RUNAWAY_NO_OUTPUT_MS')
+  set('stepOvertimeFactor', 'QB_ALERT_STEP_OVERTIME')
+  set('taskOvertimeFactor', 'QB_ALERT_TASK_OVERTIME')
+  set('idleMs', 'QB_ALERT_IDLE_MS')
+  set('notStartedMs', 'QB_ALERT_NOT_STARTED_MS')
+  return out
 }

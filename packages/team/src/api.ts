@@ -59,17 +59,21 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
       .safeParse(body)
     if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') }, 400)
 
+    const existing = store.userByName(parsed.data.name)
+    // 已经有令牌的名字不能再注册；没有令牌的是"别人把他写成了发起人"时
+    // 自动建的占位——本人拿邀请进来就认领它，之前挂在这个名字上的任务
+    // 和告警一并归他（原先这里一律报"名字已被用"，PL 反而注册不进来）
+    if (existing !== null && store.hasToken(existing.id)) {
+      return c.json({ error: 'bad_request', message: '这个名字已经被用了' }, 400)
+    }
     try {
       store.consumeInvite(parsed.data.invite)
     } catch (e) {
       return c.json({ error: 'bad_invite', message: e instanceof Error ? e.message : String(e) }, 400)
     }
-    if (store.userByName(parsed.data.name) !== null) {
-      return c.json({ error: 'bad_request', message: '这个名字已经被用了' }, 400)
-    }
-    const user = store.createUser(parsed.data.name)
+    const user = existing ?? store.createUser(parsed.data.name)
     const token = store.issueToken(user.id)
-    return c.json({ user, token }, 201)
+    return c.json({ user, token, ...(existing !== null ? { claimed: true } : {}) }, 201)
   })
 
   app.get('/api/me', (c) => c.json(c.get('user')))
@@ -114,6 +118,9 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
               statusNote: z.string().nullable(),
               // 步骤血缘（M9）：坑按它路由给同血缘的执行者
               lineageKey: z.string().nullable().optional(),
+              // 执行者开了"共享输出"的步骤带最新输出。原先这里漏了，zod 默认剥掉
+              // 未知键，远程的"他共享的输出"从来没显示过（§9 同步契约）
+              lastOutput: z.string().max(8192).nullable().optional(),
             }),
           )
           .optional(),
@@ -199,7 +206,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   // ── 远程 UI（发起人视角）───────────────────────────────
 
   app.get('/api/overview', (c) => {
-    const me = c.get('user').name
+    const me = c.get('user')
     return c.json({
       initiated: store.listTasks('related', me),
       assigned: store.listTasks('assigned', me),
@@ -210,7 +217,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   app.get('/api/tasks/:id', (c) => {
     const id = c.req.param('id')
     const task = store.taskById(id)
-    if (task === null) return c.json({ error: 'not_found' }, 404)
+    if (task === null || !store.canView(id, c.get('user'))) return c.json({ error: 'not_found' }, 404) // 看不到的按不存在处理，不泄露 id 是否存在
     return c.json({
       task,
       steps: store.stepsOf(id),
@@ -223,7 +230,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
 
   app.post('/api/tasks/:id/comments', async (c) => {
     const id = c.req.param('id')
-    if (store.taskById(id) === null) return c.json({ error: 'not_found' }, 404)
+    if (store.taskById(id) === null || !store.canView(id, c.get('user'))) return c.json({ error: 'not_found' }, 404) // 看不到的按不存在处理，不泄露 id 是否存在
     const body = await c.req.json().catch(() => ({}))
     const parsed = z.object({ stepId: z.string().nullable().optional(), body: z.string().trim().min(1, '评论不能为空').max(4000) }).safeParse(body)
     if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') }, 400)
@@ -237,6 +244,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
     const body = await c.req.json().catch(() => ({}))
     const parsed = z.object({ answer: z.string().trim().min(1, '回答不能为空').max(4000) }).safeParse(body)
     if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') }, 400)
+    const question = store.questionById(id)
+    if (question === null || !store.canView(question.taskId, c.get('user'))) return c.json({ error: 'not_found' }, 404) // 看不到的按不存在处理，不泄露 id 是否存在
     try {
       const q = store.answerQuestion(id, parsed.data.answer, c.get('user'))
       opts.onAnswer?.(q.taskId)
@@ -248,6 +257,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
 
   app.post('/api/alerts/:key/ack', (c) => {
     const key = c.req.param('key')
+    const alert = store.alertByKey(key)
+    if (alert === undefined || !store.canView(alert.taskId, c.get('user'))) return c.json({ error: 'not_found' }, 404) // 看不到的按不存在处理，不泄露 id 是否存在
     try {
       const alert = store.ackAlert(key, c.get('user'))
       opts.onAck?.(alert.taskId)
@@ -336,7 +347,11 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
 
   const requireAdmin = (c: { get(k: 'user'): { isAdmin: boolean } }): boolean => c.get('user').isAdmin
 
-  app.get('/api/push/channels', (c) => c.json({ channels: store.listChannels() }))
+  // 渠道配置里有 webhook 地址和命令行，只给管理员看
+  app.get('/api/push/channels', (c) => {
+    if (!requireAdmin(c)) return c.json({ error: 'forbidden', message: '只有管理员能查看推送渠道' }, 403)
+    return c.json({ channels: store.listChannels() })
+  })
 
   // ── 远程派任务（PL → 执行者）─────────────────────────────
   app.get('/api/users', (c) => c.json({ users: store.listUsers() }))

@@ -24,7 +24,9 @@ import {
   type PurposeStatus,
   type ServerEvent,
   type StepPatchInput,
+  type SyncStatus,
   type TaskDetail,
+  type TeamUser,
 } from './api.ts'
 import { StepCell, formatMs, type StepActions, type StepRunState } from './StepCell.tsx'
 import { Settings } from './Settings.tsx'
@@ -48,8 +50,11 @@ export function App() {
   const [view, setView] = useState<'task' | 'settings'>('task')
   const [detail, setDetail] = useState<TaskDetail | null>(null)
   const [runStates, setRunStates] = useState<Record<string, StepRunState>>({})
-  const [focusMode, setFocusMode] = useState(false)
+  // wait 步骤"盯着"时每一步最近一次探测（step.probe）
+  const [probes, setProbes] = useState<Record<string, { attempt: number; detail: string }>>({})
   const [currentStepId, setCurrentStepId] = useState<string | null>(null)
+  // 窄屏（和终端并排）时侧栏收成抽屉
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   // QB 的后台任务（起草、看截图、测试连接），按关联实体索引。慢调用不阻塞界面，靠 WS 回报进度。
   const [jobs, setJobs] = useState<Record<string, Job>>({})
   // 起草时流式到达的步骤预览
@@ -59,10 +64,11 @@ export function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const [llmStatus, setLlmStatus] = useState<PurposeStatus | null>(null)
   const [teamEnabled, setTeamEnabled] = useState(false)
-  // 坑（M9）：步骤 → 两层坑；待确认的捕获提议；只看主线开关
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [teamUsers, setTeamUsers] = useState<TeamUser[]>([])
+  // 坑（M9）：步骤 → 两层坑；待确认的捕获提议
   const [stepLessons, setStepLessons] = useState<Record<string, { layer1: LessonView[]; layer2: LessonView[] }>>({})
   const [lessonOffers, setLessonOffers] = useState<LessonOfferView[]>([])
-  const [mainlineOnly, setMainlineOnly] = useState(() => localStorage.getItem('qb-mainline-only') === '1')
   const history = useHistory()
 
   const detailRef = useRef<TaskDetail | null>(null)
@@ -108,7 +114,16 @@ export function App() {
       .catch(() => setLlmStatus(null))
     api
       .teamSettings()
-      .then((t) => setTeamEnabled(t.enabled))
+      .then((t) => {
+        setTeamEnabled(t.enabled)
+        setSyncStatus(t.enabled ? t.status : null)
+        if (!t.enabled) return
+        // 团队里的人：选发起人、委派给谁都从这里挑（原先手打名字，打错了对方永远收不到）
+        api
+          .teamUsers()
+          .then((r) => setTeamUsers(r.users))
+          .catch(() => undefined)
+      })
       .catch(() => setTeamEnabled(false))
   }, [])
 
@@ -122,6 +137,18 @@ export function App() {
     if (view === 'task') refreshLlm()
   }, [view, refreshLlm])
 
+  // 同步状态是真实的：推送失败（令牌、身份、网络）会显示出来，不再无条件"同步中"
+  useEffect(() => {
+    if (!teamEnabled) return
+    const t = setInterval(() => {
+      api
+        .teamSettings()
+        .then((s) => setSyncStatus(s.enabled ? s.status : null))
+        .catch(() => undefined)
+    }, 10_000)
+    return () => clearInterval(t)
+  }, [teamEnabled])
+
   useEffect(() => {
     setDetail(null)
     setStepLessons({})
@@ -129,13 +156,6 @@ export function App() {
     if (activeId === null) return
     void refreshDetail(activeId)
   }, [activeId, refreshDetail])
-
-  const toggleMainline = useCallback((): void => {
-    setMainlineOnly((v) => {
-      localStorage.setItem('qb-mainline-only', v ? '0' : '1')
-      return !v
-    })
-  }, [])
 
   // 事件流：步骤输出、完成、编辑、重规划、后台任务
   useEffect(() => {
@@ -182,6 +202,10 @@ export function App() {
           }))
           break
 
+        case 'step.probe':
+          setProbes((p) => ({ ...p, [e.stepId]: { attempt: e.attempt, detail: e.detail } }))
+          break
+
         case 'runbook.updated':
           setPartials((p) => ({ ...p, [e.taskId]: [] }))
           refreshIfActive(e.taskId)
@@ -211,11 +235,13 @@ export function App() {
   const steps = detail?.steps ?? []
   const runbook = detail?.runbook ?? null
 
-  // 当前步：优先第一个在跑的、再是第一个没做的（章节标题不算），用户点击可覆盖
+  // 当前步：优先第一个在跑的、再是第一个没做的（章节标题不算），用户点击可覆盖。
+  // QB 在盯着的 wait 步骤、交给别人的委派步骤不占"当前"——"我盯着，你先看下一步"
   const autoCurrent = useMemo(
     () =>
-      steps.find((s) => s.status === 'running') ??
+      steps.find((s) => s.status === 'running' && s.kind !== 'wait' && s.kind !== 'delegate') ??
       steps.find((s) => s.status === 'pending' && !isSection(s)) ??
+      steps.find((s) => s.status === 'running') ??
       steps.find((s) => !isSection(s)),
     [steps],
   )
@@ -472,20 +498,36 @@ export function App() {
     }
   }, [history, toast])
 
-  /** 委派：把这步变成 delegate + 派一个子任务给对方（经团队服务）。 */
+  /** 委派：经团队服务派给对方，这一步变成委派行（引擎一次做完，派不出去就什么都不改）。 */
   const delegateStep = useCallback(
-    async (step: Step, name: string): Promise<void> => {
+    async (step: Step, input: { assigneeName: string; displayName?: string; note?: string }): Promise<void> => {
       try {
-        await withFreshRev(step.id, (rev) =>
-          api.updateStep(step.id, rev, { kind: 'delegate', title: `→ ${name}: ${step.title}` }),
-        )
-        await api.delegateStep(step.id, name)
+        await api.delegateStep(step.id, input)
+        toast(`已委派给${input.displayName ?? input.assigneeName}：对方几秒内收到，进度会出现在这一步上`)
         await reload()
       } catch (e) {
         toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
       }
     },
-    [withFreshRev, reload, toast],
+    [reload, toast],
+  )
+
+  /** 命令里写了却没声明的参数：一键加进参数表（值先空着，运行前填）。 */
+  const declareParams = useCallback(
+    async (names: string[]): Promise<void> => {
+      const d = detailRef.current
+      if (d === null || d.runbook === null) return
+      const have = new Set(d.runbook.params.map((p) => p.name))
+      const next = [...d.runbook.params, ...names.filter((n) => !have.has(n)).map((name) => ({ name, value: '', source: 'mine' as const, secret: false }))]
+      try {
+        await api.updateParams(d.task.id, next)
+        toast(`已声明 ${names.join('、')}，在参数面板里填上值就能运行`)
+        await reload()
+      } catch (e) {
+        toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+      }
+    },
+    [reload, toast],
   )
 
   const actionsFor = useCallback(
@@ -497,9 +539,10 @@ export function App() {
       setStatus: (status, note) => void setStatus(step, status, note),
       split: (lines) => void splitStep(step, lines),
       uploadImage: (file) => void uploadImage(step, file),
-      delegate: (name) => delegateStep(step, name),
+      delegate: (input) => delegateStep(step, input),
+      declareParams: (names) => void declareParams(names),
     }),
-    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage, delegateStep],
+    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage, delegateStep, declareParams],
   )
 
   // ── 键盘与粘贴 ───────────────────────────────────────────────
@@ -521,10 +564,6 @@ export function App() {
       }
       if (e.ctrlKey || e.metaKey) return
 
-      if (e.key === 'f') {
-        setFocusMode((v) => !v)
-        return
-      }
       if (e.key === 'j' || e.key === 'k') {
         const idx = steps.findIndex((s) => s.id === currentId)
         const next = e.key === 'j' ? idx + 1 : idx - 1
@@ -565,9 +604,18 @@ export function App() {
     return () => document.removeEventListener('paste', onPaste)
   }, [view, current, uploadImage])
 
+  const openTask = (id: string): void => {
+    setView('task')
+    setActiveId(id)
+    setCurrentStepId(null)
+    setSidebarOpen(false)
+  }
+  const ongoing = tasks.filter((t) => t.status !== 'done' && t.status !== 'abandoned')
+  const finished = tasks.filter((t) => t.status === 'done' || t.status === 'abandoned')
+
   return (
     <div className="app">
-      <aside className="sidebar">
+      <aside className={`sidebar${sidebarOpen ? ' open' : ''}`}>
         <div className="sidebar-head">
           <span className="brand">QB</span>
           <span style={{ flex: 1 }} />
@@ -577,34 +625,38 @@ export function App() {
             onClick={() => {
               setView('task')
               setActiveId(null)
+              setSidebarOpen(false)
             }}
           >
             ＋
           </button>
+          <button className="btn ghost drawer-close" title="收起" onClick={() => setSidebarOpen(false)}>
+            ✕
+          </button>
         </div>
         <div className="task-list">
-          {tasks.map((t) => (
-            <button
-              key={t.id}
-              className={`task-item${t.id === activeId && view === 'task' ? ' active' : ''}`}
-              onClick={() => {
-                setView('task')
-                setActiveId(t.id)
-                setCurrentStepId(null)
-              }}
-            >
-              <span className={`gem ${gemClass(t)}`}>{gem(t)}</span>
-              <span className="title">{t.title}</span>
-            </button>
+          {ongoing.map((t) => (
+            <TaskItem key={t.id} task={t} active={t.id === activeId && view === 'task'} onOpen={() => openTask(t.id)} />
           ))}
+          {ongoing.length === 0 && <p className="dim" style={{ padding: '6px 9px' }}>没有进行中的任务。</p>}
+          {finished.length > 0 && <FinishedTasks tasks={finished} activeId={view === 'task' ? activeId : null} onOpen={openTask} />}
         </div>
         <div className="sidebar-foot">
-          <button className={`btn ghost${view === 'settings' ? ' on' : ''}`} onClick={() => setView('settings')}>
+          <button className={`btn ghost${view === 'settings' ? ' on' : ''}`} onClick={() => { setView('settings'); setSidebarOpen(false) }}>
             ⚙ 设置
           </button>
           {llmStatus !== null && !llmStatus.ok && (
             <span className="verdict unclear" style={{ fontSize: 12 }}>
               还没配置模型
+            </span>
+          )}
+          {teamEnabled && syncStatus !== null && (
+            <span
+              className={`verdict ${syncStatus.ok === false ? 'fail' : 'pass'}`}
+              style={{ fontSize: 12 }}
+              title={syncStatus.detail}
+            >
+              {syncStatus.ok === false ? `团队同步失败：${syncStatus.detail}` : syncStatus.ok === true ? '团队：已同步' : '团队：连接中…'}
             </span>
           )}
         </div>
@@ -614,6 +666,9 @@ export function App() {
         <Settings jobs={jobs} />
       ) : activeId === null ? (
         <NewTask
+          teamUsers={teamUsers}
+          teamEnabled={teamEnabled}
+          onOpenNav={() => setSidebarOpen(true)}
           onCreated={async (task) => {
             await refreshTasks()
             setActiveId(task.id)
@@ -628,25 +683,27 @@ export function App() {
           partial={partials[detail.task.id] ?? []}
           llmStatus={llmStatus}
           runStates={runStates}
+          probes={probes}
           currentId={currentId}
           editTarget={editTarget}
-          focusMode={focusMode}
           actionsFor={actionsFor}
-          onToggleFocus={() => setFocusMode((v) => !v)}
           onSelectStep={(id) => {
             setCurrentStepId(id)
             if (id !== editTarget) setEditTarget(null)
           }}
           onInsert={(pos) => void insertAt(pos)}
           onDrop={(dragged, target) => void moveTo(dragged, dropPosition(steps, target, dragged))}
-          onChanged={() => void reload()}
+          onChanged={() => {
+            void reload()
+            void refreshTasks()
+          }}
           onOpenSettings={() => setView('settings')}
+          onOpenNav={() => setSidebarOpen(true)}
           teamEnabled={teamEnabled}
+          teamUsers={teamUsers}
           toast={toast}
           lessons={stepLessons}
           offers={lessonOffers}
-          mainlineOnly={mainlineOnly}
-          onToggleMainline={toggleMainline}
         />
       )}
 
@@ -680,24 +737,25 @@ interface TaskPageProps {
   partial: PartialStep[]
   llmStatus: PurposeStatus | null
   runStates: Record<string, StepRunState>
+  /** wait 步骤"盯着"时每一步最近一次探测。 */
+  probes: Record<string, { attempt: number; detail: string }>
   currentId: string | null
   editTarget: string | null
-  focusMode: boolean
   actionsFor: (step: Step) => StepActions
-  onToggleFocus: () => void
   onSelectStep: (id: string) => void
   onInsert: (pos: Position) => void
   onDrop: (dragged: Step, target: Step) => void
   onChanged: () => void
   onOpenSettings: () => void
+  /** 窄屏：打开任务列表抽屉。 */
+  onOpenNav: () => void
   /** 配好团队服务时"问发起人"走真实发送。 */
   teamEnabled: boolean
+  teamUsers: TeamUser[]
   toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
-  /** M9：步骤 → 两层坑；待确认提议；只看主线。 */
+  /** M9：步骤 → 两层坑；待确认提议。 */
   lessons: Record<string, { layer1: LessonView[]; layer2: LessonView[] }>
   offers: LessonOfferView[]
-  mainlineOnly: boolean
-  onToggleMainline: () => void
 }
 
 function TaskPage({
@@ -706,22 +764,21 @@ function TaskPage({
   partial,
   llmStatus,
   runStates,
+  probes,
   currentId,
   editTarget,
-  focusMode,
   actionsFor,
-  onToggleFocus,
   onSelectStep,
   onInsert,
   onDrop,
   onChanged,
   onOpenSettings,
+  onOpenNav,
   teamEnabled,
+  teamUsers,
   toast,
   lessons,
   offers,
-  mainlineOnly,
-  onToggleMainline,
 }: TaskPageProps) {
   const { task, runbook, steps } = detail
   const currentRef = useRef<HTMLDivElement>(null)
@@ -732,6 +789,11 @@ function TaskPage({
   const [transcriptOpen, setTranscriptOpen] = useState(false)
   const [askOpen, setAskOpen] = useState(false)
   const [retroOpen, setRetroOpen] = useState(false)
+  const [blockedOpen, setBlockedOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
+  // 窄屏（和 SecureCRT 并排）时大纲与 QB 面板收成抽屉
+  const [outlineOpen, setOutlineOpen] = useState(false)
+  const [panelOpen, setPanelOpen] = useState(false)
 
   useEffect(() => {
     currentRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -739,7 +801,9 @@ function TaskPage({
 
   const real = steps.filter((s) => !isSection(s))
   const done = real.filter((s) => s.status === 'ok' || s.status === 'skipped').length
-  const visible = focusMode ? steps.filter((s) => s.id === currentId) : steps
+  const ended = task.status === 'done' || task.status === 'abandoned'
+  // 每一步都做完了（或跳过），任务却还没完成：提示一句，完成即复盘
+  const allDone = real.length > 0 && done === real.length && !ended
   const startJob = jobs[task.id]
   const draftJob = startJob?.kind === 'draft' ? startJob : undefined
   const importJob = startJob?.kind === 'import' ? startJob : undefined
@@ -766,9 +830,34 @@ function TaskPage({
 
   const current = steps.find((s) => s.id === currentId) ?? null
 
+  // 每一步上的评论（发起人在远程界面针对某一步说的）
+  const commentsByStep = useMemo(() => {
+    const m: Record<string, Event[]> = {}
+    for (const e of detail.events) if (e.kind === 'comment' && e.stepId !== null) (m[e.stepId] ??= []).push(e)
+    return m
+  }, [detail.events])
+
+  const setStatus = (status: 'active' | 'blocked' | 'done' | 'abandoned', note?: string): void => {
+    api
+      .setTaskStatus(task.id, status, note)
+      .then(() => {
+        onChanged()
+        if (status === 'done') {
+          toast('任务完成了——看看这次有什么值得记下来的')
+          setRetroOpen(true)
+        } else if (status === 'blocked') {
+          toast(teamEnabled ? 'QB 会替你告诉发起人（带上原因）' : '已标记卡住（没配团队服务，发起人收不到）')
+        }
+      })
+      .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+  }
+
   return (
     <div className="task-page">
       <header className="task-header">
+        <button className="btn ghost nav-toggle" title="任务列表" onClick={onOpenNav}>
+          ☰
+        </button>
         <h1>{task.title}</h1>
         <span className="task-meta">
           <span className={`gem ${gemClass(task)}`}>{gem(task)}</span> {statusLabel(task)} · {done}/{real.length}
@@ -778,21 +867,83 @@ function TaskPage({
         <span className="task-meta keys" title="快捷键">
           / 插入 · Alt+↑↓ 移动 · Tab 进出章节 · Delete 删除 · Ctrl+Z 撤销
         </span>
-        <button className="btn ghost" onClick={onToggleFocus}>
-          {focusMode ? '退出专注 (f)' : '专注模式 (f)'}
-        </button>
-        <button className="btn ghost" title="藏起坑的预警和折叠行，失败时照常浮出" onClick={onToggleMainline}>
-          {mainlineOnly ? '⚠ 显示坑提示' : '只看主线'}
-        </button>
-        {(task.status === 'done' || offers.length > 0) && (
-          <button className="btn ghost" onClick={() => setRetroOpen(true)}>
-            复盘{offers.length > 0 ? `（${offers.length}）` : ''}
+        <div className="header-actions">
+          <button className="btn ghost outline-toggle" onClick={() => setOutlineOpen((v) => !v)}>
+            大纲
           </button>
-        )}
+          {!ended && (
+            <>
+              <button
+                className="btn"
+                title={teamEnabled ? 'QB 整理好求助发给发起人，回答会回到这一步' : '临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人'}
+                onClick={() => setAskOpen(true)}
+              >
+                问发起人{teamEnabled ? '' : '（复制到 IM）'}
+              </button>
+              {steps.length > 0 && (
+                <>
+                  <button className="btn" onClick={() => setSituationOpen(true)}>
+                    情况变了…
+                  </button>
+                  <button className="btn" onClick={() => setTranscriptOpen(true)} title="自己在外部终端里跑了几步？把整段输出贴进来，QB 按命令分回各步">
+                    贴终端记录
+                  </button>
+                </>
+              )}
+              {task.status === 'blocked' ? (
+                <button className="btn danger" title="不卡了，继续做" onClick={() => setStatus('active')}>
+                  继续
+                </button>
+              ) : (
+                <button className="btn" title="卡住了、在等别人：QB 会替你告诉发起人" onClick={() => setBlockedOpen(true)}>
+                  卡住了
+                </button>
+              )}
+              <button className={`btn${allDone ? ' primary' : ''}`} onClick={() => setStatus('done')}>
+                完成任务
+              </button>
+            </>
+          )}
+          {(ended || offers.length > 0) && (
+            <button className="btn ghost" onClick={() => setRetroOpen(true)}>
+              复盘{offers.length > 0 ? `（${offers.length}）` : ''}
+            </button>
+          )}
+          <span className="more">
+            <button className="btn ghost" title="更多" onClick={() => setMoreOpen((v) => !v)}>
+              ⋯
+            </button>
+            {moreOpen && (
+              <div className="menu" onMouseLeave={() => setMoreOpen(false)}>
+                {steps.length > 0 && !ended && <RedraftButton taskId={task.id} job={draftJob} asMenuItem />}
+                {!ended && (
+                  <button
+                    className="menu-item"
+                    onClick={() => {
+                      setMoreOpen(false)
+                      const why = window.prompt('放弃这个任务？可以写一句原因（发起人会看到）', '')
+                      if (why !== null) setStatus('abandoned', why)
+                    }}
+                  >
+                    放弃这个任务
+                  </button>
+                )}
+                {ended && (
+                  <button className="menu-item" onClick={() => { setMoreOpen(false); setStatus('active') }}>
+                    重新打开
+                  </button>
+                )}
+                <button className="menu-item panel-toggle" onClick={() => { setMoreOpen(false); setPanelOpen(true) }}>
+                  看 QB 时间线
+                </button>
+              </div>
+            )}
+          </span>
+        </div>
       </header>
 
-      <div className={`task-body${focusMode ? ' focus-mode' : ''}`}>
-        <nav className="outline">
+      <div className="task-body">
+        <nav className={`outline${outlineOpen ? ' open' : ''}`} onClick={() => setOutlineOpen(false)}>
           {steps.map((s) => (
             <button
               key={s.id}
@@ -867,7 +1018,38 @@ function TaskPage({
             />
           )}
 
-          {params.length > 0 && <ParamsPanel taskId={task.id} params={params} onChanged={onChanged} toast={toast} />}
+          {task.status === 'blocked' && (
+            <div className="banner danger">
+              {blockedNote(detail.events)}
+              {teamEnabled ? ' · QB 已替你告诉发起人。' : ' · 没配团队服务，发起人收不到——可以用"问发起人"复制求助发给他。'}
+              <button className="btn ghost" onClick={() => setStatus('active')}>
+                不卡了，继续
+              </button>
+            </div>
+          )}
+
+          {allDone && (
+            <div className="banner">
+              每一步都做完了。
+              <button className="btn primary" onClick={() => setStatus('done')}>
+                完成任务并复盘
+              </button>
+            </div>
+          )}
+
+          {ended && (
+            <div className="banner">
+              {task.status === 'done' ? '这个任务已经完成。' : '这个任务已经放弃。'}
+              <button className="btn ghost" onClick={() => setRetroOpen(true)}>
+                复盘
+              </button>
+              <button className="btn ghost" onClick={() => setStatus('active')}>
+                重新打开
+              </button>
+            </div>
+          )}
+
+          {runbook !== null && <ParamsPanel taskId={task.id} params={params} onChanged={onChanged} toast={toast} />}
 
           {/* 导入来的 runbook：保真概况一行（参数一改会跟着变） */}
           {detail.fidelity !== null && (
@@ -878,7 +1060,7 @@ function TaskPage({
             </div>
           )}
 
-          {runbook !== null && params.length === 0 && runbook.assumptions.length > 0 && (
+          {runbook !== null && runbook.assumptions.length > 0 && (
             <div className="assumptions">
               <h3>假设</h3>
               {runbook.assumptions.map((a) => (
@@ -905,7 +1087,7 @@ function TaskPage({
             />
           )}
 
-          {visible.map((s) => (
+          {steps.map((s) => (
             <div key={s.id} ref={s.id === currentId ? currentRef : undefined}>
               <StepCell
                 step={s}
@@ -920,24 +1102,33 @@ function TaskPage({
                 canMove={canMoveOf(s)}
                 lessons={lessons[s.id]}
                 offers={offers.filter((o) => o.stepId === s.id)}
-                mainlineOnly={mainlineOnly}
+                comments={commentsByStep[s.id]}
+                delegation={detail.delegations[s.id]}
+                probe={probes[s.id]}
+                teamUsers={teamUsers}
+                teamEnabled={teamEnabled}
                 actions={actionsFor(s)}
                 onFocus={() => onSelectStep(s.id)}
                 onChanged={onChanged}
               />
-              {!focusMode && <InsertBar onClick={() => onInsert(insertionAfter(s))} />}
+              <InsertBar onClick={() => onInsert(insertionAfter(s))} />
             </div>
           ))}
 
-          {runbook !== null && steps.length > 0 && !focusMode && (
+          {runbook !== null && steps.length > 0 && (
             <button className="btn ghost add-step" onClick={() => onInsert(insertionAtEnd(steps))}>
               ＋ 添加一步
             </button>
           )}
         </main>
 
-        <aside className="qb-panel">
-          <h2>QB</h2>
+        <aside className={`qb-panel${panelOpen ? ' open' : ''}`}>
+          <h2>
+            QB
+            <button className="btn ghost drawer-close" onClick={() => setPanelOpen(false)}>
+              ✕
+            </button>
+          </h2>
           <div className="qb-feed">
             {detail.events.length === 0 ? (
               <p style={{ color: 'var(--text-faint)' }}>还没有事件。</p>
@@ -946,35 +1137,43 @@ function TaskPage({
                 .slice()
                 .reverse()
                 .map((e) => (
-                  <div className="qb-msg" key={e.id}>
+                  <div className={`qb-msg${e.kind === 'alert_raised' ? ' raised' : ''}`} key={e.id}>
                     {eventText(e, steps)}
+                    {e.kind === 'alert_raised' && typeof e.payload.key === 'string' && !ended && (
+                      <div>
+                        <button
+                          className="btn ghost"
+                          title="30 分钟内这条不再推给发起人；到点还没解决会重新告诉他"
+                          onClick={() => {
+                            api
+                              .snoozeAlert(task.id, String(e.payload.key))
+                              .then(() => {
+                                toast('好，30 分钟内这条不再推给发起人')
+                                onChanged()
+                              })
+                              .catch((err: unknown) => toast(err instanceof Error ? err.message : String(err), { tone: 'error' }))
+                          }}
+                        >
+                          我能搞定，先别提醒他
+                        </button>
+                      </div>
+                    )}
                     <div className="when">{new Date(e.createdAt).toLocaleTimeString('zh-CN')}</div>
                   </div>
                 ))
             )}
           </div>
-          <div className="qb-actions">
-            <button
-              className="btn"
-              title={teamEnabled ? 'QB 整理好求助发给发起人，回答会回到这一步' : '临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人'}
-              onClick={() => setAskOpen(true)}
-            >
-              问发起人{teamEnabled ? '' : '（临时 · 复制到 IM）'}
-            </button>
-
-            {steps.length > 0 && (
-              <>
-                <button className="btn" onClick={() => setSituationOpen(true)}>
-                  情况变了…
-                </button>
-                <button className="btn" onClick={() => setTranscriptOpen(true)} title="自己在外部终端里跑了几步？把整段输出贴进来，QB 按命令分回各步">
-                  贴一段终端记录
-                </button>
-                <RedraftButton taskId={task.id} job={draftJob} />
-              </>
-            )}
-          </div>
         </aside>
+
+        {blockedOpen && (
+          <BlockedDialog
+            teamEnabled={teamEnabled}
+            onDone={(note) => {
+              setBlockedOpen(false)
+              if (note !== null) setStatus('blocked', note)
+            }}
+          />
+        )}
 
         {situationOpen && (
           <SituationDialog
@@ -1039,6 +1238,69 @@ function TaskPage({
       </div>
     </div>
   )
+}
+
+/** 卡住了：一句原因（可选）。QB 带着它替执行者告诉发起人。 */
+function BlockedDialog({ teamEnabled, onDone }: { teamEnabled: boolean; onDone: (note: string | null) => void }) {
+  const [note, setNote] = useState('')
+  const quick = ['在等权限/账号', '在等别人的回复', '环境坏了，自己修不了', '不知道下一步该怎么做']
+  return (
+    <div className="modal-backdrop" onClick={() => onDone(null)}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>卡住了</h3>
+        <p className="dim">
+          {teamEnabled ? 'QB 会马上替你告诉发起人（🔴），带上这句原因。' : '没配团队服务：会标记卡住，但发起人收不到。'}
+          之后你一跑步骤或贴输出，就自动算"不卡了"。
+        </p>
+        <div className="chip-row">
+          {quick.map((q) => (
+            <button key={q} className="chip" onClick={() => setNote(q)}>
+              {q}
+            </button>
+          ))}
+        </div>
+        <textarea autoFocus rows={2} placeholder="卡在哪了？（可选）" value={note} onChange={(e) => setNote(e.target.value)} />
+        <div className="row">
+          <button className="btn danger" onClick={() => onDone(note.trim())}>
+            {teamEnabled ? '告诉发起人' : '标记卡住'}
+          </button>
+          <button className="btn ghost" onClick={() => onDone(null)}>
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** 任务列表里的一项：灵魂宝石 + 标题。 */
+function TaskItem({ task, active, onOpen }: { task: Task; active: boolean; onOpen: () => void }) {
+  return (
+    <button className={`task-item${active ? ' active' : ''}${task.status === 'done' || task.status === 'abandoned' ? ' ended' : ''}`} onClick={onOpen}>
+      <span className={`gem ${gemClass(task)}`}>{gem(task)}</span>
+      <span className="title">{task.title}</span>
+    </button>
+  )
+}
+
+/** 已完成/放弃的任务折叠在列表底部（原先任务永远完成不了，列表只增不减）。 */
+function FinishedTasks({ tasks, activeId, onOpen }: { tasks: Task[]; activeId: string | null; onOpen: (id: string) => void }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <button className="lesson-fold" style={{ margin: '8px 0 2px' }} onClick={() => setOpen((v) => !v)}>
+        已结束 {tasks.length} 个 {open ? '▴' : '▸'}
+      </button>
+      {open && tasks.map((t) => <TaskItem key={t.id} task={t} active={t.id === activeId} onOpen={() => onOpen(t.id)} />)}
+    </>
+  )
+}
+
+/** 最近一次"卡住了"的原因（横幅显示）。 */
+function blockedNote(events: Event[]): string {
+  const last = [...events].reverse().find((e) => e.kind === 'task_blocked')
+  const note = typeof last?.payload.note === 'string' ? last.payload.note : ''
+  return note !== '' ? `卡住了：${note}` : '卡住了'
 }
 
 /** 问发起人：QB 代拟的正文（目标/命令/输出尾部/试过什么），可改可发。 */
@@ -1431,7 +1693,7 @@ function DraftPrompt({
 }
 
 /** 重新起草。旧版本会保留，不会丢。 */
-function RedraftButton({ taskId, job }: { taskId: string; job: Job | undefined }) {
+function RedraftButton({ taskId, job, asMenuItem = false }: { taskId: string; job: Job | undefined; asMenuItem?: boolean }) {
   const [error, setError] = useState<string | null>(null)
   const running = job?.status === 'running'
   const elapsed = useElapsed(running ? job!.startedAt : null)
@@ -1439,7 +1701,7 @@ function RedraftButton({ taskId, job }: { taskId: string; job: Job | undefined }
   return (
     <>
       <button
-        className="btn ghost"
+        className={asMenuItem ? 'menu-item' : 'btn ghost'}
         disabled={running}
         onClick={() => {
           setError(null)
@@ -1459,21 +1721,35 @@ function RedraftButton({ taskId, job }: { taskId: string; job: Job | undefined }
 
 // ── 新任务 ────────────────────────────────────────────────────
 
-function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }) {
+function NewTask({
+  onCreated,
+  teamUsers,
+  teamEnabled,
+  onOpenNav,
+}: {
+  onCreated: (t: Task) => void | Promise<void>
+  teamUsers: TeamUser[]
+  teamEnabled: boolean
+  onOpenNav: () => void
+}) {
   const [title, setTitle] = useState('')
   const [brief, setBrief] = useState('')
   const [material, setMaterial] = useState('')
   const [initiator, setInitiator] = useState('')
   const [busy, setBusy] = useState(false)
+  // 发起人必须是团队里的名字：原先手打，打错了（或打成显示名）发起人永远看不到这个任务
+  const matched = teamUsers.find((u) => u.name === initiator.trim() || u.displayName === initiator.trim())
+  const unknownInitiator = teamEnabled && initiator.trim() !== '' && teamUsers.length > 0 && matched === undefined
 
   const submit = async (): Promise<void> => {
     if (title.trim() === '') return
     setBusy(true)
     try {
+      const initiatorName = matched?.name ?? initiator.trim()
       const task = await api.createTask({
         title: title.trim(),
         briefMd: brief,
-        ...(initiator.trim() !== '' ? { initiatorName: initiator.trim() } : {}),
+        ...(initiatorName !== '' ? { initiatorName } : {}),
       })
       if (material.trim() !== '') {
         await api.createMaterial(task.id, { kind: 'doc', text: material })
@@ -1490,6 +1766,9 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
 
   return (
     <div className="empty-state">
+      <button className="btn ghost nav-toggle" style={{ position: 'absolute', top: 10, left: 10 }} onClick={onOpenNav}>
+        ☰ 任务
+      </button>
       <div className="new-task-form">
         <input
           placeholder="要做什么？"
@@ -1506,10 +1785,26 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
           onChange={(e) => setBrief(e.target.value)}
         />
         <input
-          placeholder="发起人（谁派的活？留空 = 自己。配好团队后他会实时看到进度与告警）"
+          placeholder={teamEnabled ? '发起人（谁派的活？从团队成员里选；留空 = 自己）' : '发起人（谁派的活？留空 = 自己。配好团队后他会实时看到进度与告警）'}
           value={initiator}
+          list="qb-team-users"
           onChange={(e) => setInitiator(e.target.value)}
         />
+        <datalist id="qb-team-users">
+          {teamUsers.map((u) => (
+            <option key={u.name} value={u.name}>
+              {u.displayName}
+            </option>
+          ))}
+        </datalist>
+        {unknownInitiator && (
+          <span className="verdict unclear" style={{ fontSize: 12.5 }}>
+            团队里没有"{initiator.trim()}"——这样发起人看不到这个任务。从下拉里选一个人，或者让他先拿邀请链接注册。
+          </span>
+        )}
+        {matched !== undefined && initiator.trim() !== matched.name && (
+          <span className="dim">将记为 {matched.displayName}（{matched.name}）</span>
+        )}
         <textarea
           className="mono"
           placeholder="手头有什么？贴同事发的文档 / 脚本 / 聊天记录 / 终端日志——QB 会忠实整理成 runbook，命令逐字保留"
@@ -1592,11 +1887,11 @@ function askText(
 
 /** 灵魂宝石：亮 = 顺利，变暗 = 有波折，熄灭 = 卡住需要介入。 */
 function gem(t: Task): string {
-  return t.status === 'blocked' ? '○' : t.status === 'done' ? '✓' : '●'
+  return t.status === 'blocked' ? '○' : t.status === 'done' ? '✓' : t.status === 'abandoned' ? '✕' : '●'
 }
 
 function gemClass(t: Task): string {
-  return t.status === 'blocked' ? 'stuck' : t.status === 'draft' ? 'wobble' : 'ok'
+  return t.status === 'blocked' ? 'stuck' : t.status === 'draft' ? 'wobble' : t.status === 'abandoned' ? 'faint' : 'ok'
 }
 
 function statusLabel(t: Task): string {
@@ -1650,14 +1945,37 @@ function eventText(e: Event, steps: Step[]): string {
 
   switch (e.kind) {
     case 'task_created':
-      return '创建了任务'
+      return typeof payload.by === 'string' && payload.by !== '' && payload.remote === true ? `${payload.by} 派来了这个任务` : '创建了任务'
     case 'task_started':
       return '任务开始'
     case 'task_done':
       return '任务完成'
+    case 'task_blocked':
+      return `标记卡住了${typeof payload.note === 'string' && payload.note !== '' ? `：${payload.note}` : ''}`
+    case 'task_resumed':
+      return payload.auto === true ? '又开始动手了，不再算卡住' : '不卡了，继续'
+    case 'task_abandoned':
+      return `放弃了这个任务${typeof payload.note === 'string' && payload.note !== '' ? `：${payload.note}` : ''}`
+    case 'task_reopened':
+      return '重新打开了任务'
+    case 'alert_raised': {
+      const to = typeof payload.to === 'string' ? payload.to : '发起人'
+      const msg = typeof payload.message === 'string' ? payload.message : ''
+      return `QB 替你告诉了${to}：${msg}`
+    }
+    case 'alert_snoozed':
+      return `你说能搞定：${typeof payload.minutes === 'number' ? payload.minutes : 30} 分钟内不再提醒发起人`
+    case 'delegate_progress': {
+      const who = typeof payload.assignee === 'string' ? payload.assignee : '对方'
+      if (payload.note === '已委派') return `委派给了 ${who}`
+      const progress = typeof payload.total === 'number' && payload.total > 0 ? ` ${String(payload.done)}/${payload.total}` : ''
+      const st = payload.status === 'blocked' ? '卡住了' : payload.status === 'active' ? '在做' : String(payload.status ?? '')
+      return `${who}${st}${progress}${payload.worstAlert === 'red' ? '（需要你看一眼）' : ''}`
+    }
     case 'step_run':
-      return `开始执行${which}`
+      return payload.watch === 'only' ? `QB 开始盯着${which}` : payload.watch === 'run' ? `运行并盯着${which}` : `开始执行${which}`
     case 'step_ok':
+      if (payload.source === 'delegate') return `${which}完成了（${typeof payload.by === 'string' ? payload.by : '对方'}做完了委派）`
       return payload.source === 'image' && byQb
         ? `QB 看了截图：${which}通过${reason !== '' ? ` — ${reason}` : ''}`
         : `${which}通过${ms}${reason !== '' ? ` — ${reason}` : ''}`

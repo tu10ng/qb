@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   clearToken,
   connectRefresh,
@@ -18,24 +18,27 @@ import {
  */
 
 export function RemoteApp() {
-  const [me, setMe] = useState<string | null>(null)
+  const [me, setMe] = useState<{ displayName: string; isAdmin: boolean } | null>(null)
   const [authError, setAuthError] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (getToken() === '') return
+  const load = useCallback(() => {
     remoteApi
       .me()
-      .then((u) => setMe(u.displayName))
+      .then((u) => setMe({ displayName: u.displayName, isAdmin: u.isAdmin }))
       .catch(() => setAuthError('令牌无效，请重新登录'))
   }, [])
 
+  useEffect(() => {
+    if (getToken() !== '') load()
+  }, [load])
+
   if (me === null) {
-    return <Login authError={authError} onLogin={setMe} />
+    return <Login authError={authError} onLogin={load} />
   }
-  return <RemoteMain me={me} onLogout={() => { clearToken(); setMe(null) }} />
+  return <RemoteMain me={me.displayName} isAdmin={me.isAdmin} onLogout={() => { clearToken(); setMe(null) }} />
 }
 
-function Login({ authError, onLogin }: { authError: string | null; onLogin: (name: string) => void }) {
+function Login({ authError, onLogin }: { authError: string | null; onLogin: () => void }) {
   // 邀请链接形如 /#/join/<码>，进页面自动填上
   const inviteFromHash = /#\/join\/([A-Za-z0-9]+)/.exec(location.hash)?.[1] ?? ''
   const [invite, setInvite] = useState(inviteFromHash)
@@ -51,7 +54,7 @@ function Login({ authError, onLogin }: { authError: string | null; onLogin: (nam
       .join(invite.trim(), name.trim())
       .then((r) => {
         setToken(r.token)
-        onLogin(r.user.displayName)
+        onLogin()
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setBusy(false))
@@ -61,7 +64,7 @@ function Login({ authError, onLogin }: { authError: string | null; onLogin: (nam
     setToken(token.trim())
     remoteApi
       .me()
-      .then((u) => onLogin(u.displayName))
+      .then(() => onLogin())
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
   }
 
@@ -99,9 +102,11 @@ function Login({ authError, onLogin }: { authError: string | null; onLogin: (nam
   )
 }
 
-function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
+function RemoteMain({ me, isAdmin, onLogout }: { me: string; isAdmin: boolean; onLogout: () => void }) {
   const [overview, setOverview] = useState<{ initiated: RemoteTask[]; assigned: RemoteTask[]; openAlerts: RemoteAlert[] } | null>(null)
   const [openTask, setOpenTask] = useState<string | null>(null)
+  // 信件"去看看"直达那一步（原先只打开任务，还得自己找是哪一步）
+  const [focusStep, setFocusStep] = useState<string | null>(null)
   const [pushOpen, setPushOpen] = useState(false)
   const [dispatchOpen, setDispatchOpen] = useState(false)
 
@@ -128,11 +133,19 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
         </div>
         <div className="task-list">
           {(overview?.initiated ?? []).map((t) => (
-            <button key={t.id} className={`task-item${openTask === t.id ? ' active' : ''}`} onClick={() => setOpenTask(t.id)}>
-              <span className={`gem ${t.worstAlert === 'red' ? 'stuck' : t.worstAlert === 'yellow' ? 'wobble' : 'ok'}`}>
-                {t.worstAlert === 'red' ? '🔴' : t.worstAlert === 'yellow' ? '◐' : t.status === 'done' ? '✓' : '●'}
+            <button
+              key={t.id}
+              className={`task-item${openTask === t.id ? ' active' : ''}${t.status === 'done' || t.status === 'abandoned' ? ' ended' : ''}`}
+              onClick={() => {
+                setOpenTask(t.id)
+                setFocusStep(null)
+              }}
+            >
+              <span className={`gem ${t.worstAlert === 'red' || t.status === 'blocked' ? 'stuck' : t.worstAlert === 'yellow' ? 'wobble' : 'ok'}`}>
+                {t.worstAlert === 'red' ? '🔴' : t.status === 'blocked' ? '○' : t.worstAlert === 'yellow' ? '◐' : t.status === 'done' ? '✓' : t.status === 'abandoned' ? '✕' : '●'}
               </span>
               <span className="title">{t.title}</span>
+              <span className="dim">{t.assigneeName}</span>
             </button>
           ))}
           {overview !== null && overview.initiated.length === 0 && (
@@ -142,9 +155,11 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
           )}
         </div>
         <div className="sidebar-foot">
-          <button className="btn ghost" onClick={() => setPushOpen(true)}>
-            ⚙ 推送渠道
-          </button>
+          {isAdmin && (
+            <button className="btn ghost" onClick={() => setPushOpen(true)}>
+              ⚙ 推送渠道
+            </button>
+          )}
           <button className="btn ghost" onClick={onLogout}>
             退出
           </button>
@@ -156,10 +171,18 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
           <p className="dim">选一个任务看进度。</p>
         </div>
       ) : (
-        <RemoteTaskPage key={openTask} taskId={openTask} onChanged={refresh} />
+        <RemoteTaskPage key={openTask} taskId={openTask} focusStepId={focusStep} onChanged={refresh} />
       )}
 
-      {overview !== null && overview.openAlerts.length > 0 && <LetterStack alerts={overview.openAlerts} onOpen={setOpenTask} />}
+      {overview !== null && overview.openAlerts.length > 0 && (
+        <LetterStack
+          alerts={overview.openAlerts}
+          onOpen={(taskId, stepId) => {
+            setOpenTask(taskId)
+            setFocusStep(stepId)
+          }}
+        />
+      )}
       {pushOpen && <PushChannelsDialog onClose={() => setPushOpen(false)} />}
       {dispatchOpen && <DispatchDialog onClose={() => setDispatchOpen(false)} onDispatched={() => { refresh(); setTimeout(refresh, 4000); setTimeout(refresh, 8000) }} />}
     </div>
@@ -167,7 +190,7 @@ function RemoteMain({ me, onLogout }: { me: string; onLogout: () => void }) {
 }
 
 /** 信件栈（右下角常驻）：缺氧式"小人被困住"。 */
-function LetterStack({ alerts, onOpen }: { alerts: RemoteAlert[]; onOpen: (taskId: string) => void }) {
+function LetterStack({ alerts, onOpen }: { alerts: RemoteAlert[]; onOpen: (taskId: string, stepId: string | null) => void }) {
   const [open, setOpen] = useState(true)
   if (alerts.length === 0) return null
   const red = alerts.filter((a) => a.level === 'red').length
@@ -182,7 +205,7 @@ function LetterStack({ alerts, onOpen }: { alerts: RemoteAlert[]; onOpen: (taskI
           <div key={a.key} className={`letter ${a.level}`}>
             <span>{a.message}</span>
             <div className="letter-actions">
-              <button className="btn ghost" onClick={() => onOpen(a.taskId)}>
+              <button className="btn ghost" onClick={() => onOpen(a.taskId, a.stepId)}>
                 去看看
               </button>
               <button
@@ -200,11 +223,14 @@ function LetterStack({ alerts, onOpen }: { alerts: RemoteAlert[]; onOpen: (taskI
   )
 }
 
-function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
+function RemoteTaskPage({ taskId, focusStepId, onChanged }: { taskId: string; focusStepId: string | null; onChanged: () => void }) {
   const [detail, setDetail] = useState<RemoteDetail | null>(null)
   const [commentDraft, setCommentDraft] = useState('')
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [error, setError] = useState<string | null>(null)
+  // 选中的那一步：评论落在它上面（原先评论只能挂在任务上，占位文字却说可以选步骤）
+  const [selected, setSelected] = useState<string | null>(focusStepId)
+  const stepRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   const refresh = useCallback(() => {
     remoteApi
@@ -215,6 +241,12 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
 
   useEffect(() => refresh(), [refresh])
   useEffect(() => connectRefresh(refresh), [refresh])
+  useEffect(() => setSelected(focusStepId), [focusStepId])
+  // 从信件点进来：滚到那一步
+  const loaded = detail !== null
+  useEffect(() => {
+    if (loaded && focusStepId !== null) stepRefs.current[focusStepId]?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }, [loaded, focusStepId])
 
   if (detail === null) return <div className="empty-state">{error ?? '读取中…'}</div>
   const { task, steps } = detail
@@ -222,29 +254,57 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
   const real = steps.filter((s) => s.kind !== 'note')
   const done = real.filter((s) => s.status === 'ok' || s.status === 'skipped').length
   const sectionOf = new Map(steps.map((s) => [s.id, s.title]))
+  const selectedStep = steps.find((s) => s.id === selected) ?? null
+  const blockedEvent = [...detail.events].reverse().find((e) => e.kind === 'task_blocked')
+
+  const sendComment = (): void => {
+    if (commentDraft.trim() === '') return
+    remoteApi
+      .comment(taskId, commentDraft.trim(), selected)
+      .then(() => {
+        setCommentDraft('')
+        refresh()
+        onChanged()
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+  }
 
   return (
     <div className="task-page">
       <header className="task-header">
         <h1>{task.title}</h1>
         <span className="task-meta">
-          {task.assigneeName} 在做 · {done}/{real.length}
+          {task.assigneeName} {task.status === 'done' ? '已完成' : task.status === 'abandoned' ? '已放弃' : task.status === 'blocked' ? '卡住了' : '在做'} · {done}/{real.length}
           {task.expectedMinutes !== null && ` · 预计 ${task.expectedMinutes} 分钟`}
-          {task.startedAt !== null && ` · 已进行 ${Math.round((Date.now() - task.startedAt) / 60_000)} 分钟`}
+          {task.startedAt !== null && task.status !== 'done' && ` · 已进行 ${Math.round((Date.now() - task.startedAt) / 60_000)} 分钟`}
         </span>
       </header>
 
       <div className="task-body">
         <nav className="outline">
           {steps.map((s) => (
-            <div key={s.id} className={`outline-item${s.parentId !== null ? ' depth-1' : ''}${s.kind === 'note' ? ' section' : ''}`}>
+            <button
+              key={s.id}
+              className={`outline-item${s.parentId !== null ? ' depth-1' : ''}${s.kind === 'note' ? ' section' : ''}${s.id === selected ? ' current' : ''}`}
+              onClick={() => {
+                setSelected(s.id)
+                stepRefs.current[s.id]?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+              }}
+            >
               <span>{s.kind === 'note' ? '§' : markOf(s.status)}</span>
               <span className="t">{s.title}</span>
-            </div>
+            </button>
           ))}
         </nav>
 
         <main className="runbook">
+          {task.status === 'blocked' && (
+            <div className="banner danger">
+              {task.assigneeName} 卡住了
+              {typeof blockedEvent?.payload.note === 'string' && blockedEvent.payload.note !== '' ? `：${blockedEvent.payload.note}` : ''}
+              。可以在下面选中那一步留言，或者直接找他。
+            </div>
+          )}
           {/* 待回答的求助最显眼 */}
           {detail.questions
             .filter((q) => q.answer === null)
@@ -331,7 +391,14 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
                 {s.title}
               </div>
             ) : (
-              <div key={s.id} className={`step${s.status === 'failed' ? ' failed-cell' : ''}`}>
+              <div
+                key={s.id}
+                ref={(el) => {
+                  stepRefs.current[s.id] = el
+                }}
+                className={`step${s.status === 'failed' ? ' failed-cell' : ''}${s.id === selected ? ' current' : ''}`}
+                onClick={() => setSelected(s.id)}
+              >
                 <div className="step-head">
                   <span className="step-mark">{markOf(s.status)}</span>
                   <span className="step-title">{s.title}</span>
@@ -360,9 +427,36 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
                       <strong>{c.authorName}</strong>：{c.body}
                     </div>
                   ))}
+                {s.id === selected && (
+                  <div className="step-actions" onClick={(e) => e.stopPropagation()}>
+                    <input
+                      className="inline-edit"
+                      autoFocus={focusStepId === s.id}
+                      placeholder={`对「${s.title}」说一句（他在这一步上直接看到）`}
+                      value={commentDraft}
+                      onChange={(e) => setCommentDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') sendComment()
+                      }}
+                      style={{ flex: 1 }}
+                    />
+                    <button className="btn primary" disabled={commentDraft.trim() === ''} onClick={sendComment}>
+                      评论这一步
+                    </button>
+                  </div>
+                )}
               </div>
             ),
           )}
+
+          {/* 任务层面的评论（没选步骤时发的） */}
+          {detail.comments
+            .filter((c) => c.stepId === null)
+            .map((c) => (
+              <div key={c.id} className="remote-comment">
+                <strong>{c.authorName}</strong>：{c.body}
+              </div>
+            ))}
 
           {/* 已回答的求助（留档） */}
           {detail.questions
@@ -397,27 +491,21 @@ function RemoteTaskPage({ taskId, onChanged }: { taskId: string; onChanged: () =
           </div>
           <div className="qb-actions">
             <textarea
-              placeholder="留一条评论（可选中某一步后写）"
+              placeholder={selectedStep !== null ? `评论「${selectedStep.title}」` : '留一条评论（点左边或正文里的某一步，评论就落在那一步上）'}
               value={commentDraft}
               onChange={(e) => setCommentDraft(e.target.value)}
               rows={2}
             />
-            <button
-              className="btn primary"
-              disabled={commentDraft.trim() === ''}
-              onClick={() => {
-                remoteApi
-                  .comment(taskId, commentDraft.trim())
-                  .then(() => {
-                    setCommentDraft('')
-                    refresh()
-                    onChanged()
-                  })
-                  .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-              }}
-            >
-              评论
-            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button className="btn primary" disabled={commentDraft.trim() === ''} onClick={sendComment}>
+                {selectedStep !== null ? '评论这一步' : '评论任务'}
+              </button>
+              {selectedStep !== null && (
+                <button className="btn ghost" onClick={() => setSelected(null)}>
+                  不针对某一步
+                </button>
+              )}
+            </div>
             {error !== null && <div className="verdict fail">{error}</div>}
           </div>
         </aside>
@@ -451,6 +539,18 @@ function remoteEventText(kind: string, payload: Record<string, unknown>, section
       return '开始执行'
     case 'task_done':
       return '完成了'
+    case 'task_blocked':
+      return `卡住了${typeof payload.note === 'string' && payload.note !== '' ? `：${payload.note}` : ''}`
+    case 'task_resumed':
+      return payload.auto === true ? '又开始动手了' : '不卡了，继续'
+    case 'task_abandoned':
+      return `放弃了${typeof payload.note === 'string' && payload.note !== '' ? `：${payload.note}` : ''}`
+    case 'task_reopened':
+      return '重新打开了任务'
+    case 'alert_raised':
+      return `QB 替他开口：${typeof payload.message === 'string' ? payload.message : ''}`
+    case 'alert_snoozed':
+      return `他说能搞定，${typeof payload.minutes === 'number' ? payload.minutes : 30} 分钟内先别提醒`
     case 'step_run':
       return `开始 ${which}`
     case 'step_ok':
@@ -479,8 +579,11 @@ function remoteEventText(kind: string, payload: Record<string, unknown>, section
       return payload.status === 'confirmed' ? '一个共享的坑被确认有效' : '一个共享的坑被判定无效'
     case 'base_proposal':
       return `底稿提议：${typeof payload.stepTitle === 'string' ? payload.stepTitle : ''}`
-    case 'delegate_progress':
-      return '委派进展'
+    case 'delegate_progress': {
+      const who = typeof payload.assignee === 'string' ? payload.assignee : '对方'
+      if (payload.note === '已委派') return `把${which || '一步'}委派给了 ${who}`
+      return `委派出去的${which || '一步'}：${who} ${typeof payload.total === 'number' && payload.total > 0 ? `${String(payload.done)}/${payload.total}` : String(payload.status ?? '')}`
+    }
     default:
       return kind
   }

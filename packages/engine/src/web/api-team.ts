@@ -1,25 +1,29 @@
 /**
- * M8 路由：团队同步配置与"问发起人"的正式通道。
+ * M8 路由：团队同步配置与"问发起人"的正式通道；委派；告警静音。
  *
  * 配好团队服务后，问发起人从"临时 · 复制到 IM"升级为真实发送：
  * 求助存本地（答案回流时挂回这一步）→ 事件 → 立刻推给团队服务 →
  * 发起人回答经同步回流，出现在这一步的 QB 面板里。
  *
  * 委派（delegate）：把这步变成对方的任务，经团队服务的 dispatch 通道
- * 派出去；对方引擎几秒内收到，进度回流到委派行上。
+ * 派出去；对方引擎几秒内收到，进度按父步骤回流到委派行上。委派方本机
+ * 不建子任务副本——那份副本会被当成另一个任务推上去，成了团队里的
+ * 幽灵任务，且它的 id 和对方的对不上，进度永远回不来。
  */
 
 import { z } from 'zod'
 import { redact } from '@qb/core'
 import type { Store } from '@qb/store'
-import type { TeamSettings } from '../sync/sync.ts'
+import type { TeamConfig, TeamSettings } from '../sync/sync.ts'
 import type { Sync } from '../sync/sync.ts'
 import { errMessage, sendJson, type Router } from './router.ts'
+import type { createWsHandler } from './ws.ts'
 
 export interface TeamDeps {
   store: Store
   team: TeamSettings
   sync: Sync
+  ws: ReturnType<typeof createWsHandler>
   currentUserId: () => string
   userName: () => string
 }
@@ -36,19 +40,38 @@ const AskBody = z.object({
 })
 
 const DelegateBody = z.object({
-  assigneeName: z.string().trim().min(1, '要填对方名字'),
+  assigneeName: z.string().trim().min(1, '要选委派给谁'),
+  /** 界面选人时带上的显示名，委派行标题用。 */
+  displayName: z.string().trim().max(40).optional(),
+  /** 交代一句（进对方任务的说明）。 */
+  note: z.string().trim().max(2000).optional(),
 })
 
-export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
-  const { store, team, sync, currentUserId, userName } = deps
+const SnoozeBody = z.object({
+  key: z.string().min(1, '要给告警 key'),
+  minutes: z.number().int().positive().max(120).default(30),
+})
 
-  router.get('/settings/team', (_req, res) => {
-    const cfg = team.get()
-    // 令牌不回显全文——只回有没有（界面存的是自己那份）
-    sendJson(res, 200, { ...cfg, hasToken: cfg.token !== '', token: '' })
+const teamUrl = (cfg: TeamConfig, path: string): string => `${cfg.url.replace(/\/+$/, '')}${path}`
+
+export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
+  const { store, team, sync, ws, currentUserId } = deps
+
+  const publicCfg = (cfg: TeamConfig) => ({
+    url: cfg.url,
+    enabled: cfg.enabled,
+    hasToken: cfg.token !== '',
+    token: '',
+    identity: cfg.identity ?? null,
+    status: sync.status(),
   })
 
-  router.post('/settings/team', (_req, res, ctx) => {
+  router.get('/settings/team', (_req, res) => {
+    // 令牌不回显全文——只回有没有（界面存的是自己那份）
+    sendJson(res, 200, publicCfg(team.get()))
+  })
+
+  router.post('/settings/team', async (_req, res, ctx) => {
     const parsed = TeamBody.safeParse(ctx.body ?? {})
     if (!parsed.success) {
       sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
@@ -56,13 +79,21 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
     }
     // token 留空 = 沿用已存的
     const before = team.get()
-    const saved = team.save({
-      url: parsed.data.url,
-      token: parsed.data.token !== '' ? parsed.data.token : before.token,
-      enabled: parsed.data.enabled && (parsed.data.url !== '' || before.url !== '') && (parsed.data.token !== '' || before.token !== ''),
-    })
+    const url = parsed.data.url !== '' ? parsed.data.url : before.url
+    const token = parsed.data.token !== '' ? parsed.data.token : before.token
+    const enabled = parsed.data.enabled && url !== '' && token !== ''
+    // 地址或令牌换了，身份就得重新认：推送一律用令牌对应的团队身份
+    const sameCredentials = url === before.url && token === before.token
+    let identity = sameCredentials ? (before.identity ?? null) : null
+    let detail: string | null = null
+    if (enabled && identity === null) {
+      const r = await sync.fetchIdentity({ url, token })
+      if (r.ok && r.identity !== undefined) identity = r.identity
+      else detail = r.detail
+    }
+    const saved = team.save({ url, token, enabled, identity })
     if (saved.enabled) sync.pushNow()
-    sendJson(res, 200, { ...saved, hasToken: saved.token !== '', token: '' })
+    sendJson(res, 200, { ...publicCfg(saved), ...(detail !== null ? { warning: `还没认出团队身份：${detail}` } : {}) })
   })
 
   router.post('/settings/team/test', async (_req, res, ctx) => {
@@ -77,7 +108,33 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       sendJson(res, 400, { error: 'bad_request', message: '先填地址和令牌' })
       return
     }
-    sendJson(res, 200, await sync.testConnection(cfg))
+    const r = await sync.testConnection(cfg)
+    // 测的就是已保存的那套：顺手把身份记下
+    if (r.ok && r.identity !== undefined && cfg.url === current.url && cfg.token === current.token) {
+      team.save({ ...current, identity: r.identity })
+    }
+    sendJson(res, 200, r)
+  })
+
+  /** 团队里的人（派任务、委派、填发起人时选人用）。没配团队时是空表。 */
+  router.get('/team/users', async (_req, res) => {
+    const cfg = team.get()
+    if (!cfg.enabled) {
+      sendJson(res, 200, { users: [], enabled: false })
+      return
+    }
+    try {
+      const r = await fetch(teamUrl(cfg, '/api/users'), { headers: { authorization: `Bearer ${cfg.token}` }, signal: AbortSignal.timeout(8000) })
+      if (!r.ok) throw new Error(`团队服务返回 HTTP ${r.status}`)
+      const body = (await r.json()) as { users: Array<{ name: string; displayName: string; taskCount?: number }> }
+      sendJson(res, 200, {
+        enabled: true,
+        me: cfg.identity?.name ?? null,
+        users: body.users.map((u) => ({ name: u.name, displayName: u.displayName, taskCount: u.taskCount ?? 0 })),
+      })
+    } catch (e) {
+      sendJson(res, 502, { error: 'team_unreachable', message: errMessage(e), users: [] })
+    }
   })
 
   /**
@@ -125,15 +182,15 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
   })
 
   /**
-   * 委派这步给别人：生成对方的任务（本机存父结构），同时通过团队服务
-   * 的 dispatch 通道派出去——对方引擎几秒内收到。
-   *
-   * 配好团队服务才可委派（不然对方收不到）；没配时明确报错。
+   * 委派这步给别人：经团队服务派一个任务给对方（对方引擎几秒内收到），
+   * 这一步变成委派行，记下对方任务在团队上的 id。对方的进度按父步骤回流
+   * （sync.ts 的 task_progress），对方完成时这一步自动完成。
    */
   router.post('/steps/:id/delegate', async (_req, res, ctx) => {
     const stepId = ctx.params.id!
     const step = store.getStep(stepId)
-    if (step === null) {
+    const taskId = store.taskIdOfStep(stepId)
+    if (step === null || taskId === null) {
       sendJson(res, 404, { error: 'not_found', message: '步骤不存在' })
       return
     }
@@ -142,71 +199,133 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
       return
     }
-
     const cfg = team.get()
     if (!cfg.enabled) {
       sendJson(res, 400, { error: 'team_not_configured', message: '委派需要团队服务。到「设置 · 团队」配置后再试。' })
       return
     }
-
-    const taskId = store.taskIdOfStep(stepId)
-    if (taskId === null) {
-      sendJson(res, 404, { error: 'not_found' })
+    if (store.delegationOf(stepId) !== null) {
+      sendJson(res, 409, { error: 'already_delegated', message: '这一步已经委派出去了' })
       return
     }
+    if (step.status === 'running') {
+      sendJson(res, 409, { error: 'running', message: '这一步正在执行，先取消再委派' })
+      return
+    }
+
     const task = store.getTask(taskId)!
-    const me = store.getUserByName(userName())
-    const assignee = store.ensureUser(parsed.data.assigneeName)
+    const title = step.title.replace(/^→ [^:]+:\s*/, '')
+    const brief = [
+      `（由委派产生——原任务「${task.title}」的步骤「${title}」）`,
+      parsed.data.note !== undefined && parsed.data.note !== '' ? `交代：${parsed.data.note}` : '',
+      step.whyMd !== null ? `目的：${step.whyMd}` : '',
+      step.command !== null ? `参考命令：\n\`\`\`\n${step.command}\n\`\`\`` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n')
 
-    // 生成子任务：发起人 = 委派者（本机用户），执行者 = 对方
-    const childTask = store.createTask({
-      title: step.title.replace(/^→ [^:]+:\s*/, ''), // 去掉前缀还原标题
-      briefMd: [
-        `（由委派产生——原任务「${task.title}」的步骤「${step.title}」）`,
-        step.whyMd !== null ? `目的：${step.whyMd}` : '',
-        step.command !== null ? `参考命令：\n\`\`\`\n${step.command}\n\`\`\`` : '',
-      ].filter(Boolean).join('\n\n'),
-      initiatorId: me !== null ? me.id : currentUserId(),
-      assigneeId: assignee.id,
-      parentStepId: stepId,
-    })
-    store.appendEvent({ taskId: childTask.id, actorId: currentUserId(), kind: 'task_created', payload: { delegated: true, fromTask: task.title } })
-    store.appendEvent({
-      taskId,
-      stepId,
-      actorId: currentUserId(),
-      kind: 'delegate_progress',
-      payload: { childTaskId: childTask.id, assignee: parsed.data.assigneeName, note: '已委派' },
-    })
-
-    // 经团队服务派出去（对方引擎在 pullDown 里收到 kind=task）
+    let teamTaskId: string
     try {
-      const r = await fetch(`${cfg.url.replace(/\/+$/, '')}/api/dispatch`, {
+      const r = await fetch(teamUrl(cfg, '/api/dispatch'), {
         method: 'POST',
         headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
-          title: childTask.title,
-          briefMd: redact(childTask.briefMd).text,
+          title,
+          briefMd: redact(brief).text,
           assigneeName: parsed.data.assigneeName,
           parentStepId: stepId,
+          ...(step.expectedMinutes !== null ? { expectedMinutes: Math.max(1, Math.ceil(step.expectedMinutes)) } : {}),
         }),
         signal: AbortSignal.timeout(15_000),
       })
-      if (!r.ok) {
-        const body = await r.text().catch(() => '')
-        throw new Error(`团队服务返回 HTTP ${r.status}${body !== '' ? `：${body.slice(0, 120)}` : ''}`)
+      const body = (await r.json().catch(() => null)) as { taskId?: string; message?: string } | null
+      if (!r.ok || typeof body?.taskId !== 'string') {
+        throw new Error(`团队服务返回 HTTP ${r.status}${typeof body?.message === 'string' ? `：${body.message}` : ''}`)
       }
-      const { taskId: remoteId } = (await r.json()) as { taskId: string }
-      // 用团队服务生成的 id 替换本地的（两边一致才好关联）
-      // SQLite 不方便改 PK——写 delegate_task_id 关联即可
-      void remoteId
+      teamTaskId = body.taskId
     } catch (e) {
-      sendJson(res, 502, { error: 'dispatch_failed', message: `委派失败（任务已在本地创建）：${errMessage(e)}` })
+      sendJson(res, 502, { error: 'dispatch_failed', message: `委派没派出去（这一步没动）：${errMessage(e)}` })
       return
     }
 
-    sync.pushNow() // 把父任务的委派事件推上去
-    sendJson(res, 201, { taskId: childTask.id })
+    const who = parsed.data.displayName !== undefined && parsed.data.displayName !== '' ? parsed.data.displayName : parsed.data.assigneeName
+    store.inTransaction(() => {
+      store.createDelegation({ stepId, teamTaskId, assigneeName: parsed.data.assigneeName })
+      store.updateStep(stepId, { kind: 'delegate', title: `→ ${who}: ${title}` }, { expectedRev: step.rev, actorId: currentUserId() })
+      store.updateStepStatus(stepId, 'running', { startedAt: Date.now() })
+      store.markTaskStarted(taskId, currentUserId())
+      store.appendEvent({
+        taskId,
+        stepId,
+        actorId: currentUserId(),
+        kind: 'delegate_progress',
+        payload: { assignee: who, teamTaskId, status: 'draft', note: '已委派' },
+      })
+    })
+    ws.broadcast({ type: 'runbook.changed', taskId, stepId })
+    sync.pushNow() // 把父任务的委派行推上去（团队据此认出委派者）
+    sendJson(res, 201, { teamTaskId })
+  })
+
+  /** 委派行 → [打开对方 runbook]：从团队服务取对方任务的只读镜像。 */
+  router.get('/steps/:id/delegation', async (_req, res, ctx) => {
+    const delegation = store.delegationOf(ctx.params.id!)
+    if (delegation === null) {
+      sendJson(res, 404, { error: 'not_found', message: '这一步没有委派' })
+      return
+    }
+    const cfg = team.get()
+    if (!cfg.enabled) {
+      sendJson(res, 200, { delegation, mirror: null, note: '团队同步没开，看不到对方进度' })
+      return
+    }
+    try {
+      const r = await fetch(teamUrl(cfg, `/api/tasks/${encodeURIComponent(delegation.teamTaskId)}`), {
+        headers: { authorization: `Bearer ${cfg.token}` },
+        signal: AbortSignal.timeout(8000),
+      })
+      if (r.status === 404) {
+        sendJson(res, 200, { delegation, mirror: null, note: '对方的引擎还没同步上来（对方可能不在线）' })
+        return
+      }
+      if (!r.ok) throw new Error(`团队服务返回 HTTP ${r.status}`)
+      sendJson(res, 200, { delegation, mirror: await r.json() })
+    } catch (e) {
+      sendJson(res, 502, { error: 'team_unreachable', message: errMessage(e) })
+    }
+  })
+
+  /** 委派行 → [留言]：评论落到对方任务上（可指定对方的某一步）。 */
+  router.post('/steps/:id/delegation/comment', async (_req, res, ctx) => {
+    const delegation = store.delegationOf(ctx.params.id!)
+    if (delegation === null) {
+      sendJson(res, 404, { error: 'not_found', message: '这一步没有委派' })
+      return
+    }
+    const parsed = z
+      .object({ body: z.string().trim().min(1, '留言是空的').max(4000), stepId: z.string().nullable().optional() })
+      .safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
+      return
+    }
+    const cfg = team.get()
+    if (!cfg.enabled) {
+      sendJson(res, 400, { error: 'team_not_configured', message: '留言需要团队服务' })
+      return
+    }
+    try {
+      const r = await fetch(teamUrl(cfg, `/api/tasks/${encodeURIComponent(delegation.teamTaskId)}/comments`), {
+        method: 'POST',
+        headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ body: redact(parsed.data.body).text, stepId: parsed.data.stepId ?? null }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!r.ok) throw new Error(r.status === 404 ? '对方的任务还没同步上来' : `团队服务返回 HTTP ${r.status}`)
+      sendJson(res, 201, { ok: true })
+    } catch (e) {
+      sendJson(res, 502, { error: 'comment_failed', message: errMessage(e) })
+    }
   })
 
   /**
@@ -253,10 +372,9 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
   })
 
   /**
-   * 告警静音（"我能搞定"）：30 分钟内不出声。
-   * QB 检测到红告警后推给团队服务 → 发起人知道了；执行者觉得"我能搞定"
-   * 就静音，避免发起人被反复打扰。宪法 15：执行者看得到 QB 替他发了什么，
-   * 也应该能说"先别烦他"。
+   * 告警静音（"我能搞定"）：这段时间内这条告警不再推给发起人（团队侧随之
+   * 解除；到点条件还在就重新出现）。宪法 15：执行者看得到 QB 替他发了
+   * 什么，也应该能说"先别烦他"。原先这条路由只记了静音，推送时从没看过它。
    */
   router.post('/tasks/:id/alerts/snooze', (_req, res, ctx) => {
     const taskId = ctx.params.id!
@@ -264,19 +382,16 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       sendJson(res, 404, { error: 'not_found' })
       return
     }
-    const body = (ctx.body ?? {}) as { key?: string; minutes?: number }
-    if (typeof body.key !== 'string' || body.key === '') {
-      sendJson(res, 400, { error: 'bad_request', message: '要给告警 key' })
+    const parsed = SnoozeBody.safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
       return
     }
-    const minutes = typeof body.minutes === 'number' && body.minutes > 0 ? Math.min(body.minutes, 120) : 30
-    store.snoozeAlert(taskId, body.key, currentUserId(), minutes)
-    store.appendEvent({
-      taskId,
-      actorId: currentUserId(),
-      kind: 'edit',
-      payload: { changes: [{ field: 'alert', before: body.key, after: `静音 ${minutes} 分钟` }], snooze: body.key },
-    })
-    sendJson(res, 200, { key: body.key, minutes })
+    const { key, minutes } = parsed.data
+    store.snoozeAlert(taskId, key, currentUserId(), minutes)
+    store.appendEvent({ taskId, actorId: currentUserId(), kind: 'alert_snoozed', payload: { key, minutes } })
+    ws.broadcast({ type: 'runbook.changed', taskId, stepId: null })
+    sync.evaluateNow() // 决策集变了：马上推一次，发起人那边的告警随之解除
+    sendJson(res, 200, { key, minutes })
   })
 }

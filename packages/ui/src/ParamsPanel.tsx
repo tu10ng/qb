@@ -46,8 +46,6 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
     })
   }, [params])
 
-  if (params.length === 0) return null
-
   const confirmList = list.filter((p) => p.value === '' || p.source === 'qb_guess')
   const highlight = new Set(list.filter((p) => p.source === 'mine').map((p) => p.name))
   const shown = expanded ? list : confirmList
@@ -107,11 +105,32 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
     }
   }
 
+  const add = async (name: string, value: string): Promise<boolean> => {
+    if (list.some((p) => p.name === name)) {
+      toast(`已经有参数 ${name} 了`, { tone: 'error' })
+      return false
+    }
+    setBusy(true)
+    const next: Param[] = [...list, { name, value, source: 'mine', secret: false }]
+    setList(next)
+    try {
+      await api.updateParams(taskId, next)
+      onChanged()
+      return true
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+      setList(list)
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="params-panel">
       <div className="params-head">
         <h3>
-          参数 · {confirmList.length > 0 ? `这次要确认的 ${confirmList.length} 个` : '都在'}
+          参数 · {list.length === 0 ? '还没有' : confirmList.length > 0 ? `这次要确认的 ${confirmList.length} 个` : '都在'}
           {highlight.size > 0 ? ` · 与底稿不同的 ${highlight.size} 个已高亮` : ''}
         </h3>
         {list.length > confirmList.length && (
@@ -184,7 +203,62 @@ export function ParamsPanel({ taskId, params, onChanged, toast }: Props) {
           </div>
         )
       })}
-      {shown.length === 0 && <div className="dim">没有待确认的参数。</div>}
+      {shown.length === 0 && list.length > 0 && <div className="dim">没有待确认的参数。</div>}
+      {list.length === 0 && (
+        <div className="dim">命令里随环境变化的取值（主机、端口、路径、卡号）可以提成参数：点"⚡ 提取建议"，或在下面直接加一个。</div>
+      )}
+      <AddParam busy={busy} onAdd={add} />
+    </div>
+  )
+}
+
+/** 手动加一个参数：名字自动转成大写下划线。 */
+function AddParam({ busy, onAdd }: { busy: boolean; onAdd: (name: string, value: string) => Promise<boolean> }) {
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [value, setValue] = useState('')
+  const normalized = name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').replace(/^[^A-Z]+/, '')
+
+  if (!open) {
+    return (
+      <button className="btn ghost" style={{ marginTop: 4 }} onClick={() => setOpen(true)}>
+        ＋ 参数
+      </button>
+    )
+  }
+  const submit = (): void => {
+    if (normalized === '') return
+    void onAdd(normalized, value).then((ok) => {
+      if (!ok) return
+      setName('')
+      setValue('')
+      setOpen(false)
+    })
+  }
+  return (
+    <div className="param-row" style={{ marginTop: 4 }}>
+      <input
+        className="param-value"
+        style={{ maxWidth: 200 }}
+        autoFocus
+        placeholder="名字，如 DECODE_HOST"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && submit()}
+      />
+      <input
+        className="param-value"
+        placeholder="值（可以先空着）"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && submit()}
+      />
+      <button className="btn primary" disabled={busy || normalized === ''} onClick={submit}>
+        {normalized !== '' && normalized !== name.trim() ? `加上 ${normalized}` : '加上'}
+      </button>
+      <button className="btn ghost" onClick={() => setOpen(false)}>
+        取消
+      </button>
     </div>
   )
 }

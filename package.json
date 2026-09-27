@@ -13,13 +13,14 @@
     "test:watch": "vitest",
     "eval": "vitest run packages/engine/evals",
     "smoke": "node scripts/smoke.mjs",
-    "qb": "pnpm --filter @qb/cli start",
+    "e2e": "node scripts/e2e/run.mjs",
     "dev": "node scripts/dev.mjs",
     "build:ui": "pnpm --filter @qb/ui build"
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.1.5-rc.3",
     "@types/node": "^22.18.0",
+    "puppeteer-core": "25.12.0",
     "typescript": "~5.9.3",
     "vitest": "^5.0.2"
   }

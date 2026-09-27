@@ -7,6 +7,7 @@ import {
   type ProfileInput,
   type PublicProfile,
   type Purpose,
+  type TeamSettingsView,
 } from './api.ts'
 
 const PURPOSES: Array<{ id: Purpose; label: string; hint: string }> = [
@@ -153,7 +154,7 @@ export function Settings({ jobs }: Props) {
 
 /** 设置 · 团队：同步到团队服务（进度实时给发起人；告警推 IM）。 */
 function TeamSection() {
-  const [cfg, setCfg] = useState<{ url: string; hasToken: boolean; enabled: boolean } | null>(null)
+  const [cfg, setCfg] = useState<TeamSettingsView | null>(null)
   const [url, setUrl] = useState('')
   const [token, setToken] = useState('')
   const [enabled, setEnabled] = useState(false)
@@ -190,7 +191,11 @@ function TeamSection() {
         setUrl(c.url)
         setEnabled(c.enabled)
         setToken('')
-        setTestResult({ ok: true, detail: '已保存' })
+        setTestResult(
+          c.warning !== undefined
+            ? { ok: false, detail: c.warning }
+            : { ok: true, detail: c.identity !== null ? `已保存，团队身份是「${c.identity.displayName}」` : '已保存' },
+        )
       })
       .catch((e: unknown) => setTestResult({ ok: false, detail: e instanceof Error ? e.message : String(e) }))
       .finally(() => setBusy(false))
@@ -220,7 +225,7 @@ function TeamSection() {
       </label>
       <label className="check">
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-        启用同步（每 3 秒一拍，离线自动排队）
+        启用同步（每 2 秒一拍，离线自动排队）
       </label>
       <div className="row" style={{ display: 'flex', gap: 6 }}>
         <button className="btn primary" disabled={busy} onClick={save}>
@@ -235,7 +240,22 @@ function TeamSection() {
           {testResult.detail}
         </p>
       )}
-      {cfg.enabled && <p className="paste-hint" style={{ marginTop: 8 }}>同步中：进度、告警、求助都会推给团队服务（输出与截图不上传）。</p>}
+      {cfg.enabled && (
+        <div style={{ marginTop: 8 }}>
+          {cfg.identity !== null && (
+            <p className="paste-hint">
+              团队身份：{cfg.identity.displayName}（{cfg.identity.name}）——推送、发起人、委派都认这个名字。
+            </p>
+          )}
+          <p className={cfg.status.ok === false ? 'verdict fail' : 'paste-hint'}>
+            {cfg.status.ok === false
+              ? `同步失败：${cfg.status.detail}`
+              : cfg.status.ok === true
+                ? `${cfg.status.detail}（${new Date(cfg.status.at ?? Date.now()).toLocaleTimeString('zh-CN')}）。进度、告警、求助会推给团队服务；输出默认不上传（步骤上可以单独打开"共享输出"），截图不上传。`
+                : '还没同步过，几秒后刷新看看。'}
+          </p>
+        </div>
+      )}
     </section>
   )
 }

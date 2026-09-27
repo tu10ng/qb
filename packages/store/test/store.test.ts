@@ -53,6 +53,115 @@ describe('任务', () => {
   })
 })
 
+describe('任务生命周期', () => {
+  const kinds = (taskId: string) => store.listEvents(taskId).map((e) => e.kind)
+
+  it('完成：打结束时间、记 task_done；再点一次不重复记', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.markTaskStarted(t.id, me)
+    expect(store.setTaskStatus(t.id, 'done', me)).toBe(true)
+    expect(store.setTaskStatus(t.id, 'done', me)).toBe(false)
+
+    const after = store.getTask(t.id)!
+    expect(after.status).toBe('done')
+    expect(after.endedAt).not.toBeNull()
+    expect(kinds(t.id).filter((k) => k === 'task_done')).toHaveLength(1)
+  })
+
+  it('卡住带原因；恢复记 task_resumed；只有卡住时 resumeIfBlocked 才动', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.markTaskStarted(t.id, me)
+    store.resumeIfBlocked(t.id, me)
+    expect(kinds(t.id)).not.toContain('task_resumed')
+
+    store.setTaskStatus(t.id, 'blocked', me, { note: '等 gpu-18 的权限' })
+    const blocked = store.listEvents(t.id).find((e) => e.kind === 'task_blocked')!
+    expect(blocked.payload).toMatchObject({ note: '等 gpu-18 的权限', from: 'active' })
+
+    store.resumeIfBlocked(t.id, me)
+    expect(store.getTask(t.id)!.status).toBe('active')
+    expect(store.listEvents(t.id).find((e) => e.kind === 'task_resumed')!.payload).toMatchObject({ auto: true })
+  })
+
+  it('完成后重新打开：清掉结束时间，记 task_reopened；放弃记 task_abandoned', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.setTaskStatus(t.id, 'done', me)
+    store.setTaskStatus(t.id, 'active', me)
+    expect(store.getTask(t.id)!.endedAt).toBeNull()
+    expect(kinds(t.id)).toContain('task_reopened')
+
+    store.setTaskStatus(t.id, 'abandoned', me, { note: '需求取消' })
+    expect(store.getTask(t.id)!.endedAt).not.toBeNull()
+    expect(kinds(t.id)).toContain('task_abandoned')
+  })
+})
+
+describe('中文检索（FTS 二元组）', () => {
+  it('纯中文标题能找到底稿：词、半截词、跨词都行', () => {
+    store.createTask({ title: '升级驱动到 550', initiatorId: me })
+    store.createTask({ title: '整理压测基线', initiatorId: me })
+    store.createTask({ title: '在 X 集群部署 vLLM PD 分离', initiatorId: me })
+
+    expect(store.searchTasks('升级驱动').map((t) => t.title)).toEqual(['升级驱动到 550'])
+    expect(store.searchTasks('压测').map((t) => t.title)).toEqual(['整理压测基线'])
+    expect(store.searchTasks('Y 集群的分离部署').map((t) => t.title)).toContain('在 X 集群部署 vLLM PD 分离')
+    expect(store.searchTasks('完全无关的东西')).toEqual([])
+  })
+
+  it('坑的症状是中文也能检索到（原先单字查询永远不命中）', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.createLesson({ anchorKind: 'free', symptom: 'decode 起来但 prefill 连不上，初始化卡住', fixMd: '设置网卡名', authorId: me, sourceTaskId: t.id })
+    expect(store.searchLessons('启动时卡住了').map((l) => l.symptom)).toHaveLength(1)
+    expect(store.searchLessons('初始化')).toHaveLength(1)
+    // 远程下发的坑同样入索引
+    store.upsertRemoteLesson({ id: 'lsn_remote1', anchorRef: 'lin_x', symptom: '驱动版本不一致', fixMd: '统一驱动', authorName: '老王', localAuthorId: me, createdAt: 1 })
+    expect(store.searchLessons('驱动').map((l) => l.id)).toContain('lsn_remote1')
+  })
+
+  it('带 FTS 语法字符的查询不报错', () => {
+    store.createTask({ title: '升级 vLLM v0.11.2', initiatorId: me })
+    expect(() => store.searchTasks('v0.11.2 "quoted" -dash (paren) a*b: c^')).not.toThrow()
+    expect(store.searchTasks('v0.11.2').map((t) => t.title)).toContain('升级 vLLM v0.11.2')
+  })
+})
+
+describe('别人委派给我的任务（父步骤在对方机器上）', () => {
+  it('能建起来，读回来父步骤 id 还在（原先外键失败、整批下行回滚）', () => {
+    const t = store.createTask({ id: 'tsk_from_team', title: '压测', initiatorId: me, parentStepId: 'stp_on_other_machine' })
+    expect(store.getTask(t.id)!.parentStepId).toBe('stp_on_other_machine')
+  })
+
+  it('父步骤在本机时仍走带外键的列', () => {
+    const parent = store.createTask({ title: 'p', initiatorId: me })
+    const { steps } = store.createRunbook({ taskId: parent.id, createdBy: me, steps: [{ kind: 'delegate', title: '派' }] })
+    const child = store.createTask({ title: 'c', initiatorId: me, parentStepId: steps[0]!.id })
+    expect(store.getTask(child.id)!.parentStepId).toBe(steps[0]!.id)
+  })
+})
+
+describe('委派关联（委派方本机）', () => {
+  it('建关联、回流进度、按 runbook 取出', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { runbook, steps } = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: '派出去的一步' }] })
+    const d = store.createDelegation({ stepId: steps[0]!.id, teamTaskId: 'tsk_remote', assigneeName: 'xiaoa' })
+    expect(d).toMatchObject({ teamTaskId: 'tsk_remote', assigneeName: 'xiaoa', status: 'draft', done: 0, total: 0 })
+
+    const before = store.updateDelegationProgress(steps[0]!.id, { status: 'active', done: 2, total: 5, worstAlert: 'red' })
+    expect(before?.done).toBe(0)
+    expect(store.delegationsByRunbook(runbook.id)[steps[0]!.id]).toMatchObject({ status: 'active', done: 2, total: 5, worstAlert: 'red' })
+    expect(store.updateDelegationProgress('nope', { status: 'done', done: 1, total: 1, worstAlert: null })).toBeNull()
+  })
+})
+
+describe('下行去重', () => {
+  it('按 payload 里指定的字段判重（评论写的是 commentId）', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    store.appendEvent({ taskId: t.id, kind: 'comment', payload: { commentId: 'cmt_1', body: 'hi' } })
+    expect(store.hasEventWithPayloadId('comment', 'cmt_1', 'commentId')).toBe(true)
+    expect(store.hasEventWithPayloadId('comment', 'cmt_2', 'commentId')).toBe(false)
+  })
+})
+
 describe('Runbook', () => {
   const simpleSteps: NewStep[] = [
     { kind: 'command', title: '检查 GPU', command: 'nvidia-smi' },

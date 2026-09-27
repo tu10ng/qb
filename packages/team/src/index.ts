@@ -20,7 +20,7 @@ import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { openDb } from './db.ts'
 import { createApp } from './api.ts'
-import { TeamStore } from './store.ts'
+import { TeamStore, type TeamUser } from './store.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -36,12 +36,14 @@ const uiDir = arg('ui', join(HERE, '../../ui/dist'))
 
 const store = new TeamStore(openDb({ path: dbPath }))
 
-// 远程 UI 的实时刷新：所有已认证连接收 refresh 广播（带 taskId 增量）
-const clients = new Set<import('ws').WebSocket>()
+// 远程 UI 的实时刷新：每条连接只收它看得到的任务的 refresh（原先把所有
+// 任务 id 广播给所有连接）
+const clients = new Map<import('ws').WebSocket, TeamUser>()
 function broadcast(taskIds: string[]): void {
-  const msg = JSON.stringify({ type: 'refresh', taskIds })
-  for (const ws of clients) {
-    if (ws.readyState === ws.OPEN) ws.send(msg)
+  for (const [ws, user] of clients) {
+    if (ws.readyState !== ws.OPEN) continue
+    const visible = taskIds.filter((id) => store.canView(id, user))
+    if (visible.length > 0) ws.send(JSON.stringify({ type: 'refresh', taskIds: visible }))
   }
 }
 
@@ -61,9 +63,12 @@ if (existsSync(uiDir)) {
   // serve-static 的 root 要相对 cwd 的路径。
   // UI 构建的 base 是 /qb/（绝对路径），所以团队服务也要在 /qb/assets 下
   // 托管——同一份产物同时服务 "/"（远程首页）和 "/qb/*"（引擎路径）。
+  // 请求路径去掉 /qb 再到 dist 里找：原先按 dist/qb/assets/… 找，找不到就
+  // 落到下面的 index.html，JS 被当成 HTML 返回——远程界面一直是白屏
   const relRoot = relative(process.cwd(), uiDir).replaceAll('\\', '/')
-  app.use('/qb/assets/*', serveStatic({ root: relRoot }))
-  app.get('/qb/favicon.ico', serveStatic({ root: relRoot }))
+  const stripQb = (p: string): string => p.replace(/^\/qb/, '')
+  app.use('/qb/assets/*', serveStatic({ root: relRoot, rewriteRequestPath: stripQb }))
+  app.get('/qb/favicon.ico', serveStatic({ root: relRoot, rewriteRequestPath: stripQb }))
 }
 app.get('*', (c) => {
   if (indexHtml === null) {
@@ -90,13 +95,14 @@ server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     return
   }
   const token = new URLSearchParams(url.search).get('token') ?? ''
-  if (store.userByToken(token) === null) {
+  const user = store.userByToken(token)
+  if (user === null) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
     socket.destroy()
     return
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
-    clients.add(ws)
+    clients.set(ws, user)
     ws.on('close', () => clients.delete(ws))
     // 客户端回 pong 即视为活跃
     ws.on('pong', () => ((ws as unknown as { __missed?: number }).__missed = 0))
@@ -105,7 +111,7 @@ server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
 
 // 心跳：30 秒 ping 一轮，连续 3 次无回应就踢——死连接会堆积、慢连接会占内存
 setInterval(() => {
-  for (const ws of clients) {
+  for (const ws of clients.keys()) {
     const state = ws as unknown as { __missed?: number; terminate(): void }
     const missed = (state.__missed ?? 0) + 1
     if (missed > 3) {

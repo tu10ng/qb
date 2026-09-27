@@ -275,7 +275,7 @@ describe('坑库与底稿提议（M9）', () => {
     const result = store.ingestPush(lessonPush())
 
     // 发起人视角：黄告警出现
-    const alerts = store.openAlertsForUser('laowang')
+    const alerts = store.openAlertsForUser({ name: 'laowang', isAdmin: true })
     expect(alerts.some((a) => a.type === 'lesson_pending' && a.taskId === 'tsk_1')).toBe(true)
 
     // 作者（小A）不收回自己的坑；小B 的下行里有它
@@ -297,7 +297,7 @@ describe('坑库与底稿提议（M9）', () => {
     store.ingestPush(lessonPush())
     store.ingestPush(lessonPush()) // 重推：不重复
 
-    expect(store.openAlertsForUser('laowang').filter((a) => a.type === 'lesson_pending')).toHaveLength(1)
+    expect(store.openAlertsForUser({ name: 'laowang', isAdmin: true }).filter((a) => a.type === 'lesson_pending')).toHaveLength(1)
 
     // 非发起人不能确认
     const denied = await app.request('/api/lessons/lsn_1/confirm', {
@@ -314,7 +314,7 @@ describe('坑库与底稿提议（M9）', () => {
       body: JSON.stringify({ accept: true }),
     })
     expect(ok.status).toBe(200)
-    expect(store.openAlertsForUser('laowang').filter((a) => a.type === 'lesson_pending')).toHaveLength(0)
+    expect(store.openAlertsForUser({ name: 'laowang', isAdmin: true }).filter((a) => a.type === 'lesson_pending')).toHaveLength(0)
     expect(store.lessonById('lsn_1')!.status).toBe('confirmed')
 
     // 作者拉下行：拿到确认状态
@@ -409,5 +409,114 @@ describe('坑的驳回在带内传播（审查修复回归）', () => {
     const aDown = store.ingestPush(push1)
     const notice = aDown.down.find((d) => d.kind === 'lesson_status')
     expect((notice!.payload as { status: string }).status).toBe('declined')
+  })
+})
+
+describe('Phase 0：委派进度真的回流', () => {
+  it('子任务推快照（老引擎不带 parentStepId）→ 委派者收到进度；没变化不重发；完成再发', () => {
+    const { store } = fresh()
+    setupUsers(store)
+    const xiaob = store.createUser('xiaob', '小B')
+    store.issueToken(xiaob.id)
+    const a = store.userByName('tu10ng')!
+
+    // A（tu10ng）自己的任务里有一步 s_parent，委派给小B
+    store.ingestPush(pushBody({
+      tasks: [{ ...pushBody().tasks[0]!, steps: [{ taskId: 'tsk_1', id: 's_parent', parentId: null, orderKey: 'V', kind: 'delegate', title: '→ 小B: 压测', command: null, status: 'running', expectedMinutes: null, actualMs: null, statusNote: null }] }],
+      events: [], alerts: [],
+    }))
+    const { id: childId } = store.dispatchTask({ title: '压测', initiator: a, assigneeName: 'xiaob', parentStepId: 's_parent' })
+
+    const childPush = (status: string, done: number) =>
+      pushBody({
+        user: { name: 'xiaob', displayName: '小B' },
+        tasks: [{
+          id: childId, title: '压测', briefMd: '', initiatorName: 'tu10ng', assigneeName: 'xiaob', status,
+          expectedMinutes: null, startedAt: 1, endedAt: null, runbookVersion: 1,
+          steps: [0, 1, 2].map((i) => ({ taskId: childId, id: `c${i}`, parentId: null, orderKey: `k${i}`, kind: 'command', title: `c${i}`, command: 'x', status: i < done ? 'ok' : 'pending', expectedMinutes: null, actualMs: null, statusNote: null })),
+        }],
+        events: [], alerts: [], questions: [], lessons: [],
+      })
+
+    store.ingestPush(childPush('active', 1))
+    expect(store.taskById(childId)?.parentStepId).toBe('s_parent') // 从派活记录补上了
+
+    const pull = (since: number) => store.ingestPush(pushBody({ events: [], alerts: [], sinceDownSeq: since, tasks: [] }))
+    const first = pull(0)
+    const progress = first.down.filter((d) => d.kind === 'task_progress')
+    expect(progress).toHaveLength(1)
+    expect(progress[0]!.payload).toMatchObject({ task_id: childId, parent_step_id: 's_parent', status: 'active', done: 1, total: 3 })
+
+    // 同样的快照再推一遍：不产生新的进度下行
+    store.ingestPush(childPush('active', 1))
+    expect(pull(first.lastDownSeq).down.filter((d) => d.kind === 'task_progress')).toHaveLength(0)
+
+    // 对方完成
+    store.ingestPush(childPush('done', 3))
+    const done = pull(first.lastDownSeq).down.filter((d) => d.kind === 'task_progress')
+    expect(done).toHaveLength(1)
+    expect(done[0]!.payload).toMatchObject({ status: 'done', done: 3, total: 3 })
+  })
+})
+
+describe('Phase 0：团队服务权限', () => {
+  it('不相关的人读不到任务镜像；发起人、执行者、管理员能读', async () => {
+    const { app, store } = fresh()
+    const { initiatorToken, engineToken } = setupUsers(store)
+    const stranger = store.createUser('stranger', '路人')
+    const strangerToken = store.issueToken(stranger.id)
+    await app.request('/api/sync/push', { method: 'POST', headers: { authorization: `Bearer ${engineToken}`, 'content-type': 'application/json' }, body: JSON.stringify(pushBody({ questions: [{ id: 'qst_x', taskId: 'tsk_1', stepId: null, body: '求助', createdAt: 1 }] })) })
+
+    const get = (token: string) => app.request('/api/tasks/tsk_1', { headers: { authorization: `Bearer ${token}` } })
+    expect((await get(strangerToken)).status).toBe(404)
+    expect((await get(engineToken)).status).toBe(200)
+    expect((await get(initiatorToken)).status).toBe(200) // 老王既是发起人也是管理员
+
+    // 路人的总览里没有别人的任务（原先"任何人未回答的求助"对所有人可见）
+    const overview = (await (await app.request('/api/overview', { headers: { authorization: `Bearer ${strangerToken}` } })).json()) as { initiated: unknown[] }
+    expect(overview.initiated).toEqual([])
+    // 也不能替别人回答、评论、点知道了
+    const SH = { authorization: `Bearer ${strangerToken}`, 'content-type': 'application/json' }
+    expect((await app.request('/api/questions/qst_x/answer', { method: 'POST', headers: SH, body: JSON.stringify({ answer: 'x' }) })).status).toBe(404)
+    expect((await app.request('/api/tasks/tsk_1/comments', { method: 'POST', headers: SH, body: JSON.stringify({ body: 'x' }) })).status).toBe(404)
+  })
+
+  it('推送渠道列表只给管理员', async () => {
+    const { app, store } = fresh()
+    const { initiatorToken, engineToken } = setupUsers(store)
+    expect((await app.request('/api/push/channels', { headers: { authorization: `Bearer ${initiatorToken}` } })).status).toBe(200)
+    expect((await app.request('/api/push/channels', { headers: { authorization: `Bearer ${engineToken}` } })).status).toBe(403)
+  })
+
+  it('被写成发起人时自动建的占位用户，本人拿邀请注册时认领（原先报"名字已被用"）', async () => {
+    const { app, store } = fresh()
+    const { engineToken } = setupUsers(store)
+    // 小A 把还没注册的"laoli"写成了发起人
+    await app.request('/api/sync/push', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${engineToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify(pushBody({ tasks: [{ ...pushBody().tasks[0]!, initiatorName: 'laoli' }] })),
+    })
+    const invite = store.createInvite(60_000)
+    const join = await app.request('/api/join', { method: 'POST', body: JSON.stringify({ invite, name: 'laoli' }) })
+    expect(join.status).toBe(201)
+    const { token, claimed } = (await join.json()) as { token: string; claimed?: boolean }
+    expect(claimed).toBe(true)
+    const overview = (await (await app.request('/api/overview', { headers: { authorization: `Bearer ${token}` } })).json()) as { initiated: Array<{ id: string }>; openAlerts: unknown[] }
+    expect(overview.initiated.map((t) => t.id)).toEqual(['tsk_1'])
+    expect(overview.openAlerts).toHaveLength(1)
+
+    // 已有令牌的名字仍然不能被别人注册
+    const again = await app.request('/api/join', { method: 'POST', body: JSON.stringify({ invite: store.createInvite(60_000), name: 'laoli' }) })
+    expect(again.status).toBe(400)
+  })
+
+  it('共享输出随快照落库（原先被 zod 剥掉）', async () => {
+    const { app, store } = fresh()
+    const { engineToken } = setupUsers(store)
+    const body = pushBody()
+    body.tasks[0]!.steps![1] = { ...body.tasks[0]!.steps![1]!, lastOutput: 'NCCL WARN socketStartConnect failed' }
+    await app.request('/api/sync/push', { method: 'POST', headers: { authorization: `Bearer ${engineToken}`, 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    expect(store.stepsOf('tsk_1').find((s) => s.id === 's2')?.lastOutput).toBe('NCCL WARN socketStartConnect failed')
   })
 })

@@ -26,6 +26,7 @@ import {
   type User,
 } from '@qb/core'
 import type { Db } from './db.ts'
+import { cjkIndexText, ftsMatch } from './fts.ts'
 
 /** 保存时带的 rev 与库里不一致：别的标签页或别人先改了。 */
 export class RevConflict extends Error {
@@ -60,24 +61,19 @@ export interface StoredModelProfile {
   updatedAt: number
 }
 
-/**
- * FTS5 查询分词。
- *
- * 中文按字切、英文按词切，拼成 OR 查询。过滤掉 FTS 语法字符，
- * 否则用户任务标题里的引号、星号会让查询直接报错。
- */
-function tokenize(text: string): string[] {
-  const cleaned = text.replace(/["*()^:-]/g, ' ')
-  const out = new Set<string>()
-
-  for (const m of cleaned.matchAll(/[a-zA-Z][a-zA-Z0-9_.]*|\d+/g)) {
-    if (m[0].length >= 2) out.add(m[0].toLowerCase())
-  }
-  for (const m of cleaned.matchAll(/[一-鿿]/g)) {
-    out.add(m[0])
-  }
-
-  return [...out].slice(0, 40)
+/** 委派关联（委派方本机）：我这一步交给了谁、对方进度到哪了。 */
+export interface Delegation {
+  stepId: string
+  /** 对方任务在团队服务上的 id（对方引擎用同一个 id）。 */
+  teamTaskId: string
+  assigneeName: string
+  /** 对方任务的状态（draft/active/blocked/done/abandoned）。 */
+  status: string
+  done: number
+  total: number
+  worstAlert: 'red' | 'yellow' | null
+  createdAt: number
+  updatedAt: number
 }
 
 /**
@@ -159,15 +155,23 @@ export class Store {
       endedAt: null,
     }
 
+    // 父步骤在本机才进带外键的列；别人委派给我的（父步骤在对方机器上）进 ref 列
+    const localParent =
+      task.parentStepId !== null && this.db.prepare('SELECT 1 AS hit FROM steps WHERE id = ?').get(task.parentStepId) !== undefined
     this.db
       .prepare(
         `INSERT INTO tasks
-         (id, title, brief_md, initiator_id, assignee_id, parent_step_id, status,
-          expected_minutes, due_at, definition_of_done, created_at)
-         VALUES (@id, @title, @briefMd, @initiatorId, @assigneeId, @parentStepId, @status,
-                 @expectedMinutes, @dueAt, @definitionOfDone, @createdAt)`,
+         (id, title, brief_md, initiator_id, assignee_id, parent_step_id, parent_step_ref, status,
+          expected_minutes, due_at, definition_of_done, created_at, fts_cjk)
+         VALUES (@id, @title, @briefMd, @initiatorId, @assigneeId, @localParent, @remoteParent, @status,
+                 @expectedMinutes, @dueAt, @definitionOfDone, @createdAt, @ftsCjk)`,
       )
-      .run(task)
+      .run({
+        ...task,
+        localParent: localParent ? task.parentStepId : null,
+        remoteParent: localParent ? null : task.parentStepId,
+        ftsCjk: cjkIndexText(task.title, task.briefMd),
+      })
 
     return task
   }
@@ -214,14 +218,61 @@ export class Store {
     this.appendEvent({ taskId, actorId, kind: 'task_started', payload: {} })
   }
 
-  updateTaskStatus(taskId: string, status: TaskStatus, actorId: string | null): void {
-    const ended = status === 'done' || status === 'abandoned' ? Date.now() : null
+  /**
+   * 任务状态流转，每一步都记事件：
+   * - done / abandoned：打结束时间（完成 → 复盘，发起人那边告警随之解除）
+   * - blocked：执行者说"卡住了"，note 是原因（→ 🔴 替他开口）
+   * - active：从卡住恢复，或从完成/放弃重新打开（清掉结束时间）
+   *
+   * 状态没变时什么都不做，返回 false。
+   */
+  setTaskStatus(taskId: string, status: TaskStatus, actorId: string | null, opts: { note?: string; auto?: boolean } = {}): boolean {
+    const task = this.getTask(taskId)
+    if (task === null) throw new Error('任务不存在')
+    if (task.status === status) return false
+
+    const note = opts.note?.trim() ?? ''
+    const now = Date.now()
+    const ending = status === 'done' || status === 'abandoned'
+    const reopening = task.status === 'done' || task.status === 'abandoned'
     this.db
-      .prepare('UPDATE tasks SET status = ?, ended_at = COALESCE(?, ended_at) WHERE id = ?')
-      .run(status, ended, taskId)
-    if (status === 'done') {
-      this.appendEvent({ taskId, actorId, kind: 'task_done', payload: {} })
-    }
+      .prepare(
+        `UPDATE tasks SET status = ?,
+           ended_at   = CASE WHEN ? THEN ? WHEN ? THEN NULL ELSE ended_at END,
+           started_at = COALESCE(started_at, CASE WHEN ? THEN ? END)
+         WHERE id = ?`,
+      )
+      .run(status, ending ? 1 : 0, now, reopening ? 1 : 0, status === 'active' ? 1 : 0, now, taskId)
+
+    const payload: Record<string, unknown> = { from: task.status, ...(note !== '' ? { note } : {}), ...(opts.auto === true ? { auto: true } : {}) }
+    const kind: EventKind =
+      status === 'done'
+        ? 'task_done'
+        : status === 'abandoned'
+          ? 'task_abandoned'
+          : status === 'blocked'
+            ? 'task_blocked'
+            : reopening
+              ? 'task_reopened'
+              : task.status === 'blocked'
+                ? 'task_resumed'
+                : 'task_started'
+    this.appendEvent({ taskId, actorId, kind, payload })
+    return true
+  }
+
+  /** 兼容旧调用（委派进度回流用）：等同 setTaskStatus，不带原因。 */
+  updateTaskStatus(taskId: string, status: TaskStatus, actorId: string | null): void {
+    this.setTaskStatus(taskId, status, actorId)
+  }
+
+  /**
+   * 卡住之后又开始执行（跑了一步、贴了输出、标了完成）→ 自动恢复为进行中。
+   * 只在"真的往前走了"时恢复；改命令这类编辑不算——卡住往往正是在等别人。
+   */
+  resumeIfBlocked(taskId: string, actorId: string | null): void {
+    const task = this.getTask(taskId)
+    if (task?.status === 'blocked') this.setTaskStatus(taskId, 'active', actorId, { auto: true })
   }
 
   // ── Runbook ──────────────────────────────────────────────────
@@ -399,25 +450,21 @@ export class Store {
     return row === undefined ? null : { id: row.id, kind: row.kind, filename: row.filename }
   }
 
-  /** 找底稿：按标题+描述全文检索任务。 */
+  /** 找底稿：按标题+描述全文检索任务（中文按二元组，见 fts.ts）。 */
   searchTasks(query: string, limit = 6): Task[] {
-    const terms = tokenize(query)
-    if (terms.length === 0) return []
-    try {
-      const rows = this.db
-        .prepare(
-          `SELECT t.* FROM tasks_fts f
-           JOIN tasks t ON t.rowid = f.rowid
-           WHERE tasks_fts MATCH ?
-             AND t.archived_at IS NULL
-           ORDER BY bm25(tasks_fts), t.created_at DESC
-           LIMIT ?`,
-        )
-        .all(terms.join(' OR '), limit) as TaskRow[]
-      return rows.map(toTask)
-    } catch {
-      return []
-    }
+    const match = ftsMatch(query)
+    if (match === null) return []
+    const rows = this.db
+      .prepare(
+        `SELECT t.* FROM tasks_fts f
+         JOIN tasks t ON t.rowid = f.rowid
+         WHERE tasks_fts MATCH ?
+           AND t.archived_at IS NULL
+         ORDER BY bm25(tasks_fts), t.created_at DESC
+         LIMIT ?`,
+      )
+      .all(match, limit) as TaskRow[]
+    return rows.map(toTask)
   }
 
   /** 递归写入步骤树，自动生成 orderKey。 */
@@ -1061,11 +1108,11 @@ export class Store {
       .prepare(
         `INSERT INTO lessons
          (id, anchor_kind, anchor_ref, condition, symptom, cause, fix_md, next_time_md,
-          author_id, author_name, source_task_id, scope, created_at)
+          author_id, author_name, source_task_id, scope, created_at, fts_cjk)
          VALUES (@id, @anchorKind, @anchorRef, @condition, @symptom, @cause, @fixMd,
-                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, @createdAt)`,
+                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, @createdAt, @ftsCjk)`,
       )
-      .run(lesson)
+      .run({ ...lesson, ftsCjk: lessonCjk(lesson) })
 
     return lesson
   }
@@ -1163,11 +1210,11 @@ export class Store {
       .prepare(
         `INSERT INTO lessons
          (id, anchor_kind, anchor_ref, condition, symptom, cause, fix_md, next_time_md,
-          author_id, author_name, source_task_id, scope, uploaded, created_at)
+          author_id, author_name, source_task_id, scope, uploaded, created_at, fts_cjk)
          VALUES (@id, @anchorKind, @anchorRef, @condition, @symptom, @cause, @fixMd,
-                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, 1, @createdAt)`,
+                 @nextTimeMd, @authorId, @authorName, @sourceTaskId, @scope, 1, @createdAt, @ftsCjk)`,
       )
-      .run(lesson)
+      .run({ ...lesson, ftsCjk: lessonCjk(lesson) })
     if (l.confirmed === true) this.setRemoteLessonStatus(lesson.id, 'confirmed')
     return lesson
   }
@@ -1288,30 +1335,25 @@ export class Store {
   /**
    * 检索相关的坑。
    *
-   * FTS5 + unicode61 对中文是按字切分，召回偏宽但不会漏——对"别再踩
-   * 同一个坑"这个目标，宁可多给模型看几条也不要漏掉关键的那条。
+   * 中文按二元组、英文按词，OR 起来按 bm25 排——召回偏宽但不会漏：对
+   * "别再踩同一个坑"这个目标，宁可多给模型看几条也不要漏掉关键的那条。
    * 换 embeddings 时只改这个方法。
    */
   searchLessons(query: string, limit = 12): Lesson[] {
-    const terms = tokenize(query)
-    if (terms.length === 0) return this.recentLessons(limit)
+    const match = ftsMatch(query)
+    if (match === null) return this.recentLessons(limit)
 
-    try {
-      const rows = this.db
-        .prepare(
-          `SELECT l.* FROM lessons_fts f
-           JOIN lessons l ON l.rowid = f.rowid
-           WHERE lessons_fts MATCH ?
-             AND l.stale_at IS NULL
-           ORDER BY bm25(lessons_fts), l.hit_count DESC
-           LIMIT ?`,
-        )
-        .all(terms.join(' OR '), limit) as LessonRow[]
-      return rows.map(toLesson)
-    } catch {
-      // FTS 查询语法出错（用户输入里的特殊字符）不该让起草整个失败
-      return this.recentLessons(limit)
-    }
+    const rows = this.db
+      .prepare(
+        `SELECT l.* FROM lessons_fts f
+         JOIN lessons l ON l.rowid = f.rowid
+         WHERE lessons_fts MATCH ?
+           AND l.stale_at IS NULL
+         ORDER BY bm25(lessons_fts), l.hit_count DESC
+         LIMIT ?`,
+      )
+      .all(match, limit) as LessonRow[]
+    return rows.map(toLesson)
   }
 
   private recentLessons(limit: number): Lesson[] {
@@ -1534,18 +1576,16 @@ export class Store {
     return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) m FROM events').get() as { m: number }).m
   }
 
-  /** 同 kind 且 payload 里同 id 的事件是否已存在（下行去重用，低频小查询）。 */
-  hasEventWithPayloadId(kind: EventKind, id: string): boolean {
-    const rows = this.db
-      .prepare('SELECT payload_json FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 200')
-      .all(kind) as Array<{ payload_json: string }>
-    return rows.some((r) => {
-      try {
-        return (JSON.parse(r.payload_json) as { id?: unknown }).id === id
-      } catch {
-        return false
-      }
-    })
+  /**
+   * 同 kind 且 payload 里某个 id 字段等于它的事件是否已存在（下行去重用）。
+   * 字段名要和写入时一致——评论写的是 commentId；原先只认 id，评论去重
+   * 从来没生效过。
+   */
+  hasEventWithPayloadId(kind: EventKind, id: string, field = 'id'): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 AS hit FROM events WHERE kind = ? AND json_extract(payload_json, ?) = ? LIMIT 1`)
+      .get(kind, `$.${field}`, id) as { hit: number } | undefined
+    return row !== undefined
   }
 
     /** 告警静音（"我能搞定"）。 */
@@ -1578,6 +1618,47 @@ export class Store {
       .prepare('SELECT 1 AS hit FROM lessons WHERE source_task_id = ? AND symptom = ? LIMIT 1')
       .get(taskId, symptom) as { hit: number } | undefined
     return row !== undefined
+  }
+
+  // ── 委派（委派方本机只记关联与进度）────────────────────────
+
+  createDelegation(input: { stepId: string; teamTaskId: string; assigneeName: string }): Delegation {
+    const now = Date.now()
+    this.db
+      .prepare(
+        `INSERT INTO delegations (step_id, team_task_id, assignee_name, status, done, total, worst_alert, created_at, updated_at)
+         VALUES (?, ?, ?, 'draft', 0, 0, NULL, ?, ?)
+         ON CONFLICT(step_id) DO UPDATE SET team_task_id = excluded.team_task_id, assignee_name = excluded.assignee_name,
+           status = 'draft', done = 0, total = 0, worst_alert = NULL, updated_at = excluded.updated_at`,
+      )
+      .run(input.stepId, input.teamTaskId, input.assigneeName, now, now)
+    return this.delegationOf(input.stepId)!
+  }
+
+  delegationOf(stepId: string): Delegation | null {
+    const r = this.db.prepare('SELECT * FROM delegations WHERE step_id = ?').get(stepId) as DelegationRow | undefined
+    return r === undefined ? null : toDelegation(r)
+  }
+
+  /** 一份 runbook 上的全部委派，按步骤 id 索引（任务详情一次带出）。 */
+  delegationsByRunbook(runbookId: string): Record<string, Delegation> {
+    const rows = this.db
+      .prepare('SELECT d.* FROM delegations d JOIN steps s ON s.id = d.step_id WHERE s.runbook_id = ?')
+      .all(runbookId) as DelegationRow[]
+    return Object.fromEntries(rows.map((r) => [r.step_id, toDelegation(r)]))
+  }
+
+  /** 对方进度回流。返回更新前的值，调用方据此判断是否值得记一条事件。 */
+  updateDelegationProgress(
+    stepId: string,
+    p: { status: string; done: number; total: number; worstAlert: 'red' | 'yellow' | null },
+  ): Delegation | null {
+    const before = this.delegationOf(stepId)
+    if (before === null) return null
+    this.db
+      .prepare('UPDATE delegations SET status = ?, done = ?, total = ?, worst_alert = ?, updated_at = ? WHERE step_id = ?')
+      .run(p.status, p.done, p.total, p.worstAlert, Date.now(), stepId)
+    return before
   }
 }
 
@@ -1648,6 +1729,7 @@ interface TaskRow {
   initiator_id: string
   assignee_id: string
   parent_step_id: string | null
+  parent_step_ref: string | null
   status: string
   expected_minutes: number | null
   due_at: number | null
@@ -1853,6 +1935,37 @@ function toLessonOffer(r: Record<string, unknown>): LessonOfferRow {
   }
 }
 
+interface DelegationRow {
+  step_id: string
+  team_task_id: string
+  assignee_name: string
+  status: string
+  done: number
+  total: number
+  worst_alert: string | null
+  created_at: number
+  updated_at: number
+}
+
+function toDelegation(r: DelegationRow): Delegation {
+  return {
+    stepId: r.step_id,
+    teamTaskId: r.team_task_id,
+    assigneeName: r.assignee_name,
+    status: r.status,
+    done: r.done,
+    total: r.total,
+    worstAlert: r.worst_alert === 'red' || r.worst_alert === 'yellow' ? r.worst_alert : null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+/** 坑的中文检索列：症状、原因、修法、下次怎么做、条件一起切。 */
+function lessonCjk(l: Pick<Lesson, 'symptom' | 'cause' | 'fixMd' | 'nextTimeMd' | 'condition'>): string {
+  return cjkIndexText(l.symptom, l.cause, l.fixMd, l.nextTimeMd, l.condition)
+}
+
 function toUser(r: UserRow): User {
   return { id: r.id, name: r.name, displayName: r.display_name, createdAt: r.created_at }
 }
@@ -1864,7 +1977,7 @@ function toTask(r: TaskRow): Task {
     briefMd: r.brief_md,
     initiatorId: r.initiator_id,
     assigneeId: r.assignee_id,
-    parentStepId: r.parent_step_id,
+    parentStepId: r.parent_step_id ?? r.parent_step_ref ?? null,
     status: r.status as TaskStatus,
     expectedMinutes: r.expected_minutes,
     dueAt: r.due_at,

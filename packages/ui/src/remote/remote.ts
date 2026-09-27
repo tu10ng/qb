@@ -5,8 +5,10 @@
  * 令牌放 localStorage（团队服务的个人令牌）。
  */
 
-// base 固定 /qb/（vite 配置），团队服务也在 /qb/ 下托管 API
-const BASE = '/qb/api'
+// 远程模式就是"团队服务在 / 下托管的那份界面"（main.tsx 按路径分流），团队
+// 服务的 API 在 /api。原先写成 /qb/api——团队服务上那是 index.html，远程界面
+// 登录、看任务全部失败（只有静态资源才走 vite 的 /qb/ 基准）
+const BASE = '/api'
 const TOKEN_KEY = 'qb-team-token'
 
 export function getToken(): string {
@@ -130,7 +132,7 @@ export const remoteApi = {
   join: (invite: string, name: string) =>
     req<{ user: { displayName: string }; token: string }>('/join', { method: 'POST', body: JSON.stringify({ invite, name }) }),
 
-  me: () => req<{ displayName: string }>('/me'),
+  me: () => req<{ name: string; displayName: string; isAdmin: boolean }>('/me'),
 
   overview: () =>
     req<{ initiated: RemoteTask[]; assigned: RemoteTask[]; openAlerts: RemoteAlert[] }>('/overview'),

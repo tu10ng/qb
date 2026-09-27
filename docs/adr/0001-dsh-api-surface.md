@@ -12,21 +12,21 @@ QB 的执行层需要：本地 GUI、能调本地工具、带超时地执行命�
 
 ## 决策
 
-### 1. 只依赖下列 API（经安装后读真实 `.d.ts` 验证）
+### 1. 实际依赖的 API（2026-09-28 按代码核对；经安装后读真实 `.d.ts` 验证）
 
 | 能力 | API | 用途 |
 |---|---|---|
 | HTTP 路由 | `ctx.webServer.register({ kind: 'exact' \| 'prefix', path, handler })` → 返回 disposer | 挂 `/qb`（SPA）与 `/qb/api`（REST） |
 | WebSocket | `ctx.webServer.registerUpgrade({ path, handler })` | 挂 `/qb/ws`（步骤输出流式推送） |
 | 端口信息 | `ctx.webServer.port` / `.host` | 启动器打印 URL |
-| 命令执行 | `ctx.shell.resolve(req) → spec`；`ctx.shell.run(spec) → ShellRunResult` | `command` / `check` 步骤 |
-| 长任务 | `ctx.shell.start(spec) → ShellProcess { status, done, readOutput(), kill() }` | `wait` 步骤（起服务、下模型） |
-| ~~模型~~ | ~~`ctx.llm`~~ **已被 ADR 0002 取代**：GenerateOptions 没有 toolChoice，QB 改走 Vercel AI SDK | — |
-| 后台任务 | `ctx.jobs` | `wait` 步骤的就绪轮询 |
-| 定时 | `ctx.schedule` | 回访、卡住检测、摘要 |
-| 会话事件 | `session/event` 订阅 | 旁观模式读 `command/run`、`tool/result` |
-| 工具注册 | `ctx.tools.register(defineTool(...))` | 让模型能调 QB 的工具 |
-| 提示词 | `ctx.systemPrompt.section(...)` | 注入 QB 人格与当前任务上下文 |
+| 命令执行 | `ctx.shell.resolve(req) → spec`；`ctx.shell.start(spec) → ShellProcess { status, done, readOutput(), kill() }` | 所有步骤执行（`run()` 在 PowerShell 下拿不到输出，统一走 `start()`，超时自己计） |
+| 定时 | cordis `timer`：`ctx.setInterval` / `ctx.setTimeout` | 同步拍子、告警定时重算、就绪轮询间隔、超时 |
+
+`inject` 就是 `['webServer', 'shell', 'timer']`，别的都没用。
+
+**原先列在这里、但从没用上的**（按原方案 §8.2 设想过）：`ctx.jobs`、`ctx.schedule`、`session/event` 订阅、`ctx.tools.register`、`ctx.systemPrompt.section`。模型调用见 ADR 0002（不走 `ctx.llm`）。
+
+这意味着 QB 目前是"借 dsh 端口和 shell 的独立应用"：界面是独立 SPA，不在 dsh 的客户端插件体系里；AI 不在 dsh 会话里跑。dsh 社区的界面插件和 agent 插件都接不进来——而这恰恰是选 dsh 的理由（能简单地对接社区插件，例如 dsh-visualize）。把 QB 放回 dsh 的两个扩展面（agent 平面：工具 / skill / 提示词；客户端插件：会话卡片、右侧栏）是下一阶段的事，届时另写 ADR 0003，并把 bundle 打包和版本策略一起定下来。
 
 关键类型（来自 `@deepseek-ai/dsh-shell`）：
 
@@ -71,10 +71,11 @@ interface ShellProcess {
 interface HostPort {
   runCommand(req: RunRequest): Promise<RunResult>
   startCommand(req: RunRequest): StreamingRun
-  complete(req: CompletionRequest): Promise<Completion>
-  schedule(at: Date | number, fn: () => void): Disposable
+  schedule(delayMs: number, fn: () => void): Disposable
 }
 ```
+
+（`complete` 已按 ADR 0002 移除。）
 
 - 换 harness（Claude Agent SDK / 自研 loop）只需另写一个 `HostPort` 实现。
 
@@ -97,6 +98,7 @@ peer 版本不匹配的 bundle 会被 dsh **静默跳过**（记入 `skippedBund
 
 ## 后果
 
-- 正面：复用 dsh 的本地 GUI 宿主、shell seam、模型适配、事件日志与整个插件生态，QB 只写领域逻辑。
+- 正面：复用 dsh 的本地 HTTP 宿主与 shell seam（Windows 上 PowerShell/GBK 输出、输出落盘这些坑由它处理），QB 只写领域逻辑。
+- 现状（2026-09-28 核对）：原先设想复用的模型适配、事件日志与插件生态**都还没用上**，见上文"原先列在这里、但从没用上的"。
 - 负面：绑定一个 pre-stable 的运行时；升级 dsh 需回归测试 `packages/engine/src/dsh/`。
 - 缓解：精确版本锁 + 单一适配目录 + 启动自检。

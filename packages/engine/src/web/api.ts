@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { NeedsConfirmation, runStep, type StepRunHandle } from '../runner/run-step.ts'
+import { NeedsConfirmation, runStep } from '../runner/run-step.ts'
+import { runWaitStep } from '../runner/wait-step.ts'
 import { draftRunbook, partialSteps } from '../agent/draft.ts'
 import { diagnoseFailure } from '../agent/diagnose.ts'
 import type { Llm } from '../llm/port.ts'
@@ -17,8 +18,8 @@ import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/store'
-import type { Step, StepStatus, Verdict } from '@qb/core'
-import { checkExpectation, redact, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind } from '@qb/core'
+import type { Param, Step, StepStatus, Verdict } from '@qb/core'
+import { assessDanger, checkExpectation, redact, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind, TaskStatus } from '@qb/core'
 
 /** 落库的证据文本上限。报错在尾部，截前面；整份详情接口扛不住几十 MB 的日志。 */
 const EVIDENCE_MAX_CHARS = 64 * 1024
@@ -39,7 +40,15 @@ export interface ApiDeps {
   /** 本机用户名（委派等场景要标"是谁干的"）。 */
   userName: () => string
   team: { settings: import('../sync/sync.ts').TeamSettings; sync: import('../sync/sync.ts').Sync }
+  /** 运行中步骤的最近输出时间（失控告警要分清"在跑"和"卡死"；sync 读它）。 */
+  activity: Map<string, number>
 }
+
+/** 人能设的任务状态："完成任务""卡住了""继续""放弃""重新打开"。 */
+const TaskStatusBody = z.object({
+  status: TaskStatus.exclude(['draft']),
+  note: z.string().max(2000).optional(),
+})
 
 /** 整份替换接口的输入校验。之前直接 as 断言，畸形的 expectation 能入库。 */
 interface StepInputT {
@@ -88,16 +97,18 @@ const RunbookBody = z.object({
 })
 
 const DEFAULT_TIMEOUT_MS = 120_000
+/** wait 步骤没给超时时等多久就绪。 */
+const WAIT_DEFAULT_TIMEOUT_MS = 15 * 60_000
 
 /** 草稿部分结果的推送间隔：够跟手，又不至于淹掉 WS。 */
 const PARTIAL_PUSH_MS = 250
 
 export function buildApi(deps: ApiDeps): Router {
-  const { host, store, ws, mount, currentUserId, prompts, llm, settings, attachments } = deps
+  const { host, store, ws, mount, currentUserId, prompts, llm, settings, attachments, activity } = deps
   const router = new Router(`${mount}/api`, (req) => deps.guard.http(req))
 
-  // 正在执行的步骤：用于取消、防重复启动
-  const running = new Map<string, StepRunHandle>()
+  // 正在执行的步骤（含 wait 步骤的"盯着"）：用于取消、防重复启动
+  const running = new Map<string, { cancel(): boolean }>()
 
   // 后台任务（起草、诊断、看图、测试连接）：模型调用慢且耗时不可预测，不占 HTTP 连接
   const jobs = new Jobs({
@@ -185,6 +196,35 @@ export function buildApi(deps: ApiDeps): Router {
     sendJson(res, 200, task)
   })
 
+  /**
+   * 任务状态：完成（→ 复盘；发起人那边告警随之解除、看到"完成了"）、
+   * 卡住了（带一句原因 → 🔴 替执行者开口）、继续、放弃、重新打开。
+   * 原先没有任何路径能把任务置为完成或卡住。
+   */
+  router.post('/tasks/:id/status', (_req, res, ctx) => {
+    const taskId = ctx.params.id!
+    const task = store.getTask(taskId)
+    if (task === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+    const parsed = TaskStatusBody.safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
+      return
+    }
+    const { status, note } = parsed.data
+    const latest = store.getLatestRunbook(taskId)
+    if ((status === 'done' || status === 'abandoned') && (latest?.steps ?? []).some((s) => running.has(s.id))) {
+      sendJson(res, 409, { error: 'running', message: '还有步骤在执行，先等它跑完或取消' })
+      return
+    }
+    const changed = store.setTaskStatus(taskId, status, currentUserId(), note !== undefined ? { note } : {})
+    if (changed) ws.broadcast({ type: 'runbook.changed', taskId, stepId: null })
+    deps.team.sync.pushNow()
+    sendJson(res, 200, { task: store.getTask(taskId), changed })
+  })
+
   /** 任务详情：runbook + 步骤 + 事件，一次取全，省得前端串行请求。 */
   router.get('/tasks/:id/runbook', (_req, res, ctx) => {
     const taskId = ctx.params.id!
@@ -202,6 +242,8 @@ export function buildApi(deps: ApiDeps): Router {
       events: store.listEvents(taskId),
       // 历史输出按步骤分组带上：刷新页面后还能看到上次跑出了什么
       evidence: latest === null ? {} : store.evidenceByRunbook(latest.runbook.id),
+      // 委派出去的步骤：交给了谁、对方进度（委派行显示）
+      delegations: latest === null ? {} : store.delegationsByRunbook(latest.runbook.id),
       // 进行中的后台任务：刷新后能接回"QB 正在起草/看截图"
       jobs: [taskId, ...(latest?.steps ?? []).map((s) => s.id)].flatMap((id) => jobs.activeFor(id)),
       // M7：导入来的 runbook 带保真报告与素材指针（贴了素材的任务才能"从素材整理"）
@@ -306,11 +348,21 @@ export function buildApi(deps: ApiDeps): Router {
         },
       )
 
+      // 起草写出的 {{参数}} 进参数表（QB 猜的·待确认）：原先只写 assumptions，
+      // 参数面板不出现，步骤却提示"在上面的参数面板里补上"——死路
+      const params: Param[] = draft.params.map((p) => ({
+        name: p.name,
+        value: p.value,
+        source: 'qb_guess',
+        secret: false,
+        ...(p.description !== undefined ? { description: p.description } : {}),
+      }))
       const result = store.createRunbook({
         taskId,
         createdBy: currentUserId(),
         origin: 'draft',
         assumptions: draft.assumptions,
+        params,
         steps: draft.steps as Parameters<Store['createRunbook']>[0]['steps'],
       })
 
@@ -391,7 +443,23 @@ export function buildApi(deps: ApiDeps): Router {
       return
     }
 
-    let handle: StepRunHandle
+    // wait 步骤带就绪条件：起命令并盯着，就绪即通过（见 runner/wait-step.ts）
+    if (step.kind === 'wait' && step.probe !== null) {
+      const danger = assessDanger(rendered.text)
+      if (danger.level === 'destructive' && body.confirmed !== true) {
+        sendJson(res, 409, { error: 'needs_confirmation', message: `命令需要确认：${danger.matched.join('、')}`, matched: danger.matched, command: rendered.text })
+        return
+      }
+      const started = startWatch(step, taskId, rendered.text)
+      if (started !== null) {
+        sendJson(res, 400, { error: 'watch_failed', message: started })
+        return
+      }
+      sendJson(res, 202, { stepId, status: 'running', watching: true })
+      return
+    }
+
+    let handle: ReturnType<typeof runStep>
     try {
       handle = runStep(host, {
         stepId,
@@ -419,20 +487,24 @@ export function buildApi(deps: ApiDeps): Router {
 
     const startedAt = Date.now()
     running.set(stepId, handle)
+    activity.set(stepId, startedAt)
     store.updateStepStatus(stepId, 'running', { startedAt })
     if (taskId !== null) {
       store.markTaskStarted(taskId, currentUserId())
+      store.resumeIfBlocked(taskId, currentUserId())
       store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'step_run', payload: {} })
     }
     ws.broadcast({ type: 'step.status', stepId, status: 'running' })
 
     handle.onChunk((chunk) => {
+      activity.set(stepId, Date.now())
       ws.broadcast({ type: 'step.output', stepId, text: chunk.text, lossy: chunk.lossy })
     })
 
     void handle.outcome
       .then((outcome) => {
         running.delete(stepId)
+        activity.delete(stepId)
 
         const status: StepStatus = outcome.verdict === 'pass' ? 'ok' : outcome.verdict === 'fail' ? 'failed' : 'running'
         const endedAt = Date.now()
@@ -486,12 +558,111 @@ export function buildApi(deps: ApiDeps): Router {
       })
       .catch((e: unknown) => {
         running.delete(stepId)
+        activity.delete(stepId)
         store.updateStepStatus(stepId, 'failed', { endedAt: Date.now() })
         ws.broadcast({ type: 'step.error', stepId, message: errMessage(e) })
       })
 
     sendJson(res, 202, { stepId, status: 'running' })
   })
+
+  /**
+   * 只盯着：命令是人在 SecureCRT/Xshell 里跑的，QB 在本机轮询就绪条件
+   * （health 地址、端口、探测命令），就绪即把这一步标成通过。
+   */
+  router.post('/steps/:id/watch', (_req, res, ctx) => {
+    const stepId = ctx.params.id!
+    const step = store.getStep(stepId)
+    if (step === null) {
+      sendJson(res, 404, { error: 'not_found', message: '步骤不存在' })
+      return
+    }
+    if (step.probe === null) {
+      sendJson(res, 400, { error: 'no_probe', message: '这一步没有就绪条件（health 地址 / 端口 / 探测命令），没法盯' })
+      return
+    }
+    if (running.has(stepId)) {
+      sendJson(res, 409, { error: 'already_running', message: '这一步已经在执行或在盯着了' })
+      return
+    }
+    const failed = startWatch(step, store.taskIdOfStep(stepId), null)
+    if (failed !== null) {
+      sendJson(res, 400, { error: 'watch_failed', message: failed })
+      return
+    }
+    sendJson(res, 202, { stepId, status: 'running', watching: true })
+  })
+
+  /**
+   * 起一次"盯着"（运行并盯着 / 只盯着）。返回 null 表示已开始，否则是
+   * 开不了的原因。进度经 WS 的 step.probe 推给界面，结束时同 step.done。
+   */
+  function startWatch(step: Step, taskId: string | null, command: string | null): string | null {
+    const stepId = step.id
+    let handle: ReturnType<typeof runWaitStep>
+    try {
+      handle = runWaitStep(host, {
+        command,
+        probe: step.probe!,
+        timeoutMs: step.timeoutMs ?? WAIT_DEFAULT_TIMEOUT_MS,
+        onAttempt: (attempt, detail) => ws.broadcast({ type: 'step.probe', stepId, attempt, detail }),
+        onChunk: (text) => {
+          activity.set(stepId, Date.now())
+          ws.broadcast({ type: 'step.output', stepId, text, lossy: false })
+        },
+      })
+    } catch (e) {
+      return errMessage(e)
+    }
+
+    const startedAt = Date.now()
+    running.set(stepId, handle)
+    activity.set(stepId, startedAt)
+    store.updateStepStatus(stepId, 'running', { startedAt })
+    if (taskId !== null) {
+      store.markTaskStarted(taskId, currentUserId())
+      store.resumeIfBlocked(taskId, currentUserId())
+      store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'step_run', payload: { watch: command === null ? 'only' : 'run' } })
+    }
+    ws.broadcast({ type: 'step.status', stepId, status: 'running' })
+
+    void handle.outcome.then((o) => {
+      running.delete(stepId)
+      activity.delete(stepId)
+      const current = store.getStep(stepId)
+      // 盯着期间用户自己点了完成/跳过：人的判断优先，不覆盖
+      if (current === null || current.status !== 'running') return
+
+      const status: StepStatus = o.ready ? 'ok' : 'failed'
+      store.updateStepStatus(stepId, status, { endedAt: Date.now(), actualMs: o.elapsedMs, ...(o.ready ? {} : { note: o.detail }) })
+      const text = [o.output.trim() !== '' ? tailCap(o.output, EVIDENCE_MAX_CHARS).text : '', `—— QB 盯着的结果：${o.detail}（探测 ${o.attempts} 次）`]
+        .filter(Boolean)
+        .join('\n')
+      store.addEvidence({ stepId, source: 'auto', text, exitCode: o.exited?.exitCode ?? null, durationMs: o.elapsedMs })
+      if (taskId !== null) {
+        store.appendEvent({
+          taskId,
+          stepId,
+          actorId: currentUserId(),
+          kind: o.ready ? 'step_ok' : o.cancelled ? 'step_failed' : 'step_timeout',
+          payload: { verdict: o.ready ? 'pass' : 'fail', reason: o.detail, durationMs: o.elapsedMs, watch: true },
+        })
+        if (o.ready) onStepOk(store, taskId, stepId)
+      }
+      ws.broadcast({
+        type: 'step.done',
+        stepId,
+        verdict: o.ready ? 'pass' : 'fail',
+        reason: o.detail,
+        exitCode: o.exited?.exitCode ?? null,
+        timedOut: !o.ready && !o.cancelled,
+        durationMs: o.elapsedMs,
+        danger: 'safe',
+        redactionHits: [],
+      })
+    })
+    return null
+  }
 
   /**
    * 手动提交证据：用户自己跑完命令，把输出或截图贴回来。
@@ -603,6 +774,7 @@ export function buildApi(deps: ApiDeps): Router {
 
     if (taskId !== null) {
       store.markTaskStarted(taskId, currentUserId())
+      store.resumeIfBlocked(taskId, currentUserId())
       if (!judging || status !== step.status) {
         store.appendEvent({
           taskId,
@@ -780,7 +952,7 @@ export function buildApi(deps: ApiDeps): Router {
   registerSettingsRoutes(router, { settings, llm, jobs })
   registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
   registerM9Routes(router, { store, ws, currentUserId, team: deps.team.settings, sync: deps.team.sync })
-  registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, currentUserId, userName: () => deps.userName() })
+  registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, ws, currentUserId, userName: () => deps.userName() })
 
   return router
 }

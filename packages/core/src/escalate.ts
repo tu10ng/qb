@@ -7,13 +7,18 @@
  *
  * 🔴 需要你（信件栈 + IM）：求助发出 / 标记阻塞 / 同一步连续失败 3 次 /
  *    失败后长时间无进展 / 运行远超预期且无输出
- * 🟡 值得一看（信件栈）：某步超预计 2 倍 / 任务超预计 1.5 倍
+ * 🟡 值得一看（信件栈）：某步超预计 2 倍 / 任务超预计 1.5 倍 /
+ *    进行中却长时间没有动静 / 派来很久还没开始
  * 🔵 进展：不在这里出告警，只进时间线
+ *
+ * "没有动静"只看执行者自己的动作（ACTIVITY_KINDS）。QB 和发起人产生的
+ * 事件（告诉了发起人、评论、坑到达……）不算执行者有进展——否则 QB 一
+ * 开口，停滞条件就被自己的那条事件"解除"，告警来回闪。
  *
  * 阈值都是可调参数（AlertThresholds）。
  */
 
-import type { Event, Step, Task } from './schema.ts'
+import type { Event, EventKind, Step, Task } from './schema.ts'
 
 export type AlertLevel = 'red' | 'yellow'
 
@@ -30,6 +35,10 @@ export interface AlertThresholds {
   stepOvertimeFactor: number
   /** 任务总耗时超过预计的多少倍值得一看。 */
   taskOvertimeFactor: number
+  /** 进行中的任务多久没有执行者动作算"没有动静"（当前步预计耗时的 2 倍更长时取它）。 */
+  idleMs: number
+  /** 别人派来的任务多久还没开始值得一看。 */
+  notStartedMs: number
 }
 
 export const DEFAULT_THRESHOLDS: AlertThresholds = {
@@ -39,7 +48,32 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   runAwayNoOutputMs: 10 * 60_000,
   stepOvertimeFactor: 2,
   taskOvertimeFactor: 1.5,
+  idleMs: 60 * 60_000,
+  notStartedMs: 2 * 60 * 60_000,
 }
+
+/**
+ * 执行者自己的动作。停滞、没有动静都按"最后一次执行者动作"算。
+ */
+export const ACTIVITY_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
+  'step_run',
+  'step_ok',
+  'step_failed',
+  'step_timeout',
+  'step_skipped',
+  'edit',
+  'reorder',
+  'insert',
+  'step_deleted',
+  'step_restored',
+  'situation_changed',
+  'question_asked',
+  'replanned',
+  'task_started',
+  'task_resumed',
+  'task_reopened',
+  'lesson_proposed',
+])
 
 /** 一条告警决策。key 用于去重与解除：同一 (task, step, type) 只有一条。 */
 export interface AlertDecision {
@@ -55,6 +89,8 @@ export interface AlertDecision {
     | 'runaway' // 运行远超预期
     | 'step_overtime' // 某步超预计
     | 'task_overtime' // 任务整体超预计
+    | 'idle' // 进行中却长时间没有动静
+    | 'not_started' // 派来很久还没开始
   message: string
   /** 告警引用的事实时间（用于展示"已 18 分钟"）。 */
   at: number
@@ -85,6 +121,9 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
   const out: AlertDecision[] = []
   if (task.status === 'done' || task.status === 'abandoned') return out
 
+  const minutes = (ms: number): number => Math.round(ms / 60_000)
+  const lastActivity = [...events].reverse().find((e) => ACTIVITY_KINDS.has(e.kind))
+
   // 🔴 求助发出：没有回答之前一直红
   const asked = [...events].reverse().find((e) => e.kind === 'question_asked' || e.kind === 'question_answered')
   if (asked !== undefined && asked.kind === 'question_asked') {
@@ -94,21 +133,23 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
       stepId: asked.stepId,
       level: 'red',
       type: 'question',
-      message: `发出了求助，还没有回答 · ${Math.round((now - asked.createdAt) / 60_000)} 分钟`,
+      message: `发出了求助，还没有回答 · ${minutes(now - asked.createdAt)} 分钟`,
       at: asked.createdAt,
     })
   }
 
-  // 🔴 标记阻塞
+  // 🔴 标记阻塞：带上执行者写的那句原因
   if (task.status === 'blocked') {
+    const blockedAt = [...events].reverse().find((e) => e.kind === 'task_blocked')
+    const note = typeof blockedAt?.payload.note === 'string' ? blockedAt.payload.note.trim() : ''
     out.push({
       key: 'blocked:task',
       taskId: task.id,
       stepId: null,
       level: 'red',
       type: 'blocked',
-      message: '任务被标记为阻塞',
-      at: now,
+      message: note !== '' ? `卡住了：${note}` : '卡住了，需要你介入',
+      at: blockedAt?.createdAt ?? now,
     })
   }
 
@@ -129,28 +170,29 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
     }
   }
 
-  // 🔴 停滞：最近一次事件是失败/超时，之后再也没有动静
-  const last = events[events.length - 1]
+  // 🔴 停滞：执行者最后一个动作是失败/超时，之后再也没有动静
   if (
-    last !== undefined &&
-    (last.kind === 'step_failed' || last.kind === 'step_timeout') &&
-    now - last.createdAt >= t.stalledAfterMs
+    lastActivity !== undefined &&
+    (lastActivity.kind === 'step_failed' || lastActivity.kind === 'step_timeout') &&
+    now - lastActivity.createdAt >= t.stalledAfterMs
   ) {
-    const step = steps.find((s) => s.id === last.stepId)
+    const step = steps.find((s) => s.id === lastActivity.stepId)
     out.push({
-      key: `stalled:${last.stepId ?? 'task'}`,
+      key: `stalled:${lastActivity.stepId ?? 'task'}`,
       taskId: task.id,
-      stepId: last.stepId,
+      stepId: lastActivity.stepId,
       level: 'red',
       type: 'stalled',
-      message: `失败后 ${Math.round((now - last.createdAt) / 60_000)} 分钟没有进展${step !== undefined ? `（${step.title}）` : ''}`,
-      at: last.createdAt,
+      message: `失败后 ${minutes(now - lastActivity.createdAt)} 分钟没有进展${step !== undefined ? `（${step.title}）` : ''}`,
+      at: lastActivity.createdAt,
     })
   }
 
   // 🔴 失控：正在跑的步骤远超预计耗时**且**最近 10 分钟没有任何输出。
   // 只看耗时不管输出会把正常的"长任务"（起 vLLM 要 8 分钟）误报。
+  // 委派出去的步骤不在本机跑，由对方任务自己的告警负责。
   for (const step of steps) {
+    if (step.kind === 'delegate') continue
     if (step.status !== 'running' || step.expectedMinutes === null || step.startedAt === null) continue
     const expectedMs = step.expectedMinutes * 60_000
     if (now - step.startedAt < expectedMs * t.runAwayFactor) continue
@@ -162,7 +204,7 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
       stepId: step.id,
       level: 'red',
       type: 'runaway',
-      message: `「${step.title}」已运行 ${Math.round((now - step.startedAt) / 60_000)} 分钟（预计 ${step.expectedMinutes} 分钟），${Math.round((now - lastSeen) / 60_000)} 分钟没有输出`,
+      message: `「${step.title}」已运行 ${minutes(now - step.startedAt)} 分钟（预计 ${step.expectedMinutes} 分钟），${minutes(now - lastSeen)} 分钟没有输出`,
       at: lastSeen,
     })
   }
@@ -178,7 +220,7 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
         stepId: step.id,
         level: 'yellow',
         type: 'step_overtime',
-        message: `「${step.title}」耗时 ${Math.round(step.actualMs / 60_000)} 分钟，预计 ${step.expectedMinutes} 分钟`,
+        message: `「${step.title}」耗时 ${minutes(step.actualMs)} 分钟，预计 ${step.expectedMinutes} 分钟`,
         at: step.endedAt ?? now,
       })
     }
@@ -193,8 +235,41 @@ export function evaluateAlerts(input: EscalateInput): AlertDecision[] {
       stepId: null,
       level: 'yellow',
       type: 'task_overtime',
-      message: `任务已进行 ${Math.round((now - startedAt) / 60_000)} 分钟，预计 ${task.expectedMinutes} 分钟`,
+      message: `任务已进行 ${minutes(now - startedAt)} 分钟，预计 ${task.expectedMinutes} 分钟`,
       at: now,
+    })
+  }
+
+  // 🟡 没有动静：进行中、没卡住、没有步骤在跑，执行者却很久没动作。
+  // 这是最常见的"沉默"——人在终端里对着报错发呆，QB 这边一个事件都没有。
+  // 阈值至少是当前步预计耗时的 2 倍：手动执行的长步骤本来就没有事件。
+  if (task.status === 'active' && !steps.some((s) => s.status === 'running')) {
+    const current = currentStep(steps)
+    const since = lastActivity?.createdAt ?? task.startedAt ?? task.createdAt
+    const threshold = Math.max(t.idleMs, (current?.expectedMinutes ?? 0) * 60_000 * 2)
+    if (now - since >= threshold) {
+      out.push({
+        key: `idle:${current?.id ?? 'task'}`,
+        taskId: task.id,
+        stepId: current?.id ?? null,
+        level: 'yellow',
+        type: 'idle',
+        message: `${minutes(now - since)} 分钟没有动静${current !== undefined ? `（停在「${current.title}」）` : ''}`,
+        at: since,
+      })
+    }
+  }
+
+  // 🟡 派来很久还没开始：别人派的活，执行者还一步都没动
+  if (task.status === 'draft' && task.initiatorId !== task.assigneeId && now - task.createdAt >= t.notStartedMs) {
+    out.push({
+      key: 'not_started:task',
+      taskId: task.id,
+      stepId: null,
+      level: 'yellow',
+      type: 'not_started',
+      message: `派来 ${minutes(now - task.createdAt)} 分钟了，还没开始`,
+      at: task.createdAt,
     })
   }
 
@@ -211,4 +286,9 @@ function failStreakOf(events: Event[], stepId: string): number {
     else if (e.kind === 'step_ok' || e.kind === 'step_skipped' || e.kind === 'step_run') break
   }
   return streak
+}
+
+/** 当前步：文档顺序里第一个还没做完的步骤（章节标题和说明不算）。 */
+function currentStep(steps: Step[]): Step | undefined {
+  return steps.find((s) => s.kind !== 'note' && (s.status === 'pending' || s.status === 'failed' || s.status === 'blocked'))
 }

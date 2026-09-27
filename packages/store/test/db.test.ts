@@ -248,6 +248,44 @@ describe('数据库 schema', () => {
     }
   })
 
+  it('v7 的库升级到 v8：存量中文任务与坑补上切分，能被中文检索到', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qb-migrate8-'))
+    const path = join(dir, 'old.db')
+    try {
+      // 手工造一个 v7 库：按版本号应用前 7 个迁移
+      const old = new Database(path)
+      old.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+      for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version).filter((m) => m.version <= 7)) {
+        old.exec(m.sql)
+        old.prepare('INSERT INTO schema_migrations VALUES (?, ?, 1)').run(m.version, m.name)
+      }
+      old.exec(`
+        INSERT INTO users (id, name, display_name, created_at) VALUES ('u1','a','A',1);
+        INSERT INTO tasks (id, title, brief_md, initiator_id, assignee_id, status, created_at)
+          VALUES ('t1','升级驱动到 550','','u1','u1','done',1);
+        INSERT INTO lessons (id, anchor_kind, symptom, fix_md, author_id, scope, created_at)
+          VALUES ('l1','free','初始化卡住','统一驱动','u1','personal',1);
+      `)
+      // 旧索引下纯中文单字查询确实查不到（这就是 bug）
+      expect(old.prepare(`SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH '"升级"'`).all()).toHaveLength(0)
+      old.close()
+
+      const db = openDb({ path })
+      expect(db.prepare(`SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH '"升级"'`).all()).toHaveLength(1)
+      expect(db.prepare(`SELECT rowid FROM lessons_fts WHERE lessons_fts MATCH '"卡住"'`).all()).toHaveLength(1)
+      // 状态更新不再触发重建索引，也不破坏索引
+      db.prepare(`UPDATE tasks SET status = 'active' WHERE id = 't1'`).run()
+      expect(db.prepare(`SELECT rowid FROM tasks_fts WHERE tasks_fts MATCH '"驱动"'`).all()).toHaveLength(1)
+      db.close()
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      } catch {
+        /* 留给系统清理 */
+      }
+    }
+  })
+
   it('任务可以指向父步骤（递归委派）', () => {
     const db = openDb({ path: ':memory:' })
     db.exec(`

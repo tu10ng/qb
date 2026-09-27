@@ -264,6 +264,17 @@ export const EventKind = z.enum([
   'task_created',
   'task_started',
   'task_done',
+  /** 执行者点了"卡住了"；payload.note 是一句原因。 */
+  'task_blocked',
+  /** 从卡住恢复（手动点"继续"，或卡住后又开始执行，payload.auto=true）。 */
+  'task_resumed',
+  'task_abandoned',
+  /** 完成/放弃之后重新打开。 */
+  'task_reopened',
+  /** QB 替执行者告诉了发起人（宪法 15：执行者看得到 QB 替他说了什么）。 */
+  'alert_raised',
+  /** 执行者说"我能搞定"：这条告警静音一段时间。 */
+  'alert_snoozed',
 ])
 export type EventKind = z.infer<typeof EventKind>
 

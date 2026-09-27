@@ -6,10 +6,106 @@
  * 用 zod 校验，SQL 本身保持可读。FTS5 也是原生写法最直接。
  */
 
+import type { Db } from './db.ts'
+import { cjkIndexText } from './fts.ts'
+
 export interface Migration {
   version: number
   name: string
   sql: string
+  /** sql 之后、同一事务里跑的数据迁移（SQL 算不了的派生值，如中文切分）。 */
+  apply?: (db: Db) => void
+}
+
+/**
+ * 三张全文索引表的定义（v8 起）。外部内容表：原文列 + fts_cjk（汉字的
+ * 单字与二元组，见 fts.ts）。触发器只在文本列变化时重建索引——状态、
+ * 计数这类更新不再白白删了又插。
+ */
+const FTS_SQL = `
+CREATE VIRTUAL TABLE tasks_fts USING fts5(
+  title, brief_md, fts_cjk,
+  content='tasks', content_rowid='rowid',
+  tokenize='unicode61'
+);
+CREATE TRIGGER tasks_fts_insert AFTER INSERT ON tasks BEGIN
+  INSERT INTO tasks_fts(rowid, title, brief_md, fts_cjk)
+  VALUES (new.rowid, new.title, new.brief_md, new.fts_cjk);
+END;
+CREATE TRIGGER tasks_fts_delete AFTER DELETE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, brief_md, fts_cjk)
+  VALUES ('delete', old.rowid, old.title, old.brief_md, old.fts_cjk);
+END;
+CREATE TRIGGER tasks_fts_update AFTER UPDATE OF title, brief_md, fts_cjk ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts, rowid, title, brief_md, fts_cjk)
+  VALUES ('delete', old.rowid, old.title, old.brief_md, old.fts_cjk);
+  INSERT INTO tasks_fts(rowid, title, brief_md, fts_cjk)
+  VALUES (new.rowid, new.title, new.brief_md, new.fts_cjk);
+END;
+INSERT INTO tasks_fts(rowid, title, brief_md, fts_cjk) SELECT rowid, title, brief_md, fts_cjk FROM tasks;
+
+CREATE VIRTUAL TABLE lessons_fts USING fts5(
+  symptom, cause, fix_md, next_time_md, condition, fts_cjk,
+  content='lessons', content_rowid='rowid',
+  tokenize='unicode61'
+);
+CREATE TRIGGER lessons_fts_insert AFTER INSERT ON lessons BEGIN
+  INSERT INTO lessons_fts(rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk)
+  VALUES (new.rowid, new.symptom, new.cause, new.fix_md, new.next_time_md, new.condition, new.fts_cjk);
+END;
+CREATE TRIGGER lessons_fts_delete AFTER DELETE ON lessons BEGIN
+  INSERT INTO lessons_fts(lessons_fts, rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk)
+  VALUES ('delete', old.rowid, old.symptom, old.cause, old.fix_md, old.next_time_md, old.condition, old.fts_cjk);
+END;
+CREATE TRIGGER lessons_fts_update AFTER UPDATE OF symptom, cause, fix_md, next_time_md, condition, fts_cjk ON lessons BEGIN
+  INSERT INTO lessons_fts(lessons_fts, rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk)
+  VALUES ('delete', old.rowid, old.symptom, old.cause, old.fix_md, old.next_time_md, old.condition, old.fts_cjk);
+  INSERT INTO lessons_fts(rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk)
+  VALUES (new.rowid, new.symptom, new.cause, new.fix_md, new.next_time_md, new.condition, new.fts_cjk);
+END;
+INSERT INTO lessons_fts(rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk)
+  SELECT rowid, symptom, cause, fix_md, next_time_md, condition, fts_cjk FROM lessons;
+
+CREATE VIRTUAL TABLE skills_fts USING fts5(
+  name, description, applies_when, fts_cjk,
+  content='skills', content_rowid='rowid',
+  tokenize='unicode61'
+);
+CREATE TRIGGER skills_fts_insert AFTER INSERT ON skills BEGIN
+  INSERT INTO skills_fts(rowid, name, description, applies_when, fts_cjk)
+  VALUES (new.rowid, new.name, new.description, new.applies_when, new.fts_cjk);
+END;
+CREATE TRIGGER skills_fts_delete AFTER DELETE ON skills BEGIN
+  INSERT INTO skills_fts(skills_fts, rowid, name, description, applies_when, fts_cjk)
+  VALUES ('delete', old.rowid, old.name, old.description, old.applies_when, old.fts_cjk);
+END;
+CREATE TRIGGER skills_fts_update AFTER UPDATE OF name, description, applies_when, fts_cjk ON skills BEGIN
+  INSERT INTO skills_fts(skills_fts, rowid, name, description, applies_when, fts_cjk)
+  VALUES ('delete', old.rowid, old.name, old.description, old.applies_when, old.fts_cjk);
+  INSERT INTO skills_fts(rowid, name, description, applies_when, fts_cjk)
+  VALUES (new.rowid, new.name, new.description, new.applies_when, new.fts_cjk);
+END;
+INSERT INTO skills_fts(rowid, name, description, applies_when, fts_cjk)
+  SELECT rowid, name, description, applies_when, fts_cjk FROM skills;
+`
+
+/** v8 的数据部分：给存量行补上汉字切分，再重建三张索引表。 */
+function backfillCjkAndRebuildFts(db: Db): void {
+  const tasks = db.prepare('SELECT rowid, title, brief_md FROM tasks').all() as Array<{ rowid: number; title: string; brief_md: string }>
+  const setTask = db.prepare('UPDATE tasks SET fts_cjk = ? WHERE rowid = ?')
+  for (const t of tasks) setTask.run(cjkIndexText(t.title, t.brief_md), t.rowid)
+
+  const lessons = db
+    .prepare('SELECT rowid, symptom, cause, fix_md, next_time_md, condition FROM lessons')
+    .all() as Array<{ rowid: number; symptom: string; cause: string | null; fix_md: string; next_time_md: string | null; condition: string | null }>
+  const setLesson = db.prepare('UPDATE lessons SET fts_cjk = ? WHERE rowid = ?')
+  for (const l of lessons) setLesson.run(cjkIndexText(l.symptom, l.cause, l.fix_md, l.next_time_md, l.condition), l.rowid)
+
+  const skills = db.prepare('SELECT rowid, name, description, applies_when FROM skills').all() as Array<{ rowid: number; name: string; description: string; applies_when: string | null }>
+  const setSkill = db.prepare('UPDATE skills SET fts_cjk = ? WHERE rowid = ?')
+  for (const s of skills) setSkill.run(cjkIndexText(s.name, s.description, s.applies_when), s.rowid)
+
+  db.exec(FTS_SQL)
 }
 
 export const MIGRATIONS: Migration[] = [
@@ -412,6 +508,61 @@ CREATE TABLE lesson_offers (
 CREATE INDEX idx_lesson_offers_task ON lesson_offers(task_id, status, created_at);
 CREATE UNIQUE INDEX idx_lesson_offers_dedup ON lesson_offers(task_id, kind, dedup_key, status)
   WHERE dedup_key IS NOT NULL AND status = 'pending';
+`,
+  },
+  {
+    version: 8,
+    name: 'fts-cjk',
+    sql: `
+-- 中文检索修复：unicode61 把连续汉字存成一个词元，单字/二元组都查不到。
+-- 加 fts_cjk 列存汉字的单字与二元组（fts.ts 计算），索引表重建。
+DROP TRIGGER IF EXISTS tasks_fts_insert;
+DROP TRIGGER IF EXISTS tasks_fts_delete;
+DROP TRIGGER IF EXISTS tasks_fts_update;
+DROP TRIGGER IF EXISTS lessons_fts_insert;
+DROP TRIGGER IF EXISTS lessons_fts_delete;
+DROP TRIGGER IF EXISTS lessons_fts_update;
+DROP TRIGGER IF EXISTS skills_fts_insert;
+DROP TRIGGER IF EXISTS skills_fts_delete;
+DROP TRIGGER IF EXISTS skills_fts_update;
+DROP TABLE IF EXISTS tasks_fts;
+DROP TABLE IF EXISTS lessons_fts;
+DROP TABLE IF EXISTS skills_fts;
+ALTER TABLE tasks ADD COLUMN fts_cjk TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN fts_cjk TEXT NOT NULL DEFAULT '';
+ALTER TABLE skills ADD COLUMN fts_cjk TEXT NOT NULL DEFAULT '';
+`,
+    apply: backfillCjkAndRebuildFts,
+  },
+  {
+    version: 9,
+    name: 'delegations',
+    sql: `
+-- 委派：我这一步交给了谁、对方任务在团队服务上的 id、对方进度。
+-- 委派方本机不再建子任务副本（那份副本会被当成另一个任务推上去，
+-- 成了团队里的幽灵任务）；对方的任务只在对方引擎上，这里只记关联与进度。
+CREATE TABLE delegations (
+  step_id       TEXT PRIMARY KEY REFERENCES steps(id) ON DELETE CASCADE,
+  team_task_id  TEXT NOT NULL,
+  assignee_name TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'draft',
+  done          INTEGER NOT NULL DEFAULT 0,
+  total         INTEGER NOT NULL DEFAULT 0,
+  worst_alert   TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX idx_delegations_team_task ON delegations(team_task_id);
+`,
+  },
+  {
+    version: 10,
+    name: 'remote-parent-step',
+    sql: `
+-- 别人委派给我的任务：父步骤在委派方的机器上，本机 steps 表里没有。
+-- parent_step_id 带外键（本机委派用），跨机器的父步骤存这里——原先硬塞进
+-- parent_step_id，提交时外键失败，整批下行回滚，这台引擎从此同步不了。
+ALTER TABLE tasks ADD COLUMN parent_step_ref TEXT;
 `,
   },
 ]

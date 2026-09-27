@@ -99,24 +99,55 @@ button {
   overflow: hidden;
 }
 
-.task-body.focus-mode {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.task-body.focus-mode .outline,
-.task-body.focus-mode .qb-panel {
-  display: none;
-}
-
 /* ── 顶栏 ────────────────────────────────────────────────── */
 
 .task-header {
   display: flex;
   align-items: baseline;
-  gap: 14px;
-  padding: 12px 20px;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
+}
+
+/* 执行者最常用的几个动作常驻顶栏：任何宽度下都点得到 */
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+/* 窄屏才出现的抽屉开关 */
+.nav-toggle,
+.outline-toggle,
+.panel-toggle,
+.drawer-close {
+  display: none;
+}
+
+.drawer-close {
+  float: right;
+  padding: 0 6px;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-bg);
+  font-size: 13px;
+}
+.banner.danger {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+  color: var(--danger);
 }
 
 .task-header h1 {
@@ -202,6 +233,11 @@ button {
 .gem.ok { color: var(--ok); }
 .gem.wobble { color: var(--warn); }
 .gem.stuck { color: var(--danger); }
+.gem.faint { color: var(--text-faint); }
+
+.task-item.ended {
+  color: var(--text-faint);
+}
 
 /* ── 大纲 ────────────────────────────────────────────────── */
 
@@ -1528,4 +1564,144 @@ kbd {
   display: flex;
   gap: 5px;
   flex-shrink: 0;
+}
+
+/* ── Phase 0：委派行、盯着、评论、透明 ───────────────────── */
+
+.probe-line {
+  margin-top: 4px;
+  color: var(--text-dim);
+}
+
+.delegation-row {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  font-size: 13px;
+}
+
+.delegation-row .step-actions {
+  align-items: center;
+}
+
+.mirror {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+}
+
+.mirror-step {
+  padding: 1px 0;
+  font-size: 12.5px;
+}
+.mirror-step.depth-1 {
+  padding-left: 16px;
+}
+
+.step-comments {
+  margin-top: 6px;
+}
+
+/* QB 替执行者开了口：时间线里醒目一点，旁边是"我能搞定" */
+.qb-msg.raised {
+  padding-left: 8px;
+  border-left: 2px solid var(--danger);
+}
+
+/* ── 窄屏：和 SecureCRT / Xshell 并排放的时候 ──────────────── */
+
+/* 放不下三栏：QB 面板收成右侧抽屉（时间线在顶栏 ⋯ 里打开） */
+@media (max-width: 1279px) {
+  .task-body {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+  .qb-panel {
+    display: none;
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(340px, 90vw);
+    z-index: 30;
+    box-shadow: -6px 0 24px rgba(0, 0, 0, 0.18);
+  }
+  .qb-panel.open {
+    display: flex;
+  }
+  .panel-toggle,
+  .qb-panel .drawer-close {
+    display: flex;
+  }
+  .task-meta.keys {
+    display: none;
+  }
+}
+
+/* 再窄：任务列表和大纲也收成左侧抽屉 */
+@media (max-width: 999px) {
+  .app {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sidebar {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(280px, 85vw);
+    z-index: 35;
+    box-shadow: 6px 0 24px rgba(0, 0, 0, 0.18);
+  }
+  .sidebar.open {
+    display: flex;
+  }
+  .task-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .outline {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(260px, 80vw);
+    z-index: 32;
+    background: var(--bg-panel);
+    box-shadow: 6px 0 24px rgba(0, 0, 0, 0.18);
+  }
+  .outline.open {
+    display: block;
+  }
+  .nav-toggle,
+  .outline-toggle,
+  .sidebar .drawer-close {
+    display: inline-block;
+  }
+  .runbook {
+    padding: 14px 16px 100px;
+  }
+}
+
+/* 半屏 800 宽以下：命令块的按钮换到下一行，缩进收掉 */
+@media (max-width: 799px) {
+  .runbook {
+    padding: 12px 10px 100px;
+  }
+  .step-why,
+  .step-body {
+    margin-left: 0;
+  }
+  .cmd {
+    flex-direction: column;
+  }
+  .step-head {
+    flex-wrap: wrap;
+  }
+  .param-name {
+    min-width: 0;
+  }
 }

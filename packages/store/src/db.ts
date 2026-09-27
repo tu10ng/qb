@@ -56,6 +56,7 @@ function migrate(db: Db): void {
     // 每个迁移单独一个事务：失败时不会留下半个 schema。
     const run = db.transaction(() => {
       db.exec(m.sql)
+      m.apply?.(db)
       record.run(m.version, m.name, Date.now())
     })
     run()

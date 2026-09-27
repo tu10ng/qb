@@ -273,16 +273,22 @@ export class TeamStore {
       }
 
       for (const t of push.tasks) {
+        // parent_step_id：快照带了就用；老引擎不带时从派活记录补（委派产生的
+        // 子任务在 dispatched_tasks 里记着父步骤）。原先这列从没写进去过，
+        // 委派进度因此一条都没生成。
         this.db
           .prepare(
-            `INSERT INTO tasks (id, title, brief_md, initiator_name, assignee_name, status, expected_minutes,
-                                started_at, ended_at, runbook_version, updated_at)
-             VALUES (@id, @title, @briefMd, @initiatorName, @assigneeName, @status, @expectedMinutes,
-                     @startedAt, @endedAt, @runbookVersion, @updatedAt)
+            `INSERT INTO tasks (id, title, brief_md, initiator_name, assignee_name, status, parent_step_id,
+                                expected_minutes, started_at, ended_at, runbook_version, updated_at)
+             VALUES (@id, @title, @briefMd, @initiatorName, @assigneeName, @status,
+                     COALESCE(@parentStepId, (SELECT parent_step_id FROM dispatched_tasks WHERE id = @id)),
+                     @expectedMinutes, @startedAt, @endedAt, @runbookVersion, @updatedAt)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title, brief_md = excluded.brief_md,
                initiator_name = excluded.initiator_name, assignee_name = excluded.assignee_name,
-               status = excluded.status, expected_minutes = excluded.expected_minutes,
+               status = excluded.status,
+               parent_step_id = COALESCE(excluded.parent_step_id, tasks.parent_step_id),
+               expected_minutes = excluded.expected_minutes,
                started_at = excluded.started_at, ended_at = excluded.ended_at,
                runbook_version = excluded.runbook_version, updated_at = excluded.updated_at`,
           )
@@ -398,21 +404,10 @@ export class TeamStore {
         }
       }
 
-      // 委派进度：子任务（有 parent_step_id）有快照更新时，给父任务执行者
-      // 生成一条下行——他在自己界面上看到委派行的进度
-      for (const t of push.tasks) {
-        if (t.parentStepId === null || t.parentStepId === undefined) continue
-        const parent = this.db
-          .prepare('SELECT assignee_name FROM tasks WHERE id = (SELECT task_id FROM steps WHERE id = ?)')
-          .get(t.parentStepId) as { assignee_name: string } | undefined
-        if (parent === undefined) continue
-        this.db
-          .prepare('INSERT INTO task_progress (task_id, parent_step_id, assignee_name, status, done, total, updated_at, down_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(t.id, t.parentStepId, parent.assignee_name, t.status,
-               (t.steps ?? []).filter((x) => x.kind !== 'note' && (x.status === 'ok' || x.status === 'skipped')).length,
-               (t.steps ?? []).filter((x) => x.kind !== 'note').length,
-               Date.now(), this.nextDownSeq())
-      }
+      // 委派进度：子任务（有 parent_step_id）有变化时，给委派者一条下行——
+      // 他那一步的委派行显示对方进度，对方完成时那一步自动完成。
+      // 每个子任务只留一行，状态/进度/最坏告警有变才换新的下行序号。
+      for (const t of push.tasks) this.refreshDelegationProgress(t.id)
 
       const down = this.pullDown(push.sinceDownSeq, push.user.name)
       return { newRedAlerts: newRed, resolvedAlerts: resolved, ...down }
@@ -541,6 +536,87 @@ export class TeamStore {
            input.parentStepId ?? null, input.expectedMinutes ?? null, input.definitionOfDone ?? null,
            Date.now(), downSeq)
     return { id, downSeq }
+  }
+
+  /**
+   * 子任务进度 → 委派者的下行（一任务一行，有变化才换序号）。
+   * 收件人是派活的人（dispatched_tasks.initiator_name）；没有派活记录时
+   * 退回父步骤所在任务的执行者。
+   */
+  private refreshDelegationProgress(taskId: string): void {
+    const task = this.db.prepare('SELECT status, parent_step_id FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; parent_step_id: string | null }
+      | undefined
+    if (task === undefined || task.parent_step_id === null) return
+
+    const recipient =
+      (this.db.prepare('SELECT initiator_name FROM dispatched_tasks WHERE id = ?').get(taskId) as { initiator_name: string } | undefined)?.initiator_name ??
+      (this.db
+        .prepare('SELECT t.assignee_name FROM tasks t JOIN steps s ON s.task_id = t.id WHERE s.id = ? LIMIT 1')
+        .get(task.parent_step_id) as { assignee_name: string } | undefined)?.assignee_name
+    if (recipient === undefined || recipient === '') return
+
+    const counts = this.db
+      .prepare("SELECT count(*) total, sum(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) done FROM steps WHERE task_id = ? AND kind != 'note'")
+      .get(taskId) as { total: number; done: number | null }
+    const worst = (this.db
+      .prepare("SELECT level FROM alerts WHERE task_id = ? AND status = 'open' ORDER BY CASE level WHEN 'red' THEN 0 ELSE 1 END LIMIT 1")
+      .get(taskId) as { level: string } | undefined)?.level ?? null
+    const done = counts.done ?? 0
+
+    const existing = this.db.prepare('SELECT status, done, total, worst_alert FROM task_progress WHERE task_id = ?').get(taskId) as
+      | { status: string; done: number; total: number; worst_alert: string | null }
+      | undefined
+    if (
+      existing !== undefined &&
+      existing.status === task.status &&
+      existing.done === done &&
+      existing.total === counts.total &&
+      existing.worst_alert === worst
+    ) {
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO task_progress (task_id, parent_step_id, assignee_name, status, done, total, worst_alert, updated_at, down_seq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET parent_step_id = excluded.parent_step_id, assignee_name = excluded.assignee_name,
+           status = excluded.status, done = excluded.done, total = excluded.total, worst_alert = excluded.worst_alert,
+           updated_at = excluded.updated_at, down_seq = excluded.down_seq`,
+      )
+      .run(taskId, task.parent_step_id, recipient, task.status, done, counts.total, worst, Date.now(), this.nextDownSeq())
+  }
+
+  /**
+   * 这个人能不能看这个任务的镜像：管理员、发起人、执行者、委派者
+   * （父步骤在他的任务里）、介入过的人（评论过、点过"知道了"）。
+   * 原先任何令牌都能读任何任务——命令、输出、求助全在里面。
+   */
+  canView(taskId: string, user: Pick<TeamUser, 'name' | 'isAdmin'>): boolean {
+    if (user.isAdmin) return true
+    const t = this.taskById(taskId)
+    if (t === null) return false
+    if (t.initiatorName === user.name || t.assigneeName === user.name) return true
+    if (t.parentStepId !== null) {
+      const delegator = this.db
+        .prepare('SELECT t.assignee_name FROM tasks t JOIN steps s ON s.task_id = t.id WHERE s.id = ? LIMIT 1')
+        .get(t.parentStepId) as { assignee_name: string } | undefined
+      if (delegator?.assignee_name === user.name) return true
+    }
+    const touched = this.db
+      .prepare(
+        `SELECT 1 AS hit FROM comments c JOIN users u ON u.id = c.author_id WHERE c.task_id = @id AND u.name = @me
+         UNION ALL
+         SELECT 1 FROM alerts a JOIN users u ON u.id = a.acked_by WHERE a.task_id = @id AND u.name = @me
+         LIMIT 1`,
+      )
+      .get({ id: taskId, me: user.name })
+    return touched !== undefined
+  }
+
+  /** 这个用户是否已经有令牌（没有 = 引擎按名字自动建的占位，可被本人认领）。 */
+  hasToken(userId: string): boolean {
+    return this.db.prepare('SELECT 1 AS hit FROM tokens WHERE user_id = ? LIMIT 1').get(userId) !== undefined
   }
 
   listUsers(): Array<TeamUser & { taskCount: number }> {
@@ -690,22 +766,28 @@ export class TeamStore {
     return r === undefined ? undefined : toAlert(r)
   }
 
-  listTasks(scope: 'initiated' | 'assigned' | 'related', userName: string): Array<TaskMirror & { total: number; done: number; worstAlert: 'red' | 'yellow' | null }> {
-    // related：我发起的 + 派给我的 + 有我未回答求助的 + 我评论/已读过的。
-    // 本地自建任务的"发起人"就是执行者本人，发起人视角若只按 initiator
-    // 匹配会什么都看不到——他真正相关的是"向我求助/我介入过"的任务。
+  listTasks(
+    scope: 'initiated' | 'assigned' | 'related',
+    viewer: Pick<TeamUser, 'name' | 'isAdmin'>,
+  ): Array<TaskMirror & { total: number; done: number; worstAlert: 'red' | 'yellow' | null }> {
+    // related：我发起的 + 派给我的 + 我委派出去的 + 我评论/已读过的；管理员
+    // 另外看得到"没指定发起人（发起人就是执行者本人）却发出了求助"的任务
+    // ——没人派的活，求助总得有人接。原先这里是"任何人未回答的求助"，
+    // 每个用户都能看到全队所有求助。
     const where =
       scope === 'initiated'
         ? 't.initiator_name = @me'
         : scope === 'assigned'
           ? 't.assignee_name = @me'
           : `t.initiator_name = @me OR t.assignee_name = @me
-             OR t.id IN (SELECT q.task_id FROM questions q WHERE q.answer IS NULL AND q.asker_name != @me)
+             OR t.parent_step_id IN (SELECT s.id FROM steps s JOIN tasks p ON p.id = s.task_id WHERE p.assignee_name = @me)
              OR t.id IN (SELECT c.task_id FROM comments c JOIN users u ON u.id = c.author_id WHERE u.name = @me)
-             OR t.id IN (SELECT a.task_id FROM alerts a JOIN users u ON u.id = a.acked_by WHERE u.name = @me)`
+             OR t.id IN (SELECT a.task_id FROM alerts a JOIN users u ON u.id = a.acked_by WHERE u.name = @me)
+             OR (@admin = 1 AND t.initiator_name = t.assignee_name AND t.assignee_name != @me
+                 AND t.id IN (SELECT q.task_id FROM questions q WHERE q.answer IS NULL))`
     const rows = this.db
       .prepare(`SELECT DISTINCT t.* FROM tasks t WHERE ${where} ORDER BY t.updated_at DESC`)
-      .all({ me: userName }) as Array<Record<string, unknown>>
+      .all({ me: viewer.name, admin: viewer.isAdmin ? 1 : 0 }) as Array<Record<string, unknown>>
     return rows.map((r) => {
       const id = r.id as string
       const counts = this.db
@@ -767,14 +849,20 @@ export class TeamStore {
     return rows.map(toAlert)
   }
 
-  openAlertsForUser(userName: string): AlertRow[] {
+  /**
+   * 该我处理的告警：我发起的任务上的；我是管理员时，再加上没指定发起人
+   * （发起人就是执行者本人）的任务——否则没人派的活卡住了谁都不知道。
+   */
+  openAlertsForUser(viewer: Pick<TeamUser, 'name' | 'isAdmin'>): AlertRow[] {
     return (this.db
       .prepare(
         `SELECT a.* FROM alerts a JOIN tasks t ON t.id = a.task_id
-         WHERE t.initiator_name = ? AND a.status = 'open'
+         WHERE a.status = 'open'
+           AND (t.initiator_name = @me
+                OR (@admin = 1 AND t.initiator_name = t.assignee_name AND t.assignee_name != @me))
          ORDER BY CASE a.level WHEN 'red' THEN 0 ELSE 1 END, a.updated_at DESC`,
       )
-      .all(userName) as Array<Record<string, unknown>>).map(toAlert)
+      .all({ me: viewer.name, admin: viewer.isAdmin ? 1 : 0 }) as Array<Record<string, unknown>>).map(toAlert)
   }
 
   // ── 推送渠道与设置 ───────────────────────────────────────

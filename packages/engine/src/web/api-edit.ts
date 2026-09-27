@@ -240,6 +240,8 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
       note: note === '' ? null : note,
     })
     store.markTaskStarted(taskId, currentUserId())
+    // 卡住之后又做完了一步：人已经往前走了，不再算卡住
+    if (status === 'ok' || status === 'skipped') store.resumeIfBlocked(taskId, currentUserId())
 
     const kind = status === 'skipped' ? 'step_skipped' : status === 'failed' ? 'step_failed' : status === 'ok' ? 'step_ok' : 'edit'
     store.appendEvent({

@@ -101,6 +101,14 @@ describe('🔴 阻塞', () => {
     const done = run({ task: task({ status: 'done' }), events: [event('question_asked')] })
     expect(done).toEqual([])
   })
+
+  it('告警文案带上执行者写的原因', () => {
+    const blocked = run({
+      task: task({ status: 'blocked' }),
+      events: [event('task_blocked', { stepId: null, payload: { note: '等 gpu-18 的权限' }, createdAt: at(5) })],
+    })
+    expect(find(blocked, 'blocked')).toMatchObject({ message: '卡住了：等 gpu-18 的权限', at: at(5) })
+  })
 })
 
 describe('🔴 连续失败', () => {
@@ -136,6 +144,16 @@ describe('🔴 停滞', () => {
     const alive = run({ now: at(100), events: [event('step_failed', { createdAt: at(30) }), event('step_ok', { stepId: 's9', createdAt: at(50) })] })
     expect(find(alive, 'stalled')).toBeUndefined()
   })
+
+  it('QB 和发起人的事件不算执行者有进展（否则告警一开口就把自己解除了）', () => {
+    const events = [
+      event('step_failed', { createdAt: at(30) }),
+      event('alert_raised', { actorId: null, createdAt: at(51) }),
+      event('comment', { actorId: null, createdAt: at(60) }),
+      event('lesson_shared', { actorId: null, createdAt: at(70) }),
+    ]
+    expect(find(run({ now: at(100), events }), 'stalled')).toMatchObject({ level: 'red', at: at(30) })
+  })
 })
 
 describe('🔴 失控', () => {
@@ -147,6 +165,40 @@ describe('🔴 失控', () => {
     // 预计 8 分钟，跑了 30 分钟 → 3.75 倍，红；只跑 20 分钟 → 2.5 倍，不红
     expect(find(run({ now: at(20), steps: [running] }), 'runaway')).toBeUndefined()
     expect(find(run({ now: at(30), steps: [step({ status: 'failed' })] }), 'runaway')).toBeUndefined()
+  })
+
+  it('最近还有输出就不算失控；委派出去的步骤不算', () => {
+    const running = step({ status: 'running', startedAt: at(0) })
+    const recent = new Map([['s1', at(28)]])
+    expect(find(evaluateAlerts({ now: at(30), task: task(), steps: [running], events: [], lastOutputAt: recent }), 'runaway')).toBeUndefined()
+    expect(find(run({ now: at(30), steps: [step({ kind: 'delegate', status: 'running', startedAt: at(0) })] }), 'runaway')).toBeUndefined()
+  })
+})
+
+describe('🟡 没有动静 / 还没开始', () => {
+  it('进行中却一小时没有执行者动作 → 黄，停在当前步', () => {
+    const idle = run({ now: at(70), steps: [step({ status: 'ok' }), step({ id: 's2', title: '起 prefill' })], events: [event('step_ok', { createdAt: at(5) })] })
+    expect(find(idle, 'idle')).toMatchObject({ level: 'yellow', stepId: 's2', key: 'idle:s2' })
+    expect(find(idle, 'idle')!.message).toContain('停在「起 prefill」')
+  })
+
+  it('有步骤在跑、任务卡住了、或刚有动作，都不算没有动静', () => {
+    expect(find(run({ now: at(70), steps: [step({ status: 'running', startedAt: at(1) })] }), 'idle')).toBeUndefined()
+    expect(find(run({ now: at(70), task: task({ status: 'blocked' }) }), 'idle')).toBeUndefined()
+    expect(find(run({ now: at(70), events: [event('edit', { createdAt: at(50) })] }), 'idle')).toBeUndefined()
+  })
+
+  it('阈值至少是当前步预计耗时的 2 倍（手动跑的长步骤没有事件）', () => {
+    const long = [step({ expectedMinutes: 45 })]
+    expect(find(run({ now: at(80), steps: long }), 'idle')).toBeUndefined()
+    expect(find(run({ now: at(95), steps: long }), 'idle')).toBeDefined()
+  })
+
+  it('别人派来的任务两小时还是草稿 → 黄；自己给自己建的不算', () => {
+    const draft = task({ status: 'draft', startedAt: null })
+    expect(find(run({ now: at(130), task: draft }), 'not_started')).toMatchObject({ level: 'yellow' })
+    expect(find(run({ now: at(100), task: draft }), 'not_started')).toBeUndefined()
+    expect(find(run({ now: at(130), task: task({ status: 'draft', startedAt: null, initiatorId: 'u2' }) }), 'not_started')).toBeUndefined()
   })
 })
 
@@ -177,5 +229,7 @@ describe('幂等与去重', () => {
   it('默认阈值完整（文档即代码）', () => {
     expect(DEFAULT_THRESHOLDS.failStreak).toBe(3)
     expect(DEFAULT_THRESHOLDS.stalledAfterMs).toBe(20 * 60_000)
+    expect(DEFAULT_THRESHOLDS.idleMs).toBe(60 * 60_000)
+    expect(DEFAULT_THRESHOLDS.notStartedMs).toBe(2 * 60 * 60_000)
   })
 })

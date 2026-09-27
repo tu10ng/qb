@@ -65,6 +65,41 @@ export interface Diagnosis {
   model: string
 }
 
+/** 委派关联（委派方本机）：这一步交给了谁、对方进度。 */
+export interface Delegation {
+  stepId: string
+  teamTaskId: string
+  assigneeName: string
+  status: string
+  done: number
+  total: number
+  worstAlert: 'red' | 'yellow' | null
+  createdAt: number
+  updatedAt: number
+}
+
+export interface TeamUser {
+  name: string
+  displayName: string
+  taskCount: number
+}
+
+export interface SyncStatus {
+  ok: boolean | null
+  at: number | null
+  detail: string
+}
+
+export interface TeamSettingsView {
+  url: string
+  token: string
+  hasToken: boolean
+  enabled: boolean
+  identity: { name: string; displayName: string } | null
+  status: SyncStatus
+  warning?: string
+}
+
 export interface TaskDetail {
   task: Task
   runbook: Runbook | null
@@ -72,12 +107,22 @@ export interface TaskDetail {
   events: Event[]
   /** 按步骤分组的历史证据——刷新后还能看到上次跑出了什么。 */
   evidence: Record<string, Evidence[]>
+  /** 委派出去的步骤（按步骤 id）。 */
+  delegations: Record<string, Delegation>
   /** 进行中的后台任务（起草、看截图），刷新后接回进度。 */
   jobs: Job[]
   /** M7：导入来的 runbook 的保真报告；参数一改会跟着变。 */
   fidelity: FidelityView | null
   /** 任务最近贴进来的素材（有它才能"从素材整理"）。 */
   material: { id: string; kind: string; filename: string | null } | null
+}
+
+/** 对方任务在团队服务上的只读镜像（委派行打开看）。 */
+export interface DelegationMirror {
+  task: { id: string; title: string; assigneeName: string; status: string; startedAt: number | null }
+  steps: Array<{ id: string; parentId: string | null; kind: string; title: string; command: string | null; status: string; statusNote: string | null; lastOutput?: string | null }>
+  events: Array<{ kind: string; stepId: string | null; actorName: string | null; payload: Record<string, unknown>; createdAt: number }>
+  questions: Array<{ id: string; body: string; answer: string | null }>
 }
 
 export interface FidelityView {
@@ -158,7 +203,7 @@ export interface NewStepInput {
   expectedMinutes?: number | null
 }
 
-export type StepPatchInput = Partial<Pick<Step, 'kind' | 'title' | 'whyMd' | 'command' | 'expectation' | 'expectedMinutes' | 'timeoutMs'>>
+export type StepPatchInput = Partial<Pick<Step, 'kind' | 'title' | 'whyMd' | 'command' | 'expectation' | 'expectedMinutes' | 'timeoutMs' | 'shareOutput'>>
 
 // ── 模型设置 ─────────────────────────────────────────────────
 
@@ -249,6 +294,31 @@ export const api = {
 
   taskDetail: (taskId: string) => req<TaskDetail>(`/tasks/${taskId}/runbook`),
 
+  /** 完成任务 / 卡住了 / 继续 / 放弃 / 重新打开。 */
+  setTaskStatus: (taskId: string, status: 'active' | 'blocked' | 'done' | 'abandoned', note?: string) =>
+    req<{ task: Task; changed: boolean }>(`/tasks/${taskId}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status, ...(note !== undefined && note.trim() !== '' ? { note } : {}) }),
+    }),
+
+  /** wait 步骤"只盯着"：命令在别处跑，QB 在本机轮询就绪条件。 */
+  watchStep: (stepId: string) => req<{ stepId: string; watching: boolean }>(`/steps/${stepId}/watch`, { method: 'POST' }),
+
+  /** 告警静音（"我能搞定"）。 */
+  snoozeAlert: (taskId: string, key: string, minutes = 30) =>
+    req<{ key: string; minutes: number }>(`/tasks/${taskId}/alerts/snooze`, { method: 'POST', body: JSON.stringify({ key, minutes }) }),
+
+  /** 团队里的人（选发起人、委派给谁）。 */
+  teamUsers: () => req<{ enabled: boolean; me?: string | null; users: TeamUser[] }>('/team/users'),
+
+  /** 委派行 → 打开对方 runbook（团队服务上的只读镜像）。 */
+  delegationMirror: (stepId: string) =>
+    req<{ delegation: Delegation; mirror: DelegationMirror | null; note?: string }>(`/steps/${stepId}/delegation`),
+
+  /** 委派行 → 给对方留言（可指定对方的某一步）。 */
+  delegationComment: (stepId: string, body: string, remoteStepId: string | null = null) =>
+    req<{ ok: boolean }>(`/steps/${stepId}/delegation/comment`, { method: 'POST', body: JSON.stringify({ body, stepId: remoteStepId }) }),
+
   /**
    * 让 QB 起草 runbook。立刻返回任务 id，结果经 WS 的 job.update 推送。
    * existing=true 表示已经有一个在跑了（连点两次不会起两份）。
@@ -283,11 +353,11 @@ export const api = {
   cancelStep: (stepId: string) =>
     req<{ stepId: string; killed: boolean }>(`/steps/${stepId}/cancel`, { method: 'POST' }),
 
-  /** 委派这步给别人（生成对方任务，经团队服务派出去）。 */
-  delegateStep: (stepId: string, assigneeName: string) =>
-    req<{ taskId: string }>(`/steps/${stepId}/delegate`, {
+  /** 委派这步给别人（经团队服务派出去；这一步变成委派行）。 */
+  delegateStep: (stepId: string, input: { assigneeName: string; displayName?: string; note?: string }) =>
+    req<{ teamTaskId: string }>(`/steps/${stepId}/delegate`, {
       method: 'POST',
-      body: JSON.stringify({ assigneeName }),
+      body: JSON.stringify(input),
     }),
 
   // ── 编辑（原地修改）─────────────────────────────────────────
@@ -438,10 +508,10 @@ export const api = {
 
   // ── 团队同步（M8）────────────────────────────────────────
 
-  teamSettings: () => req<{ url: string; token: string; hasToken: boolean; enabled: boolean }>('/settings/team'),
+  teamSettings: () => req<TeamSettingsView>('/settings/team'),
 
   saveTeamSettings: (input: { url: string; token?: string; enabled: boolean }) =>
-    req<{ url: string; hasToken: boolean; enabled: boolean }>('/settings/team', {
+    req<TeamSettingsView>('/settings/team', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
@@ -498,6 +568,7 @@ export type ServerEvent =
       redactionHits: string[]
     }
   | { type: 'step.error'; stepId: string; message: string }
+  | { type: 'step.probe'; stepId: string; attempt: number; detail: string }
   | { type: 'runbook.updated'; taskId: string; version: number }
   | { type: 'runbook.changed'; taskId: string; stepId: string | null }
   | { type: 'job.update'; job: Job }

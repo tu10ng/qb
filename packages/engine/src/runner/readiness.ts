@@ -1,3 +1,4 @@
+import { connect } from 'node:net'
 import type { ReadinessProbe } from '@qb/core'
 import type { HostPort } from '../dsh/port.ts'
 
@@ -86,15 +87,9 @@ async function probeOnce(
     }
 
     case 'port': {
-      // 用命令探测而非自己开 socket：这样它和用户手动验证的方式一致，
-      // 出问题时用户能自己复现。
-      const cmd = process.platform === 'win32'
-        ? `powershell -Command "(Test-NetConnection -ComputerName ${probe.host} -Port ${probe.port}).TcpTestSucceeded"`
-        : `bash -c 'exec 3<>/dev/tcp/${probe.host}/${probe.port}' 2>/dev/null`
-      const r = await host.runCommand({ command: cmd, timeoutMs: 10_000, ...(signal !== undefined ? { signal } : {}) })
-      const ok = process.platform === 'win32'
-        ? r.stdout.toLowerCase().includes('true')
-        : r.exitCode === 0
+      // 直接开 TCP 连接：原先拼 shell 命令（Windows 上 Test-NetConnection 一次
+      // 要好几秒，host 还是拼进命令行的），这里既快又不经 shell
+      const ok = await tcpProbe(probe.host, probe.port, 3000)
       return ok
         ? { ready: true, detail: `${probe.host}:${probe.port} 已监听` }
         : { ready: false, detail: `${probe.host}:${probe.port} 未监听` }
@@ -116,6 +111,20 @@ async function probeOnce(
       // 这里不该重复读日志文件。
       return { ready: false, detail: '日志模式由输出流匹配，不走轮询' }
   }
+}
+
+/** 能不能连上 host:port（连上即关）。 */
+export function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = connect({ host, port })
+    const done = (ok: boolean): void => {
+      sock.destroy()
+      resolve(ok)
+    }
+    sock.setTimeout(timeoutMs, () => done(false))
+    sock.once('connect', () => done(true))
+    sock.once('error', () => done(false))
+  })
 }
 
 function sleep(host: HostPort, ms: number, signal: AbortSignal | undefined): Promise<void> {

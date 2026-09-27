@@ -269,4 +269,17 @@ CREATE INDEX idx_down_notices_user ON down_notices(user_name, down_seq);
 ALTER TABLE steps ADD COLUMN last_output TEXT;
 `,
   },
+  {
+    version: 5,
+    name: 'delegation-progress-one-row',
+    sql: `
+-- 委派进度：每个子任务只留一行（原先每次推送都插一行，且从未真正生成过）。
+-- recipient 是该收到进度的人（委派者），沿用 assignee_name 列名。
+DELETE FROM task_progress WHERE id NOT IN (SELECT MAX(id) FROM task_progress GROUP BY task_id);
+CREATE UNIQUE INDEX idx_task_progress_task ON task_progress(task_id);
+ALTER TABLE task_progress ADD COLUMN worst_alert TEXT;
+-- 引擎自动建的用户（别人把他写成发起人时）没有令牌：本人拿邀请注册时认领它
+CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
+`,
+  },
 ]

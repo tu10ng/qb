@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import type { Environment, Lesson, Skill, Task } from '@qb/core'
+import { PARAM_RE, type Environment, type Lesson, type Skill, type Task } from '@qb/core'
 import type { Llm } from '../llm/port.ts'
 import { fillTemplate } from './prompt.ts'
 
@@ -44,7 +44,17 @@ const FlatStep = z.object({
 })
 export type FlatStep = z.infer<typeof FlatStep>
 
+const DraftParam = z.object({
+  name: z.string().describe('参数名，大写下划线，如 DECODE_HOST；命令里写成 {{DECODE_HOST}}'),
+  value: z.string().describe('你猜的取值；完全不知道就留空字符串，别编一个像真的').catch(''),
+  description: z.string().optional().describe('一句话说明这是什么').catch(undefined),
+})
+
 export const DraftSchema = z.object({
+  params: z
+    .array(DraftParam.nullable().catch(null))
+    .describe('命令里随环境变化的取值（主机、IP、端口、路径、卡号、版本……）。每个 {{NAME}} 都要在这里声明。')
+    .catch([]),
   assumptions: z
     .array(
       z.object({
@@ -52,7 +62,7 @@ export const DraftSchema = z.object({
         value: z.string().describe('你假设的取值'),
       }),
     )
-    .describe('信息不全时你做出的假设。用户会在文档顶部看到并可修改。')
+    .describe('参数表达不了的假设（做法、前提、范围）。用户会在文档顶部看到并可修改。')
     .catch([]),
   steps: z
     .array(FlatStep.nullable().catch(null))
@@ -192,6 +202,8 @@ export interface DraftContext {
 }
 
 export interface DraftResult {
+  /** 起草的参数（QB 猜的·待确认）。命令里用到却没声明的也补在这里，值留空。 */
+  params: Array<{ name: string; value: string; description?: string }>
   assumptions: Array<{ key: string; value: string; editedByUser: boolean }>
   steps: StepOut[]
   model: string
@@ -230,12 +242,41 @@ export async function draftRunbook(
   }
 
   return {
+    params: draftParams(result.output.params, steps),
     assumptions: result.output.assumptions.map((a) => ({ ...a, editedByUser: false })),
     // 扁平列表按 section 还原成树
     steps: toTree(steps),
     model: result.model,
     dropped: result.output.steps.length - steps.length,
   }
+}
+
+/**
+ * 参数表：模型声明的（名字规整成大写下划线、去重）+ 命令里用到却没声明
+ * 的（值留空，界面上显示"缺"，运行按钮挡住并提示去补）。
+ */
+export function draftParams(
+  declared: Array<z.infer<typeof DraftParam> | null>,
+  steps: Array<Pick<Flat, 'command'>>,
+): DraftResult['params'] {
+  const out: DraftResult['params'] = []
+  const seen = new Set<string>()
+  for (const p of declared) {
+    if (p === null) continue
+    const name = p.name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').replace(/^[^A-Z]+/, '')
+    if (name === '' || seen.has(name)) continue
+    seen.add(name)
+    out.push({ name, value: p.value, ...(p.description !== undefined && p.description.trim() !== '' ? { description: p.description.trim() } : {}) })
+  }
+  for (const s of steps) {
+    for (const m of (s.command ?? '').matchAll(PARAM_RE)) {
+      const name = m[1]!
+      if (seen.has(name)) continue
+      seen.add(name)
+      out.push({ name, value: '', description: '起草时用到但没给值' })
+    }
+  }
+  return out
 }
 
 // ── 模板渲染 ─────────────────────────────────────────────────
