@@ -81,11 +81,13 @@ async function pushWebhook(ch: PushChannel, ctx: PushContext): Promise<PushOutco
     body: JSON.stringify({ text: pushText(ctx), level: ctx.alert.level, type: ctx.alert.type, task: { id: ctx.task.id, title: ctx.task.title } }),
     signal: AbortSignal.timeout(10_000),
   })
+  // 目标的响应体不回显给调用者：那会变成"读任意内网地址"的原语
+  if (!res.ok) void res.text().catch(() => '')
   return {
     channelId: ch.id,
     channelName: ch.name,
     ok: res.ok,
-    detail: `HTTP ${res.status}${res.ok ? '' : `：${(await res.text().catch(() => '')).slice(0, 120)}`}`,
+    detail: `HTTP ${res.status}`,
   }
 }
 

@@ -64,6 +64,9 @@ export type Sync = ReturnType<typeof createSync>
 export function createSync(deps: SyncDeps) {
   const { store, userName, broadcast, log } = deps
   let warnedOffline = false
+  // 重入锁：一拍 2 秒而 fetch 超时 20 秒——不锁的话最多十个并发推送，
+  // 各自拿旧游标，完成乱序时会把 downSeq 写回旧值
+  let pushing = false
 
   const state = (): SyncState =>
     store.getSyncState<SyncState>(STATE_KEY) ?? { pushedSeq: store.maxEventSeq(), downSeq: 0 }
@@ -89,12 +92,18 @@ export function createSync(deps: SyncDeps) {
   function pushNow(): void {
     const cfg = new TeamSettings(store).get()
     if (!cfg.enabled || cfg.url === '' || cfg.token === '') return
-    void pushOnce(cfg).catch((e: unknown) => {
-      if (!warnedOffline) {
-        log(`团队同步失败（不影响本地使用）：${e instanceof Error ? e.message : String(e)}`)
-        warnedOffline = true
-      }
-    })
+    if (pushing) return
+    pushing = true
+    void pushOnce(cfg)
+      .catch((e: unknown) => {
+        if (!warnedOffline) {
+          log(`团队同步失败（不影响本地使用）：${e instanceof Error ? e.message : String(e)}`)
+          warnedOffline = true
+        }
+      })
+      .finally(() => {
+        pushing = false
+      })
   }
 
   async function pushOnce(cfg: TeamConfig): Promise<void> {
@@ -150,7 +159,9 @@ export function createSync(deps: SyncDeps) {
         now: Date.now(),
         task,
         steps: latest.steps,
-        events: store.listEvents(taskId, 50),
+        // 200 条窗口：求助未回答的红告警靠回溯事件判断，窗口太小会在
+        // 活跃任务上静默解除
+        events: store.listEvents(taskId, 200),
       }).map((d) => ({ key: d.key, taskId: d.taskId, stepId: d.stepId, level: d.level, type: d.type, message: d.message, at: d.at }))
     })
 
@@ -181,10 +192,12 @@ export function createSync(deps: SyncDeps) {
       lastDownSeq: number
     }
 
-    applyDown(result.down)
-
-    store.markQuestionsPushed(unpushedQuestions.map((q) => q.id))
-    setState({ pushedSeq: st.pushedSeq + events.length, downSeq: result.lastDownSeq })
+    // 下行落地 + 游标推进同一个事务：崩在中间也不会重复拉同一批下行
+    store.inTransaction(() => {
+      applyDown(result.down)
+      store.markQuestionsPushed(unpushedQuestions.map((q) => q.id))
+      setState({ pushedSeq: st.pushedSeq + events.length, downSeq: result.lastDownSeq })
+    })
 
     if (warnedOffline) {
       log('团队同步已恢复')
@@ -199,13 +212,16 @@ export function createSync(deps: SyncDeps) {
       if (item.kind === 'comment') {
         const p = item.payload
         const taskId = String(p.task_id ?? '')
+        const commentId = String(p.id ?? '')
+        // 按 id 去重：响应丢失重放时同一条评论不能落两次
+        if (commentId !== '' && store.hasEventWithPayloadId('comment', commentId)) continue
         const body = redact(String(p.body ?? '')).text
         store.appendEvent({
           taskId,
           stepId: p.step_id !== undefined && p.step_id !== null ? String(p.step_id) : null,
           actorId: null,
           kind: 'comment',
-          payload: { author: String(p.author_name ?? ''), body },
+          payload: { author: String(p.author_name ?? ''), body, commentId },
         })
         touchedTasks.add(taskId)
       } else if (item.kind === 'answer') {

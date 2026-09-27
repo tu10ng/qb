@@ -256,6 +256,7 @@ export const EventKind = z.enum([
   'lesson_proposed',
   'lesson_confirmed',
   'replanned',
+  'task_created',
   'task_started',
   'task_done',
 ])

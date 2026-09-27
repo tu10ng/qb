@@ -11,9 +11,10 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { serve } from '@hono/node-server'
+import { serveStatic } from '@hono/node-server/serve-static'
 import { WebSocketServer } from 'ws'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -52,8 +53,16 @@ const app = createApp({
   onAck: (taskId) => broadcast([taskId]),
 })
 
-// 远程 UI 静态托管（同一份构建产物，基地址是相对的）
+// 远程 UI 静态托管（同一份构建产物，基地址是相对的）。
+// /assets/* 这类真文件必须以正确的 Content-Type 返回——全部回 index.html
+// 会让 <script> 因 MIME 不符被浏览器拒载（白屏）。
 const indexHtml = existsSync(join(uiDir, 'index.html')) ? readFileSync(join(uiDir, 'index.html'), 'utf8') : null
+if (existsSync(uiDir)) {
+  // serve-static 的 root 要相对 cwd 的路径
+  const relRoot = relative(process.cwd(), uiDir).replaceAll('\\', '/')
+  app.use('/assets/*', serveStatic({ root: relRoot }))
+  app.get('/favicon.ico', serveStatic({ root: relRoot }))
+}
 app.get('*', (c) => {
   if (indexHtml === null) {
     return c.text(`远程 UI 未找到（--ui ${uiDir}）。先 pnpm --filter @qb/ui build。`, 500)
@@ -82,8 +91,25 @@ server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     clients.add(ws)
     ws.on('close', () => clients.delete(ws))
+    // 客户端回 pong 即视为活跃
+    ws.on('pong', () => ((ws as unknown as { __missed?: number }).__missed = 0))
   })
 })
+
+// 心跳：30 秒 ping 一轮，连续 3 次无回应就踢——死连接会堆积、慢连接会占内存
+setInterval(() => {
+  for (const ws of clients) {
+    const state = ws as unknown as { __missed?: number; terminate(): void }
+    const missed = (state.__missed ?? 0) + 1
+    if (missed > 3) {
+      ws.terminate()
+      clients.delete(ws)
+      continue
+    }
+    state.__missed = missed
+    ws.ping()
+  }
+}, 30_000).unref?.()
 
 // 首次启动：没有用户时发一张邀请，打印一次加入链接
 if (!store.hasUsers()) {

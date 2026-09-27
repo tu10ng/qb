@@ -61,7 +61,7 @@ export function apply(ctx: DshContext, config: Config): void {
     adapt: readPrompt('adapt.md'),
   }
 
-  // M8：团队同步。3 秒一拍：有新事件/未推的求助才会上传，空转很便宜。
+  // M8：团队同步（见下方 interval 注释）。
   const team = new TeamSettings(store)
   const sync = createSync({
     store,
@@ -69,7 +69,9 @@ export function apply(ctx: DshContext, config: Config): void {
     broadcast: (data) => ws.broadcast(data),
     log: (msg) => console.warn(`[qb] ${msg}`),
   })
-  ctx.setInterval(() => sync.pushNow(), 3000)
+  // 2 秒一拍：方案验收要求"PL 的评论 2 秒内到达执行者"。
+  // 无上行时是 pull-only（很轻），这个频率没有负担。
+  ctx.setInterval(() => sync.pushNow(), 2000)
 
   const api = buildApi({
     host,

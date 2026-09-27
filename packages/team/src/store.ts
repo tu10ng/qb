@@ -11,10 +11,23 @@ import type { Db } from './db.ts'
 
 const newId = (prefix: string) => `${prefix}_${customAlphabet('23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz', 12)()}`
 
+interface UserRowT {
+  id: string
+  name: string
+  display_name: string
+  is_admin: number
+}
+
+function toTeamUser(r: UserRowT): TeamUser {
+  return { id: r.id, name: r.name, displayName: r.display_name, isAdmin: r.is_admin === 1 }
+}
+
 export interface TeamUser {
   id: string
   name: string
   displayName: string
+  /** 首位注册用户即管理员：渠道与邀请只有他能配（命令渠道等于 shell）。 */
+  isAdmin: boolean
 }
 
 export interface TaskMirror {
@@ -137,25 +150,22 @@ export class TeamStore {
   // ── 用户 / 令牌 / 邀请 ───────────────────────────────────
 
   createUser(name: string, displayName?: string): TeamUser {
-    const u: TeamUser = { id: newId('usr'), name, displayName: displayName ?? name }
+    const first = !this.hasUsers()
+    const u: TeamUser = { id: newId('usr'), name, displayName: displayName ?? name, isAdmin: first }
     this.db
-      .prepare('INSERT INTO users (id, name, display_name, created_at) VALUES (?, ?, ?, ?)')
-      .run(u.id, u.name, u.displayName, Date.now())
+      .prepare('INSERT INTO users (id, name, display_name, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(u.id, u.name, u.displayName, first ? 1 : 0, Date.now())
     return u
   }
 
   userByName(name: string): TeamUser | null {
-    const row = this.db.prepare('SELECT * FROM users WHERE name = ?').get(name) as
-      | { id: string; name: string; display_name: string }
-      | undefined
-    return row === undefined ? null : { id: row.id, name: row.name, displayName: row.display_name }
+    const row = this.db.prepare('SELECT * FROM users WHERE name = ?').get(name) as UserRowT | undefined
+    return row === undefined ? null : toTeamUser(row)
   }
 
   userById(id: string): TeamUser | null {
-    const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
-      | { id: string; name: string; display_name: string }
-      | undefined
-    return row === undefined ? null : { id: row.id, name: row.name, displayName: row.display_name }
+    const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRowT | undefined
+    return row === undefined ? null : toTeamUser(row)
   }
 
   hasUsers(): boolean {
@@ -174,11 +184,11 @@ export class TeamStore {
   /** 校验令牌，返回用户；顺手记录使用时间。 */
   userByToken(token: string): TeamUser | null {
     const row = this.db
-      .prepare('SELECT t.user_id uid, u.name, u.display_name FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?')
-      .get(hashToken(token)) as { uid: string; name: string; display_name: string } | undefined
+      .prepare('SELECT t.user_id uid, u.* FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?')
+      .get(hashToken(token)) as (UserRowT & { uid: string }) | undefined
     if (row === undefined) return null
     this.db.prepare('UPDATE tokens SET last_used_at = ? WHERE token_hash = ?').run(Date.now(), hashToken(token))
-    return { id: row.uid, name: row.name, displayName: row.display_name }
+    return { id: row.uid, name: row.name, displayName: row.display_name, isAdmin: row.is_admin === 1 }
   }
 
   createInvite(expiresInMs: number, maxUses = 1, createdBy: string | null = null): string {
@@ -189,15 +199,17 @@ export class TeamStore {
     return token
   }
 
-  /** 用掉一张邀请（过期/用尽抛错）。 */
+  /** 用掉一张邀请（过期/用尽抛错）。原子：条件 UPDATE，并发不会超额。 */
   consumeInvite(token: string): void {
-    const row = this.db.prepare('SELECT * FROM invites WHERE token = ?').get(token) as
-      | { uses: number; max_uses: number; expires_at: number }
-      | undefined
-    if (row === undefined) throw new Error('邀请码不存在')
-    if (row.expires_at < Date.now()) throw new Error('邀请码已过期')
-    if (row.uses >= row.max_uses) throw new Error('邀请码已被使用')
-    this.db.prepare('UPDATE invites SET uses = uses + 1 WHERE token = ?').run(token)
+    const r = this.db
+      .prepare('UPDATE invites SET uses = uses + 1 WHERE token = ? AND expires_at > ? AND uses < max_uses')
+      .run(token, Date.now())
+    if (r.changes === 0) {
+      const row = this.db.prepare('SELECT * FROM invites WHERE token = ?').get(token) as
+        | { uses: number; max_uses: number; expires_at: number }
+        | undefined
+      throw new Error(row === undefined ? '邀请码不存在' : row.expires_at <= Date.now() ? '邀请码已过期' : '邀请码已被使用')
+    }
   }
 
   // ── 引擎同步（镜像写入 + 下行回流）────────────────────────
@@ -392,15 +404,15 @@ export class TeamStore {
     // 匹配会什么都看不到——他真正相关的是"向我求助/我介入过"的任务。
     const where =
       scope === 'initiated'
-        ? 'initiator_name = @me'
+        ? 't.initiator_name = @me'
         : scope === 'assigned'
-          ? 'assignee_name = @me'
-          : `initiator_name = @me OR assignee_name = @me
-             OR id IN (SELECT task_id FROM questions WHERE answer IS NULL AND asker_name != @me)
-             OR id IN (SELECT task_id FROM comments c JOIN users u ON u.id = c.author_id WHERE u.name = @me)
-             OR id IN (SELECT task_id FROM alerts a JOIN users u ON u.id = a.acked_by WHERE u.name = @me)`
+          ? 't.assignee_name = @me'
+          : `t.initiator_name = @me OR t.assignee_name = @me
+             OR t.id IN (SELECT q.task_id FROM questions q WHERE q.answer IS NULL AND q.asker_name != @me)
+             OR t.id IN (SELECT c.task_id FROM comments c JOIN users u ON u.id = c.author_id WHERE u.name = @me)
+             OR t.id IN (SELECT a.task_id FROM alerts a JOIN users u ON u.id = a.acked_by WHERE u.name = @me)`
     const rows = this.db
-      .prepare(`SELECT DISTINCT t.* FROM tasks t WHERE ${where.replace(/id/g, 't.id')} ORDER BY t.updated_at DESC`)
+      .prepare(`SELECT DISTINCT t.* FROM tasks t WHERE ${where} ORDER BY t.updated_at DESC`)
       .all({ me: userName }) as Array<Record<string, unknown>>
     return rows.map((r) => {
       const id = r.id as string

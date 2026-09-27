@@ -1292,6 +1292,20 @@ export class Store {
     return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) m FROM events').get() as { m: number }).m
   }
 
+  /** 同 kind 且 payload 里同 id 的事件是否已存在（下行去重用，低频小查询）。 */
+  hasEventWithPayloadId(kind: EventKind, id: string): boolean {
+    const rows = this.db
+      .prepare('SELECT payload_json FROM events WHERE kind = ? ORDER BY seq DESC LIMIT 200')
+      .all(kind) as Array<{ payload_json: string }>
+    return rows.some((r) => {
+      try {
+        return (JSON.parse(r.payload_json) as { id?: unknown }).id === id
+      } catch {
+        return false
+      }
+    })
+  }
+
   /** 把一串 store 操作包进单个事务：中途失败整体回滚，不留半套参数/半数改动。 */
   inTransaction<T>(fn: () => T): T {
     return this.db.transaction(fn)()

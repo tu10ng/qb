@@ -165,6 +165,10 @@ export function buildApi(deps: ApiDeps): Router {
       ...(body.definitionOfDone !== undefined ? { definitionOfDone: body.definitionOfDone } : {}),
     })
 
+    // 建任务就记一条：同步靠事件发现脏任务，没有这条，一个只建了任务
+    // 还没写 runbook 的活永远不会出现在发起人那边
+    store.appendEvent({ taskId: task.id, actorId: currentUserId(), kind: 'task_created', payload: {} })
+
     sendJson(res, 201, task)
   })
 

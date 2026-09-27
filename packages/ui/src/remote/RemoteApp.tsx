@@ -408,6 +408,8 @@ function remoteEventText(kind: string, payload: Record<string, unknown>, section
   const stepTitle = typeof payload.title === 'string' ? payload.title : ''
   const which = stepTitle !== '' ? `「${stepTitle}」` : ''
   switch (kind) {
+    case 'task_created':
+      return '任务创建'
     case 'task_started':
       return '开始执行'
     case 'task_done':

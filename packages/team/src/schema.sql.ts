@@ -20,6 +20,8 @@ CREATE TABLE users (
   id          TEXT PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
+  -- 首位注册用户即管理员：推送渠道（命令渠道=shell）与邀请只有他能配
+  is_admin    INTEGER NOT NULL DEFAULT 0,
   created_at  INTEGER NOT NULL
 );
 

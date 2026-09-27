@@ -23,7 +23,7 @@ export interface ApiOptions {
   onAck?: (taskId: string) => void
 }
 
-export type AppEnv = { Variables: { user: { id: string; name: string; displayName: string } } }
+export type AppEnv = { Variables: { user: { id: string; name: string; displayName: string; isAdmin: boolean } } }
 
 export function createApp(opts: ApiOptions): Hono<AppEnv> {
   const { store } = opts
@@ -31,8 +31,9 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
 
   // 引擎同步回路的报错要能看见（否则只有干巴巴的 500，没法排查）
   app.onError((err, c) => {
+    // 细节只进服务端日志；给客户端的文案固定，SQLite 报错不该泄 schema
     console.error('[qb-team] 处理出错:', err instanceof Error ? err.stack ?? err.message : err)
-    return c.json({ error: 'internal', message: err instanceof Error ? err.message : String(err) }, 500)
+    return c.json({ error: 'internal', message: '服务内部错误，看团队服务日志' }, 500)
   })
 
   // ── 认证 ───────────────────────────────────────────────
@@ -154,13 +155,17 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
 
     const result = store.ingestPush(parsed.data as SyncPush)
 
-    // 新红告警 → 推渠道（异步，别卡住同步回路）
+    // 新红告警 → 推渠道（异步，别卡住同步回路；结果进日志便于排查）
     for (const alert of result.newRedAlerts) {
       const task = store.taskById(alert.taskId)
       if (task === null) continue
       const steps = store.stepsOf(alert.taskId)
       const stepTitle = alert.stepId !== null ? (steps.find((s) => s.id === alert.stepId)?.title ?? null) : null
-      void pushAlert(store, { alert, task, stepTitle })
+      void pushAlert(store, { alert, task, stepTitle }).then((outcomes) => {
+        for (const o of outcomes) {
+          if (!o.ok) console.warn(`[qb-team] 推送失败（${o.channelName}）：${o.detail}`)
+        }
+      })
     }
 
     const changedTasks = new Set<string>([...parsed.data.tasks.map((t) => t.id), ...result.newRedAlerts.map((a) => a.taskId), ...result.resolvedAlerts.map((a) => a.taskId)])
@@ -240,13 +245,26 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
     enabled: z.boolean().default(true),
   })
 
+  const requireAdmin = (c: { get(k: 'user'): { isAdmin: boolean } }): boolean => c.get('user').isAdmin
+
   app.get('/api/push/channels', (c) => c.json({ channels: store.listChannels() }))
+
+  // 管理员续发邀请（首张邀请用尽后新人从这进来）
+  app.post('/api/invites', (c) => {
+    if (!requireAdmin(c)) return c.json({ error: 'forbidden', message: '只有管理员能发邀请' }, 403)
+    const token = store.createInvite(24 * 60 * 60_000, 3, c.get('user').id)
+    return c.json({ invite: token, url: `/#/join/${token}` }, 201)
+  })
 
   app.post('/api/push/channels', async (c) => {
     const parsed = ChannelBody.safeParse(await c.req.json().catch(() => ({})))
     if (!parsed.success) return c.json({ error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') }, 400)
+    if (!requireAdmin(c)) return c.json({ error: 'forbidden', message: '只有管理员能配推送渠道（命令渠道会以服务进程执行命令）' }, 403)
     if (parsed.data.kind === 'webhook' && typeof parsed.data.config.url !== 'string') {
       return c.json({ error: 'bad_request', message: 'webhook 渠道要填 url' }, 400)
+    }
+    if (parsed.data.kind === 'webhook' && !/^https?:\/\//.test(String(parsed.data.config.url))) {
+      return c.json({ error: 'bad_request', message: 'url 要以 http:// 或 https:// 开头' }, 400)
     }
     if (parsed.data.kind === 'command' && typeof parsed.data.config.command !== 'string') {
       return c.json({ error: 'bad_request', message: 'command 渠道要填 command（如 python push.py）' }, 400)
@@ -255,6 +273,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
   })
 
   app.delete('/api/push/channels/:id', (c) => {
+    if (!requireAdmin(c)) return c.json({ error: 'forbidden', message: '只有管理员能删推送渠道' }, 403)
     store.deleteChannel(c.req.param('id'))
     return c.json({ ok: true })
   })

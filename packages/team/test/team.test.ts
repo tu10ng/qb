@@ -14,10 +14,11 @@ function fresh() {
 
 /** 造执行者（引擎令牌的持有者）与发起人。 */
 function setupUsers(store: TeamStore): { initiatorToken: string; engineToken: string } {
-  const executor = store.createUser('tu10ng', '小A')
-  const engineToken = store.issueToken(executor.id)
+  // 先建老王：首位注册者即管理员（渠道/邀请只有他能配，测试里要用）
   const initiator = store.createUser('laowang', '老王')
   const initiatorToken = store.issueToken(initiator.id)
+  const executor = store.createUser('tu10ng', '小A')
+  const engineToken = store.issueToken(executor.id)
   return { initiatorToken, engineToken }
 }
 

@@ -1456,6 +1456,8 @@ function eventText(e: Event, steps: Step[]): string {
   const byQb = payload.by === 'qb'
 
   switch (e.kind) {
+    case 'task_created':
+      return '创建了任务'
     case 'task_started':
       return '任务开始'
     case 'task_done':
