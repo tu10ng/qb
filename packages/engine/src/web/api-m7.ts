@@ -8,7 +8,7 @@
 
 import { z } from 'zod'
 import { checkExpectation, literalSuggestions, matchBlocks, redact, renderCommand, sanitizeText, splitTranscript, tailCap, checkFidelity, type Expectation, type Param, type StepStatus, type Verdict } from '@qb/core'
-import type { Store } from '@qb/server'
+import type { Store } from '@qb/store'
 import type { Llm } from '../llm/port.ts'
 import { importMaterial } from '../agent/import.ts'
 import { proposeAdapt } from '../agent/adapt.ts'

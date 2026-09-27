@@ -13,7 +13,7 @@ import { AttachmentError, type Attachments } from './attachments.ts'
 import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
-import type { Store } from '@qb/server'
+import type { Store } from '@qb/store'
 import type { Step, StepStatus, Verdict } from '@qb/core'
 import { checkExpectation, redact, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind } from '@qb/core'
 

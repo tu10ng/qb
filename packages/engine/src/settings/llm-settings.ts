@@ -4,7 +4,7 @@
  * key 只存在本机这份库里。对外（HTTP 接口、日志）一律只给打码后的样子。
  */
 
-import type { Store, StoredModelProfile } from '@qb/server'
+import type { Store, StoredModelProfile } from '@qb/store'
 import {
   Capabilities,
   ProfileOptions,

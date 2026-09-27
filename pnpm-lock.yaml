@@ -44,9 +44,9 @@ importers:
       '@qb/core':
         specifier: workspace:*
         version: link:../core
-      '@qb/server':
+      '@qb/store':
         specifier: workspace:*
-        version: link:../server
+        version: link:../store
       ai:
         specifier: ^7.0.116
         version: 7.0.116(zod@4.6.5)
@@ -58,7 +58,7 @@ importers:
         specifier: 0.1.5-rc.3
         version: 0.1.5-rc.3(6f178f8ee7bbbfcd7d6a2ea90ac18123)
 
-  packages/server:
+  packages/store:
     dependencies:
       '@qb/core':
         specifier: workspace:*

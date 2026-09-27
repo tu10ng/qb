@@ -15,7 +15,7 @@
     "@ai-sdk/deepseek": "^3.0.54",
     "@ai-sdk/openai-compatible": "^3.0.57",
     "@qb/core": "workspace:*",
-    "@qb/server": "workspace:*",
+    "@qb/store": "workspace:*",
     "ai": "^7.0.116",
     "zod": "^4.6.5"
   },

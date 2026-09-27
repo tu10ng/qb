@@ -1,5 +1,5 @@
 {
-  "name": "@qb/server",
+  "name": "@qb/store",
   "version": "0.1.0",
   "private": true,
   "type": "module",

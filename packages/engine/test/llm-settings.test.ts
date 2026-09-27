@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { openDb, Store } from '@qb/server'
+import { openDb, Store } from '@qb/store'
 import { LlmSettings } from '../src/settings/llm-settings.ts'
 import { Capabilities, type PresetId, type Wire } from '../src/llm/profiles.ts'
 

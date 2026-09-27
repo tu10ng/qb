@@ -8,7 +8,7 @@
 
 import { z } from 'zod'
 import { Expectation, ReadinessProbe, StepKind, StepPatch, type StepStatus } from '@qb/core'
-import { RevConflict, type Store } from '@qb/server'
+import { RevConflict, type Store } from '@qb/store'
 import { errMessage, sendJson, type Router } from './router.ts'
 import type { createWsHandler } from './ws.ts'
 
