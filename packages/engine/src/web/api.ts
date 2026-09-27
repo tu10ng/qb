@@ -9,6 +9,7 @@ import { Jobs } from './jobs.ts'
 import { registerEditRoutes } from './api-edit.ts'
 import { registerSettingsRoutes } from './api-settings.ts'
 import { fidelityFor, registerM7Routes } from './api-m7.ts'
+import { registerTeamRoutes } from './api-team.ts'
 import { AttachmentError, type Attachments } from './attachments.ts'
 import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
@@ -33,6 +34,7 @@ export interface ApiDeps {
   settings: LlmSettings
   attachments: Attachments
   guard: LocalGuard
+  team: { settings: import('../sync/sync.ts').TeamSettings; sync: import('../sync/sync.ts').Sync }
 }
 
 /** 整份替换接口的输入校验。之前直接 as 断言，畸形的 expectation 能入库。 */
@@ -135,6 +137,7 @@ export function buildApi(deps: ApiDeps): Router {
       title?: string
       briefMd?: string
       assigneeId?: string
+      initiatorName?: string
       expectedMinutes?: number
       dueAt?: number
       definitionOfDone?: string
@@ -145,9 +148,16 @@ export function buildApi(deps: ApiDeps): Router {
       return
     }
 
+    // 谁派的活：同事在 IM 里派的，记录下来——他在团队服务那边就能
+    // 看到这个任务的全部进度与告警（任务=契约：发起人 → 执行者）
+    const initiatorId =
+      typeof body.initiatorName === 'string' && body.initiatorName.trim() !== ''
+        ? store.ensureUser(body.initiatorName.trim()).id
+        : currentUserId()
+
     const task = store.createTask({
       title: body.title.trim(),
-      initiatorId: currentUserId(),
+      initiatorId,
       ...(body.briefMd !== undefined ? { briefMd: body.briefMd } : {}),
       ...(body.assigneeId !== undefined ? { assigneeId: body.assigneeId } : {}),
       ...(body.expectedMinutes !== undefined ? { expectedMinutes: body.expectedMinutes } : {}),
@@ -758,6 +768,7 @@ export function buildApi(deps: ApiDeps): Router {
   registerEditRoutes(router, { store, ws, currentUserId, isRunning: (id) => running.has(id) })
   registerSettingsRoutes(router, { settings, llm, jobs })
   registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
+  registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, currentUserId })
 
   return router
 }

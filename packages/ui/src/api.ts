@@ -213,8 +213,10 @@ export const api = {
   listTasks: (scope: 'mine' | 'delegated' = 'mine') =>
     req<{ tasks: Task[] }>(`/tasks?scope=${scope}`).then((r) => r.tasks),
 
-  createTask: (input: { title: string; briefMd?: string }) =>
-    req<Task>('/tasks', { method: 'POST', body: JSON.stringify(input) }),
+  createTask: (input: { title: string; briefMd?: string; initiatorName?: string; materialText?: string }) => {
+    const { materialText, ...rest } = input
+    return req<Task>('/tasks', { method: 'POST', body: JSON.stringify(rest) })
+  },
 
   taskDetail: (taskId: string) => req<TaskDetail>(`/tasks/${taskId}/runbook`),
 
@@ -349,6 +351,26 @@ export const api = {
   // ── 设置 · 模型 ─────────────────────────────────────────────
 
   llmSettings: () => req<LlmSettingsView>('/settings/llm'),
+
+  // ── 团队同步（M8）────────────────────────────────────────
+
+  teamSettings: () => req<{ url: string; token: string; hasToken: boolean; enabled: boolean }>('/settings/team'),
+
+  saveTeamSettings: (input: { url: string; token?: string; enabled: boolean }) =>
+    req<{ url: string; hasToken: boolean; enabled: boolean }>('/settings/team', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  testTeamSettings: (input: { url?: string; token?: string }) =>
+    req<{ ok: boolean; detail: string }>('/settings/team/test', { method: 'POST', body: JSON.stringify(input) }),
+
+  /** 问发起人：配好团队服务才真正发送；sent=false 时界面退回复制到 IM。 */
+  askInitiator: (taskId: string, input: { stepId?: string | null; body: string }) =>
+    req<{ sent: boolean; questionId?: string; reason?: string }>(`/tasks/${taskId}/ask`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 
   saveProfile: (input: ProfileInput) =>
     req<LlmSettingsView & { profile: PublicProfile }>('/settings/llm/profiles', {

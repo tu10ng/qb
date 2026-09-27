@@ -350,4 +350,19 @@ INSERT INTO tasks_fts(rowid, title, brief_md) SELECT rowid, title, brief_md FROM
 ALTER TABLE runbooks ADD COLUMN material_id TEXT REFERENCES materials(id) ON DELETE SET NULL;
 `,
   },
+  {
+    version: 5,
+    name: 'team-sync',
+    sql: `
+-- M8：求助是否已推给团队服务（0=待推，1=已推）
+ALTER TABLE questions ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0;
+
+-- 同步游标（已推到哪条事件、下行拉到哪号）等小状态
+CREATE TABLE sync_state (
+  key        TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`,
+  },
 ]

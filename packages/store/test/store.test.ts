@@ -598,6 +598,40 @@ describe('M7：参数 / 底稿 / 素材', () => {
   })
 })
 
+describe('M8：求助与同步游标', () => {
+  it('求助：建、答、待推列表、标记已推', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { id } = store.createQuestion({ taskId: t.id, stepId: null, askerId: me, bodyMd: 'hostname 是什么？' })
+    expect(store.listUnpushedQuestions()).toHaveLength(1)
+
+    expect(store.answerQuestion(id, 'gpu-21')).toBe(true)
+    expect(store.answerQuestion('qst_none', 'x')).toBe(false)
+    const q = store.getQuestion(id)!
+    expect(q.answerMd).toBe('gpu-21')
+    expect(q.answeredAt).not.toBeNull()
+    // 回答由团队回流时直接标已推
+    expect(q.pushed).toBe(true)
+
+    store.markQuestionsPushed([id])
+    expect(store.listUnpushedQuestions()).toEqual([])
+  })
+
+  it('同步游标与带 seq 的事件', () => {
+    const t = store.createTask({ title: 'y', initiatorId: me })
+    store.appendEvent({ taskId: t.id, kind: 'step_run' })
+    store.appendEvent({ taskId: t.id, kind: 'step_ok' })
+    expect(store.maxEventSeq()).toBeGreaterThanOrEqual(2)
+    const after = store.eventsAfter(0)
+    expect(after).toHaveLength(2)
+    expect(after[0]!.seq).toBeLessThan(after[1]!.seq)
+
+    expect(store.getSyncState('x')).toBeNull()
+    store.setSyncState('x', { a: 1 })
+    store.setSyncState('x', { a: 2 })
+    expect(store.getSyncState<{ a: number }>('x')).toEqual({ a: 2 })
+  })
+})
+
 describe('本机设置', () => {
   it('模型档案：新建、覆盖、删除', () => {
     const p = store.saveModelProfile({

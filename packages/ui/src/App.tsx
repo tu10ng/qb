@@ -56,6 +56,7 @@ export function App() {
   const [editTarget, setEditTarget] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [llmStatus, setLlmStatus] = useState<PurposeStatus | null>(null)
+  const [teamEnabled, setTeamEnabled] = useState(false)
   const history = useHistory()
 
   const detailRef = useRef<TaskDetail | null>(null)
@@ -86,12 +87,21 @@ export function App() {
       .llmSettings()
       .then((s) => setLlmStatus(s.status.structure))
       .catch(() => setLlmStatus(null))
+    api
+      .teamSettings()
+      .then((t) => setTeamEnabled(t.enabled))
+      .catch(() => setTeamEnabled(false))
   }, [])
 
   useEffect(() => {
     void refreshTasks()
     refreshLlm()
   }, [refreshTasks, refreshLlm])
+
+  // 设置页改完团队配置回来要刷新（简单起见：每次切回任务视图都刷一次）
+  useEffect(() => {
+    if (view === 'task') refreshLlm()
+  }, [view, refreshLlm])
 
   useEffect(() => {
     setDetail(null)
@@ -586,6 +596,7 @@ export function App() {
           onDrop={(dragged, target) => void moveTo(dragged, dropPosition(steps, target, dragged))}
           onChanged={() => void reload()}
           onOpenSettings={() => setView('settings')}
+          teamEnabled={teamEnabled}
           toast={toast}
         />
       )}
@@ -630,6 +641,8 @@ interface TaskPageProps {
   onDrop: (dragged: Step, target: Step) => void
   onChanged: () => void
   onOpenSettings: () => void
+  /** 配好团队服务时"问发起人"走真实发送。 */
+  teamEnabled: boolean
   toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
 }
 
@@ -649,6 +662,7 @@ function TaskPage({
   onDrop,
   onChanged,
   onOpenSettings,
+  teamEnabled,
   toast,
 }: TaskPageProps) {
   const { task, runbook, steps } = detail
@@ -658,6 +672,7 @@ function TaskPage({
   const [adaptDismissedJob, setAdaptDismissedJob] = useState<string | null>(null)
   const [situationOpen, setSituationOpen] = useState(false)
   const [transcriptOpen, setTranscriptOpen] = useState(false)
+  const [askOpen, setAskOpen] = useState(false)
 
   useEffect(() => {
     currentRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
@@ -866,23 +881,12 @@ function TaskPage({
             )}
           </div>
           <div className="qb-actions">
-            {/* 临时 · 复制到 IM 替代：M8 接上团队服务后改为直接发给发起人、回答内联出现在这一步 */}
             <button
               className="btn"
-              title="临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人"
-              onClick={() => {
-                void navigator.clipboard.writeText(
-                  askText(
-                    task,
-                    current,
-                    current !== null ? (detail.evidence[current.id] ?? []) : [],
-                    current !== null ? detail.events : [],
-                  ),
-                )
-                toast('求助内容已复制，贴到 IM 里发给发起人（临时 · 复制到 IM）')
-              }}
+              title={teamEnabled ? 'QB 整理好求助发给发起人，回答会回到这一步' : '临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人'}
+              onClick={() => setAskOpen(true)}
             >
-              问发起人（临时 · 复制到 IM）
+              问发起人{teamEnabled ? '' : '（临时 · 复制到 IM）'}
             </button>
 
             {steps.length > 0 && (
@@ -910,6 +914,32 @@ function TaskPage({
           />
         )}
 
+        {askOpen && (
+          <AskDialog
+            enabled={teamEnabled}
+            initial={askText(
+              task,
+              current,
+              current !== null ? (detail.evidence[current.id] ?? []) : [],
+              current !== null ? detail.events : [],
+            )}
+            onDone={(body) => {
+              setAskOpen(false)
+              if (body === null) return
+              api
+                .askInitiator(task.id, { stepId: current?.id ?? null, body })
+                .then((r) => {
+                  if (r.sent) toast('已发给发起人，回答会出现在 QB 面板和这一步')
+                  else {
+                    void navigator.clipboard.writeText(body)
+                    toast('还没配置团队服务：求助内容已复制，贴到 IM 里发（临时 · 复制到 IM）')
+                  }
+                })
+                .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+            }}
+          />
+        )}
+
         {transcriptOpen && (
           <TranscriptDialog
             onDone={(text) => {
@@ -929,6 +959,34 @@ function TaskPage({
             }}
           />
         )}
+      </div>
+    </div>
+  )
+}
+
+/** 问发起人：QB 代拟的正文（目标/命令/输出尾部/试过什么），可改可发。 */
+function AskDialog({ enabled, initial, onDone }: { enabled: boolean; initial: string; onDone: (body: string | null) => void }) {
+  const [text, setText] = useState(initial)
+  return (
+    <div className="modal-backdrop" onClick={() => onDone(null)}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <h3>{enabled ? '问发起人' : '问发起人（临时 · 复制到 IM）'}</h3>
+        <p className="dim">QB 按上下文代拟了正文（报错尾部、已试过什么都在），改完再发。</p>
+        <textarea
+          autoFocus
+          className="mono"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows={12}
+        />
+        <div className="row">
+          <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text)}>
+            {enabled ? '发给发起人' : '复制全文'}
+          </button>
+          <button className="btn ghost" onClick={() => onDone(null)}>
+            取消
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -1212,19 +1270,25 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
   const [title, setTitle] = useState('')
   const [brief, setBrief] = useState('')
   const [material, setMaterial] = useState('')
+  const [initiator, setInitiator] = useState('')
   const [busy, setBusy] = useState(false)
 
   const submit = async (): Promise<void> => {
     if (title.trim() === '') return
     setBusy(true)
     try {
-      const task = await api.createTask({ title: title.trim(), briefMd: brief })
+      const task = await api.createTask({
+        title: title.trim(),
+        briefMd: brief,
+        ...(initiator.trim() !== '' ? { initiatorName: initiator.trim() } : {}),
+      })
       if (material.trim() !== '') {
         await api.createMaterial(task.id, { kind: 'doc', text: material })
       }
       setTitle('')
       setBrief('')
       setMaterial('')
+      setInitiator('')
       await onCreated(task)
     } finally {
       setBusy(false)
@@ -1247,6 +1311,11 @@ function NewTask({ onCreated }: { onCreated: (t: Task) => void | Promise<void> }
           placeholder="详细说明（就像给 agent 写 prompt：目标、约束、已知的坑）"
           value={brief}
           onChange={(e) => setBrief(e.target.value)}
+        />
+        <input
+          placeholder="发起人（谁派的活？留空 = 自己。配好团队后他会实时看到进度与告警）"
+          value={initiator}
+          onChange={(e) => setInitiator(e.target.value)}
         />
         <textarea
           className="mono"
@@ -1425,6 +1494,20 @@ function eventText(e: Event, steps: Step[]): string {
     }
     case 'situation_changed':
       return `情况变了：${reason}`
+    case 'comment': {
+      const author = typeof payload.author === 'string' ? payload.author : '发起人'
+      const body = typeof payload.body === 'string' ? payload.body : ''
+      return `${author} 评论：${body}`
+    }
+    case 'question_asked':
+      return '发出了求助（已通知发起人）'
+    case 'question_answered': {
+      const by = typeof payload.by === 'string' ? payload.by : '发起人'
+      const answer = typeof payload.answer === 'string' ? payload.answer : ''
+      return `${by} 回答了：${answer}`
+    }
+    case 'alert_acked':
+      return '发起人知道了'
     default:
       return e.kind
   }

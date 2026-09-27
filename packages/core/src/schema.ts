@@ -251,6 +251,8 @@ export const EventKind = z.enum([
   'question_asked',
   'question_answered',
   'delegate_progress',
+  'comment',
+  'alert_acked',
   'lesson_proposed',
   'lesson_confirmed',
   'replanned',

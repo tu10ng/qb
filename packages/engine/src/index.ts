@@ -11,6 +11,7 @@ import { buildApi } from './web/api.ts'
 import { Attachments } from './web/attachments.ts'
 import { createLocalGuard } from './web/local-guard.ts'
 import { createWsHandler } from './web/ws.ts'
+import { createSync, TeamSettings } from './sync/sync.ts'
 import { createSpaHandler } from './web/spa.ts'
 
 export const name = 'qb-engine'
@@ -60,6 +61,16 @@ export function apply(ctx: DshContext, config: Config): void {
     adapt: readPrompt('adapt.md'),
   }
 
+  // M8：团队同步。3 秒一拍：有新事件/未推的求助才会上传，空转很便宜。
+  const team = new TeamSettings(store)
+  const sync = createSync({
+    store,
+    userName: () => config.userName ?? 'me',
+    broadcast: (data) => ws.broadcast(data),
+    log: (msg) => console.warn(`[qb] ${msg}`),
+  })
+  ctx.setInterval(() => sync.pushNow(), 3000)
+
   const api = buildApi({
     host,
     store,
@@ -71,6 +82,7 @@ export function apply(ctx: DshContext, config: Config): void {
     settings,
     attachments,
     guard,
+    team: { settings: team, sync },
   })
 
   ctx.webServer.register({ kind: 'prefix', path: `${mount}/api`, handler: api.handle })

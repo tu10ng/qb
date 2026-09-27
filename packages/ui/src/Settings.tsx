@@ -30,6 +30,7 @@ export function Settings({ jobs }: Props) {
   const [view, setView] = useState<LlmSettingsView | null>(null)
   const [editing, setEditing] = useState<PublicProfile | 'new' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState<'llm' | 'team'>('llm')
 
   const refresh = useCallback(async () => {
     try {
@@ -63,7 +64,13 @@ export function Settings({ jobs }: Props) {
 
   return (
     <div className="settings">
-      <h1>设置 · 模型</h1>
+      <h1>设置</h1>
+      <div className="chip-row" style={{ marginBottom: 14 }}>
+        <button className={`chip${tab === 'llm' ? ' on' : ''}`} onClick={() => setTab('llm')}>模型</button>
+        <button className={`chip${tab === 'team' ? ' on' : ''}`} onClick={() => setTab('team')}>团队</button>
+      </div>
+      {tab === 'team' ? <TeamSection /> : (
+      <>
       <p className="settings-lead">
         key 只存在这台电脑上，不同步、不写日志。<code>.env.local</code> 里的配置会作为一个只读档案出现在这里。
       </p>
@@ -138,7 +145,98 @@ export function Settings({ jobs }: Props) {
       )}
 
       {error !== null && <div className="verdict fail">{error}</div>}
+      </>
+      )}
     </div>
+  )
+}
+
+/** 设置 · 团队：同步到团队服务（进度实时给发起人；告警推 IM）。 */
+function TeamSection() {
+  const [cfg, setCfg] = useState<{ url: string; hasToken: boolean; enabled: boolean } | null>(null)
+  const [url, setUrl] = useState('')
+  const [token, setToken] = useState('')
+  const [enabled, setEnabled] = useState(false)
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    api
+      .teamSettings()
+      .then((c) => {
+        setCfg(c)
+        setUrl(c.url)
+        setEnabled(c.enabled)
+      })
+      .catch(() => setCfg(null))
+  }, [])
+
+  const test = (): void => {
+    setBusy(true)
+    setTestResult(null)
+    api
+      .testTeamSettings({ url: url !== '' ? url : undefined, ...(token !== '' ? { token } : {}) })
+      .then(setTestResult)
+      .catch((e: unknown) => setTestResult({ ok: false, detail: e instanceof Error ? e.message : String(e) }))
+      .finally(() => setBusy(false))
+  }
+
+  const save = (): void => {
+    setBusy(true)
+    api
+      .saveTeamSettings({ url, ...(token !== '' ? { token } : {}), enabled })
+      .then((c) => {
+        setCfg(c)
+        setUrl(c.url)
+        setEnabled(c.enabled)
+        setToken('')
+        setTestResult({ ok: true, detail: '已保存' })
+      })
+      .catch((e: unknown) => setTestResult({ ok: false, detail: e instanceof Error ? e.message : String(e) }))
+      .finally(() => setBusy(false))
+  }
+
+  if (cfg === null) return <p className="dim">读取设置…</p>
+
+  return (
+    <section>
+      <p className="settings-lead">
+        团队服务（<code>node packages/team/src/index.ts</code>）让发起人实时看到进度、收到告警（推 IM）、回答你的求助。
+        没配置时一切照旧，只是"问发起人"退回复制到 IM。
+      </p>
+      <label>
+        团队服务地址
+        <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://10.0.1.8:3777" />
+      </label>
+      <label>
+        个人令牌
+        <input
+          type="password"
+          autoComplete="off"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder={cfg.hasToken ? `已配置（留空不改）` : '在团队服务注册后拿到'}
+        />
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+        启用同步（每 3 秒一拍，离线自动排队）
+      </label>
+      <div className="row" style={{ display: 'flex', gap: 6 }}>
+        <button className="btn primary" disabled={busy} onClick={save}>
+          保存
+        </button>
+        <button className="btn" disabled={busy} onClick={test}>
+          测试连接
+        </button>
+      </div>
+      {testResult !== null && (
+        <p className={testResult.ok ? 'verdict pass' : 'verdict fail'} style={{ marginTop: 8 }}>
+          {testResult.detail}
+        </p>
+      )}
+      {cfg.enabled && <p className="paste-hint" style={{ marginTop: 8 }}>同步中：进度、告警、求助都会推给团队服务（输出与截图不上传）。</p>}
+    </section>
   )
 }
 

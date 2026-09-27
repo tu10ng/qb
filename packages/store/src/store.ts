@@ -1214,6 +1214,84 @@ export class Store {
       .run(key, JSON.stringify(value), Date.now())
   }
 
+  // ── 求助（M8：问发起人走团队服务）─────────────────────────
+
+  createQuestion(input: { taskId: string; stepId?: string | null; askerId: string; bodyMd: string }): { id: string } {
+    const id = ids.question()
+    this.db
+      .prepare(
+        `INSERT INTO questions (id, task_id, step_id, asker_id, body_md, created_at, pushed)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(id, input.taskId, input.stepId ?? null, input.askerId, input.bodyMd, Date.now())
+    return { id }
+  }
+
+  getQuestion(id: string): { id: string; taskId: string; stepId: string | null; bodyMd: string; answerMd: string | null; answeredByName: string | null; answeredAt: number | null; pushed: boolean } | null {
+    const row = this.db.prepare('SELECT * FROM questions WHERE id = ?').get(id) as
+      | { id: string; task_id: string; step_id: string | null; body_md: string; answer_md: string | null; answered_at: number | null; pushed: number }
+      | undefined
+    if (row === undefined) return null
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      stepId: row.step_id,
+      bodyMd: row.body_md,
+      answerMd: row.answer_md,
+      answeredByName: null, // 本地表不存名字；团队回流的回答记在事件 payload 里
+      answeredAt: row.answered_at,
+      pushed: row.pushed === 1,
+    }
+  }
+
+  /** 团队侧回答回流：写答案并标记已推。 */
+  answerQuestion(id: string, answerMd: string): boolean {
+    const r = this.db
+      .prepare('UPDATE questions SET answer_md = ?, answered_at = ?, pushed = 1 WHERE id = ?')
+      .run(answerMd, Date.now(), id)
+    return r.changes > 0
+  }
+
+  listUnpushedQuestions(): Array<{ id: string; taskId: string; stepId: string | null; bodyMd: string; createdAt: number }> {
+    type Row = { id: string; task_id: string; step_id: string | null; body_md: string; created_at: number }
+    const rows = this.db
+      .prepare('SELECT id, task_id, step_id, body_md, created_at FROM questions WHERE pushed = 0 ORDER BY created_at')
+      .all() as Row[]
+    return rows.map((r) => ({ id: r.id, taskId: r.task_id, stepId: r.step_id, bodyMd: r.body_md, createdAt: r.created_at }))
+  }
+
+  markQuestionsPushed(ids: string[]): void {
+    const stmt = this.db.prepare('UPDATE questions SET pushed = 1 WHERE id = ?')
+    for (const id of ids) stmt.run(id)
+  }
+
+  // ── 同步游标（M8）─────────────────────────────────────────
+
+  getSyncState<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value_json FROM sync_state WHERE key = ?').get(key) as { value_json: string } | undefined
+    return row === undefined ? null : (JSON.parse(row.value_json) as T)
+  }
+
+  setSyncState(key: string, value: unknown): void {
+    this.db
+      .prepare(
+        `INSERT INTO sync_state (key, value_json, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      )
+      .run(key, JSON.stringify(value), Date.now())
+  }
+
+  /** 超过游标的全部事件（同步用），带引擎本地的 seq 当推送幂等键。 */
+  eventsAfter(seq: number, limit = 500): Array<Event & { seq: number }> {
+    return (this.db
+      .prepare('SELECT * FROM (SELECT * FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?) ORDER BY seq ASC')
+      .all(seq, limit) as EventRow[]).map((r) => ({ ...toEvent(r), seq: r.seq }))
+  }
+
+  maxEventSeq(): number {
+    return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) m FROM events').get() as { m: number }).m
+  }
+
   /** 把一串 store 操作包进单个事务：中途失败整体回滚，不留半套参数/半数改动。 */
   inTransaction<T>(fn: () => T): T {
     return this.db.transaction(fn)()
