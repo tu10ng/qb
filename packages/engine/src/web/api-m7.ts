@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import { checkExpectation, literalSuggestions, matchBlocks, redact, renderCommand, sanitizeText, splitTranscript, tailCap, checkFidelity, type Expectation, type Param, type StepStatus, type Verdict } from '@qb/core'
+import { checkExpectation, FIELD_KEY_SRC, isRunnable, isTemplated, literalSuggestions, matchBlocks, PARAM_NAME_RE, redact, redactSecrets, renderCommand, sanitizeText, splitTranscript, tailCap, checkFidelity, type Expectation, type Param, type StepStatus, type Verdict } from '@qb/core'
 import type { Store } from '@qb/store'
 import type { Llm } from '../llm/port.ts'
 import { importMaterial } from '../agent/import.ts'
@@ -27,12 +27,21 @@ export interface M7Deps {
   prompts: { persona: string; import: string; adapt: string }
 }
 
+const ParamField = z.object({
+  key: z.string().regex(new RegExp(`^${FIELD_KEY_SRC}$`, 'u'), '字段名只能用字母（含中文）、数字和下划线'),
+  value: z.string(),
+  secret: z.boolean().default(false),
+})
+
 const ParamBody = z.object({
-  name: z.string().regex(/^[A-Z][A-Z0-9_]*$/, '参数名要大写下划线'),
+  name: z.string().regex(PARAM_NAME_RE, '参数名用大写英文、数字、下划线（如 DECODE_HOST），或带中文（如 容器名）'),
   value: z.string(),
   description: z.string().optional(),
   source: z.enum(['origin', 'base', 'mine', 'qb_guess', 'env']).optional(),
   secret: z.boolean().optional(),
+  fields: z.array(ParamField).max(20).optional(),
+  valueLabel: z.string().max(20).optional(),
+  scope: z.string().nullable().optional(),
 })
 
 const MaterialBody = z.object({
@@ -51,7 +60,7 @@ const AdaptApplyBody = z.object({
 })
 
 const SuggestApplyBody = z.object({
-  items: z.array(z.object({ value: z.string().min(1), name: z.string().regex(/^[A-Z][A-Z0-9_]*$/) })).min(1),
+  items: z.array(z.object({ value: z.string().min(1), name: z.string().regex(PARAM_NAME_RE) })).min(1),
 })
 
 export function registerM7Routes(router: Router, deps: M7Deps): void {
@@ -146,7 +155,7 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
         // 坑的 stepIndex 是模型按它自己的步骤列表（含无命令的步骤）编的号，
         // 映射要用同一套下标：文档序、排除章节标题
         const lessonStep = new Map(
-          created.steps.filter((s) => !(s.kind === 'note' && s.parentId === null)).map((s, i) => [i, s.id]),
+          created.steps.filter((s) => s.kind !== 'section').map((s, i) => [i, s.id]),
         )
 
         // 原文里的坑：锚到步骤血缘（同血缘的复制品都看得见，M9）；
@@ -396,7 +405,10 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
       const before = prev.get(p.name)
       // 值变了的参数一律标 mine（界面据此高亮"这次改过"），不管客户端
       // 传了什么 source——面板发的是完整对象，会带着旧 source 回来
-      const changed = before === undefined || before.value !== p.value
+      const changed = before === undefined || before.value !== p.value || JSON.stringify(before.fields ?? []) !== JSON.stringify(p.fields ?? before.fields ?? [])
+      const fields = p.fields ?? before?.fields
+      const valueLabel = p.valueLabel ?? before?.valueLabel
+      const scope = p.scope !== undefined ? p.scope : before?.scope
       return {
         name: p.name,
         value: p.value,
@@ -405,19 +417,81 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
         ...(p.description !== undefined || before?.description !== undefined
           ? { description: p.description ?? before!.description }
           : {}),
+        ...(fields !== undefined && fields.length > 0 ? { fields } : {}),
+        ...(valueLabel !== undefined ? { valueLabel } : {}),
+        ...(scope !== undefined && scope !== null ? { scope } : {}),
       }
     })
+    const names = new Set<string>()
+    for (const p of next) {
+      if (names.has(p.name)) {
+        sendJson(res, 400, { error: 'bad_request', message: `参数名重复：${p.name}` })
+        return
+      }
+      names.add(p.name)
+    }
     store.updateRunbookParams(latest.runbook.id, next)
 
     const changes = next
-      .filter((p) => prev.get(p.name)?.value !== p.value)
-      .map((p) => ({ name: p.name, before: prev.get(p.name)?.value ?? null, after: p.value }))
+      .filter((p) => prev.get(p.name)?.value !== p.value || JSON.stringify(prev.get(p.name)?.fields ?? []) !== JSON.stringify(p.fields ?? []))
+      // secret 的值不进事件（事件会同步给团队）
+      .map((p) => ({ name: p.name, before: p.secret ? '***' : (prev.get(p.name)?.value ?? null), after: p.secret ? '***' : p.value }))
     if (changes.length > 0) {
       store.markTaskStarted(taskId, currentUserId())
       store.appendEvent({ taskId, actorId: currentUserId(), kind: 'edit', payload: { changes: [{ field: 'params', before: null, after: null }], paramChanges: changes } })
     }
     changed(taskId)
     sendJson(res, 200, { params: next })
+  })
+
+  /**
+   * 参数改名：参数表里改名，所有块里的 {{旧名}} / {{旧名.字段}} 一起换，
+   * 每处一条 edit 事件（整体一个事务）。
+   */
+  router.post('/tasks/:id/params/rename', (_req, res, ctx) => {
+    const taskId = ctx.params.id!
+    const latest = latestOf(taskId)
+    if (latest === null) {
+      sendJson(res, 404, { error: 'not_found' })
+      return
+    }
+    const parsed = z.object({ from: z.string().min(1), to: z.string().regex(PARAM_NAME_RE, '参数名用大写英文、数字、下划线，或带中文') }).safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
+      return
+    }
+    const { from, to } = parsed.data
+    if (!latest.runbook.params.some((p) => p.name === from)) {
+      sendJson(res, 404, { error: 'not_found', message: `没有参数 ${from}` })
+      return
+    }
+    if (latest.runbook.params.some((p) => p.name === to)) {
+      sendJson(res, 409, { error: 'exists', message: `已经有参数 ${to} 了` })
+      return
+    }
+    const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const ref = new RegExp(`\\{\\{${escaped}(\\.[\\p{L}_][\\p{L}\\p{N}_]*)?\\}\\}`, 'gu')
+    const touched = store.inTransaction(() => {
+      let n = 0
+      for (const s of latest.steps) {
+        const patch: { command?: string; bodyMd?: string } = {}
+        if (s.command !== null && ref.test(s.command)) patch.command = s.command.replace(ref, (_m, field: string | undefined) => `{{${to}${field ?? ''}}}`)
+        ref.lastIndex = 0
+        if (s.bodyMd !== null && ref.test(s.bodyMd)) patch.bodyMd = s.bodyMd.replace(ref, (_m, field: string | undefined) => `{{${to}${field ?? ''}}}`)
+        ref.lastIndex = 0
+        if (patch.command === undefined && patch.bodyMd === undefined) continue
+        const { changes } = store.updateStep(s.id, patch, { expectedRev: s.rev, actorId: currentUserId() })
+        if (changes.length > 0) {
+          store.appendEvent({ taskId, stepId: s.id, actorId: currentUserId(), kind: 'edit', payload: { changes, source: 'rename-param' } })
+          n++
+        }
+      }
+      store.updateRunbookParams(latest.runbook.id, latest.runbook.params.map((p) => (p.name === from ? { ...p, name: to } : p)))
+      store.appendEvent({ taskId, actorId: currentUserId(), kind: 'edit', payload: { changes: [{ field: 'params', before: null, after: null }], renamedParam: { from, to }, touchedSteps: n } })
+      return n
+    })
+    changed(taskId)
+    sendJson(res, 200, { touchedSteps: touched })
   })
 
   /** 提取建议：渲染后的命令里重复出现的字面值。 */
@@ -428,9 +502,10 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
       return
     }
     const rendered = latest.steps
+      .filter((s) => isTemplated(s))
       .map((s) => (s.command !== null ? renderCommand(s.command, latest.runbook.params).text : ''))
       .filter((t) => t !== '')
-    const known = new Set(latest.runbook.params.map((p) => p.value))
+    const known = new Set(latest.runbook.params.flatMap((p) => [p.value, ...(p.fields ?? []).map((f) => f.value)]))
     const suggestions = literalSuggestions(rendered).filter((s) => !known.has(s.value))
     sendJson(res, 200, { suggestions })
   })
@@ -486,7 +561,7 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
 
         let touched = 0
         for (const s of latest.steps) {
-          if (s.command === null || s.command === '') continue
+          if (s.command === null || s.command === '' || !isTemplated(s)) continue
           let next = s.command
           for (const item of parsed.data.items) {
             const name = finalName.get(item.value) ?? item.name
@@ -543,7 +618,8 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
       sendJson(res, 400, { error: 'bad_request', message: '没认出任何命令——这段里没有提示符' })
       return
     }
-    const matches = matchBlocks(blocks, latest.steps, latest.runbook.params)
+    // 只有"要做的"命令步骤能认领输出：代码、回显不算
+    const matches = matchBlocks(blocks, latest.steps.filter((s) => isRunnable(s)), latest.runbook.params)
 
     let matched = 0
     for (const m of matches) {
@@ -553,8 +629,9 @@ export function registerM7Routes(router: Router, deps: M7Deps): void {
       matched++
 
       const clean = redact(sanitizeText(block.output))
-      const capped = tailCap(clean.text, 64 * 1024)
-      store.addEvidence({ stepId: step.id, source: 'paste', text: capped.text, redacted: clean.hits.length > 0 })
+      const masked = redactSecrets(clean.text, latest.runbook.params)
+      const capped = tailCap(masked.text, 64 * 1024)
+      store.addEvidence({ stepId: step.id, source: 'paste', text: capped.text, redacted: clean.hits.length > 0 || masked.hits > 0 })
 
       // 与手动粘贴同一套判定；exitCode 预期跳过（粘贴里没有退出码）
       let verdict: Verdict | null = null

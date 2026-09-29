@@ -565,4 +565,34 @@ CREATE INDEX idx_delegations_team_task ON delegations(team_task_id);
 ALTER TABLE tasks ADD COLUMN parent_step_ref TEXT;
 `,
   },
+  {
+    version: 11,
+    name: 'manual-blocks-and-doc-lineage',
+    sql: `
+-- runbook 是可以执行的手册：块有章节（任意层）、文字、代码、回显。
+-- 原来"顶层的 note"就是章节，改成显式的 section；嵌套的 note 本来就是说明，
+-- 把标题当正文。
+UPDATE steps SET kind = 'section' WHERE kind = 'note' AND parent_id IS NULL;
+ALTER TABLE steps ADD COLUMN body_md TEXT;
+ALTER TABLE steps ADD COLUMN lang TEXT;
+-- 参考回显：跑完应该看到什么（随文档复制，版本之间可以对比）
+ALTER TABLE steps ADD COLUMN ref_md TEXT;
+-- 标题是按内容自动取的（导入/粘贴来的块）：界面不单独显示，内容改了跟着变
+ALTER TABLE steps ADD COLUMN title_auto INTEGER NOT NULL DEFAULT 0;
+-- 嵌套的说明：原来只有标题（和"为什么"），合起来当正文
+UPDATE steps SET body_md = title || CASE WHEN why_md IS NOT NULL AND why_md != '' THEN char(10) || char(10) || why_md ELSE '' END,
+                 title_auto = 1
+  WHERE kind = 'note';
+-- 文档血缘：同一任务的各版本、以它为底稿复制出来的 runbook 共用；挂在
+-- 整份文档上的问答锚在它上面
+ALTER TABLE runbooks ADD COLUMN lineage_key TEXT;
+-- 直接写表达式（不包子查询）：不相关的标量子查询 SQLite 只算一次，所有行会拿到同一个值
+UPDATE runbooks SET lineage_key = 'doc_' || lower(hex(randomblob(8))) WHERE lineage_key IS NULL;
+-- 同一任务的各版本共用第一个版本的血缘
+UPDATE runbooks SET lineage_key = (
+  SELECT r0.lineage_key FROM runbooks r0 WHERE r0.task_id = runbooks.task_id ORDER BY r0.version LIMIT 1
+);
+CREATE INDEX idx_runbooks_lineage ON runbooks(lineage_key);
+`,
+  },
 ]

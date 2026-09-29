@@ -1,6 +1,10 @@
 import {
+  canContain,
+  codeTitle,
   ids,
+  noteTitle,
   orderKeyBetween,
+  paramRefs,
   type Assumption,
   type Environment,
   type EnvironmentFacts,
@@ -181,6 +185,38 @@ export class Store {
     return row === undefined ? null : toTask(row)
   }
 
+  /**
+   * 改任务信息（标题、说明、发起人、预期）。建任务时只要一句"要做什么"，
+   * 其余边做边补。返回改了哪些字段（改前改后）；没变化时为空。
+   */
+  updateTask(
+    taskId: string,
+    patch: { title?: string; briefMd?: string; initiatorId?: string; expectedMinutes?: number | null; definitionOfDone?: string | null },
+  ): Array<{ field: string; before: unknown; after: unknown }> {
+    const run = this.db.transaction(() => {
+      const task = this.getTask(taskId)
+      if (task === null) throw new Error('任务不存在')
+      const changes: Array<{ field: string; before: unknown; after: unknown }> = []
+      const next = { ...task }
+      for (const key of ['title', 'briefMd', 'initiatorId', 'expectedMinutes', 'definitionOfDone'] as const) {
+        const after = patch[key]
+        if (after === undefined || after === task[key]) continue
+        changes.push({ field: key, before: task[key], after })
+        ;(next as Record<string, unknown>)[key] = after
+      }
+      if (changes.length === 0) return changes
+      this.db
+        .prepare(
+          `UPDATE tasks SET title = @title, brief_md = @briefMd, initiator_id = @initiatorId,
+             expected_minutes = @expectedMinutes, definition_of_done = @definitionOfDone, fts_cjk = @ftsCjk
+           WHERE id = @id`,
+        )
+        .run({ ...next, ftsCjk: cjkIndexText(next.title, next.briefMd) })
+      return changes
+    })
+    return run()
+  }
+
   listTasks(filter: { assigneeId?: string; initiatorId?: string; status?: TaskStatus } = {}): Task[] {
     const where: string[] = ['archived_at IS NULL']
     const params: Record<string, unknown> = {}
@@ -294,6 +330,8 @@ export class Store {
     /** 素材：这份 runbook 从哪份素材整理而来（保真对着它比）。 */
     materialId?: string | null
     origin?: Runbook['origin']
+    /** 文档血缘；不给时沿用这个任务第一个版本的，第一个版本新生成。 */
+    lineageKey?: string
     sourceSkillId?: string | null
     sourceSkillVersion?: number | null
     /** 这批步骤的来源；单个步骤可在 NewStep 里覆盖。默认 human。 */
@@ -304,6 +342,13 @@ export class Store {
         .prepare('SELECT MAX(version) v FROM runbooks WHERE task_id = ?')
         .get(input.taskId) as { v: number | null }
       const version = (prev.v ?? 0) + 1
+      // 文档血缘：同一任务的各版本共用；以底稿为基础复制时沿用底稿的
+      const lineage =
+        input.lineageKey ??
+        (this.db.prepare('SELECT lineage_key FROM runbooks WHERE task_id = ? ORDER BY version LIMIT 1').get(input.taskId) as
+          | { lineage_key: string | null }
+          | undefined)?.lineage_key ??
+        ids.docLineage()
 
       const runbook: Runbook = {
         id: ids.runbook(),
@@ -316,6 +361,7 @@ export class Store {
         baseRunbookId: input.baseRunbookId ?? null,
         materialId: input.materialId ?? null,
         origin: input.origin ?? null,
+        lineageKey: lineage,
         sourceSkillId: input.sourceSkillId ?? null,
         sourceSkillVersion: input.sourceSkillVersion ?? null,
       }
@@ -324,8 +370,8 @@ export class Store {
         .prepare(
           `INSERT INTO runbooks
            (id, task_id, version, created_by, created_at, assumptions_json, params_json,
-            base_runbook_id, material_id, origin, source_skill_id, source_skill_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            base_runbook_id, material_id, origin, source_skill_id, source_skill_version, lineage_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           runbook.id,
@@ -340,12 +386,13 @@ export class Store {
           runbook.origin,
           runbook.sourceSkillId,
           runbook.sourceSkillVersion,
+          runbook.lineageKey,
         )
 
-      // 步骤默认来源跟着 runbook 来源走：import→逐字来自素材，copy/adapt→
+      // 步骤默认来源跟着 runbook 来源走：import/doc→逐字来自素材，copy/adapt→
       // 来自底稿，draft→QB 写的，没说就是人写的
       const stepOrigin: StepOrigin =
-        input.origin === 'import'
+        input.origin === 'import' || input.origin === 'doc'
           ? 'import'
           : input.origin === 'copy' || input.origin === 'adapt'
             ? 'base'
@@ -381,30 +428,7 @@ export class Store {
     if (base === undefined) throw new Error('底稿不存在')
 
     const baseSteps = this.listSteps(baseRunbookId)
-    const childrenOf = new Map<string | null, Step[]>()
-    for (const s of baseSteps) {
-      const list = childrenOf.get(s.parentId) ?? []
-      list.push(s)
-      childrenOf.set(s.parentId, list)
-    }
-    const toNew = (s: Step): NewStep => ({
-      kind: s.kind,
-      title: s.title,
-      whyMd: s.whyMd,
-      whySource: s.whySource,
-      command: s.command,
-      envId: s.envId,
-      expectation: s.expectation,
-      probe: s.probe,
-      timeoutMs: s.timeoutMs,
-      expectedMinutes: s.expectedMinutes,
-      origin: 'base',
-      ...(s.lineageKey !== null ? { lineageKey: s.lineageKey } : {}),
-      ...(s.sourceRef !== null ? { sourceRef: s.sourceRef } : {}),
-      ...(childrenOf.get(s.id) !== undefined ? { children: (childrenOf.get(s.id) ?? []).map(toNew) } : {}),
-    })
-    const top = (childrenOf.get(null) ?? []).map(toNew)
-
+    const top = toNewSteps(baseSteps, { keepLineage: true, origin: 'base' })
     const params = toRunbook(base).params.map((p) => ({ ...p, source: 'base' as const }))
     return this.createRunbook({
       taskId,
@@ -412,8 +436,76 @@ export class Store {
       params,
       baseRunbookId,
       origin: 'copy',
+      // 文档血缘跟着底稿走：挂在整份文档上的问答，复制品上也看得见
+      ...(base.lineage_key !== null ? { lineageKey: base.lineage_key } : {}),
       steps: top,
     })
+  }
+
+  /**
+   * 从别的 runbook 挑一些块（连同子树）接到这份 runbook 的某个位置。
+   * 血缘保留（挂在那些步骤上的问答跟着来），状态和证据不带；用到的参数
+   * 这边没有的一并带过来。返回新插入的顶层块。
+   */
+  graftSteps(input: {
+    targetRunbookId: string
+    parentId: string | null
+    afterId: string | null
+    sourceRunbookId: string
+    stepIds: string[]
+    actorId: string
+  }): { inserted: Step[]; addedParams: string[] } {
+    const run = this.db.transaction(() => {
+      const source = this.listSteps(input.sourceRunbookId)
+      const picked = source.filter((s) => input.stepIds.includes(s.id))
+      if (picked.length === 0) throw new Error('没选中任何步骤')
+      // 选中的块连同子树；选中的祖先已经包含的子孙不再单列
+      const chosen = new Set(input.stepIds)
+      const roots = source.filter((s) => chosen.has(s.id) && !this.ancestorChosen(source, s, chosen))
+      const subtree = source.filter((s) => roots.some((r) => this.isInSubtree(source, s, r)))
+      const nodes = toNewSteps(subtree, { keepLineage: true, origin: 'base', roots: roots.map((r) => r.id) })
+
+      if (input.parentId !== null) this.assertStepInRunbook(input.parentId, input.targetRunbookId)
+      const inserted: Step[] = []
+      let after = input.afterId
+      for (const node of nodes) {
+        const orderKey = this.keyAfter(input.targetRunbookId, input.parentId, after, null)
+        const step = this.insertStepRow(input.targetRunbookId, input.parentId, orderKey, node, 'base')
+        if (node.children !== undefined && node.children.length > 0) {
+          this.insertStepTree(input.targetRunbookId, step.id, node.children, 'base')
+        }
+        inserted.push(step)
+        after = step.id
+      }
+
+      // 用到的参数：这边没有的带过来（同名的不覆盖——这边的值是这次的）
+      const target = this.getRunbook(input.targetRunbookId)!
+      const sourceRb = this.getRunbook(input.sourceRunbookId)!
+      const have = new Set(target.params.map((p) => p.name))
+      const used = new Set(subtree.flatMap((s) => paramRefs(`${s.command ?? ''}\n${s.bodyMd ?? ''}`)))
+      const added = sourceRb.params.filter((p) => used.has(p.name) && !have.has(p.name)).map((p) => ({ ...p, source: 'base' as const, scope: null }))
+      if (added.length > 0) this.updateRunbookParams(target.id, [...target.params, ...added])
+      return { inserted, addedParams: added.map((p) => p.name) }
+    })
+    return run()
+  }
+
+  private ancestorChosen(all: Step[], s: Step, chosen: Set<string>): boolean {
+    let parentId = s.parentId
+    while (parentId !== null) {
+      if (chosen.has(parentId)) return true
+      parentId = all.find((x) => x.id === parentId)?.parentId ?? null
+    }
+    return false
+  }
+
+  private isInSubtree(all: Step[], s: Step, root: Step): boolean {
+    let cur: Step | undefined = s
+    while (cur !== undefined) {
+      if (cur.id === root.id) return true
+      cur = cur.parentId === null ? undefined : all.find((x) => x.id === cur!.parentId)
+    }
+    return false
   }
 
   // ── 素材（M7）：贴进来的原文，保真/覆盖/出处都对着它 ────────
@@ -495,9 +587,10 @@ export class Store {
     runbookId: string,
     parentId: string | null,
     orderKey: string,
-    node: NewStep,
+    nodeIn: NewStep,
     origin: StepOrigin,
   ): Step {
+    const node = legacyShape(nodeIn)
     const step: Step = {
       id: ids.step(),
       runbookId,
@@ -505,9 +598,13 @@ export class Store {
       orderKey,
       kind: node.kind,
       title: node.title,
+      titleAuto: node.titleAuto ?? false,
       whyMd: node.whyMd ?? null,
       whySource: node.whySource ?? null,
       command: node.command ?? null,
+      bodyMd: node.bodyMd ?? null,
+      lang: node.lang ?? null,
+      refMd: node.refMd ?? null,
       envId: node.envId ?? null,
       expectation: node.expectation ?? null,
       probe: node.probe ?? null,
@@ -530,15 +627,16 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO steps
-         (id, runbook_id, parent_id, order_key, kind, title, why_md, why_source,
-          command, env_id, expectation_json, probe_json, timeout_ms, expected_minutes, status,
+         (id, runbook_id, parent_id, order_key, kind, title, title_auto, why_md, why_source,
+          command, body_md, lang, ref_md, env_id, expectation_json, probe_json, timeout_ms, expected_minutes, status,
           rev, lineage_key, origin, source_ref)
-         VALUES (@id, @runbookId, @parentId, @orderKey, @kind, @title, @whyMd, @whySource,
-                 @command, @envId, @expectationJson, @probeJson, @timeoutMs, @expectedMinutes, @status,
+         VALUES (@id, @runbookId, @parentId, @orderKey, @kind, @title, @titleAutoInt, @whyMd, @whySource,
+                 @command, @bodyMd, @lang, @refMd, @envId, @expectationJson, @probeJson, @timeoutMs, @expectedMinutes, @status,
                  @rev, @lineageKey, @origin, @sourceRef)`,
       )
       .run({
         ...step,
+        titleAutoInt: step.titleAuto ? 1 : 0,
         expectationJson: step.expectation === null ? null : JSON.stringify(step.expectation),
         probeJson: step.probe === null ? null : JSON.stringify(step.probe),
       })
@@ -677,17 +775,27 @@ export class Store {
         if (JSON.stringify(before) === JSON.stringify(after)) continue
         changes.push({ field, before, after })
       }
-      if (changes.length === 0) return { step: current, changes }
 
       const next: Step = { ...current }
       for (const c of changes) {
         ;(next as Record<string, unknown>)[c.field] = c.after
       }
+      // 自动标题：人改了标题就不再自动；内容改了（或改回自动）时跟着重算
+      if (patch.title !== undefined && patch.titleAuto === undefined && next.title !== current.title) next.titleAuto = false
+      if (next.titleAuto && patch.title === undefined) {
+        const auto = autoTitle(next)
+        if (auto !== next.title) {
+          changes.push({ field: 'title', before: next.title, after: auto })
+          next.title = auto
+        }
+      }
+      if (changes.length === 0) return { step: current, changes }
 
       this.db
         .prepare(
           `UPDATE steps SET
-             kind = @kind, title = @title, why_md = @whyMd, command = @command,
+             kind = @kind, title = @title, title_auto = @titleAutoInt, why_md = @whyMd, command = @command,
+             body_md = @bodyMd, lang = @lang, ref_md = @refMd,
              expectation_json = @expectationJson, probe_json = @probeJson,
              timeout_ms = @timeoutMs, expected_minutes = @expectedMinutes,
              share_output = @shareOutput,
@@ -698,8 +806,12 @@ export class Store {
           id: stepId,
           kind: next.kind,
           title: next.title,
+          titleAutoInt: next.titleAuto ? 1 : 0,
           whyMd: next.whyMd,
           command: next.command,
+          bodyMd: next.bodyMd,
+          lang: next.lang,
+          refMd: next.refMd,
           expectationJson: next.expectation === null ? null : JSON.stringify(next.expectation),
           probeJson: next.probe === null ? null : JSON.stringify(next.probe),
           timeoutMs: next.timeoutMs,
@@ -727,7 +839,12 @@ export class Store {
     origin?: StepOrigin
   }): Step {
     const run = this.db.transaction(() => {
-      if (input.parentId !== null) this.assertStepInRunbook(input.parentId, input.runbookId)
+      if (input.parentId !== null) {
+        this.assertStepInRunbook(input.parentId, input.runbookId)
+        if (!canContain(this.getStep(input.parentId)!, legacyShape(input.step))) {
+          throw new Error(input.step.kind === 'section' ? '章节不能放到步骤下面' : '这种块下面不能再放东西')
+        }
+      }
       const orderKey = this.keyAfter(input.runbookId, input.parentId, input.afterId, null)
       const step = this.insertStepRow(
         input.runbookId,
@@ -771,6 +888,10 @@ export class Store {
         // 不能移进自己的子树，否则整棵子树会从文档里消失
         if (this.isSelfOrDescendant(stepId, to.parentId)) {
           throw new Error('不能把步骤移到它自己的子步骤下面')
+        }
+        const parent = this.getStep(to.parentId)!
+        if (!canContain(parent, current)) {
+          throw new Error(current.kind === 'section' ? '章节不能放到步骤下面' : '这种块下面不能再放东西')
         }
       }
 
@@ -1024,6 +1145,25 @@ export class Store {
     return out
   }
 
+  /**
+   * 同一血缘的步骤在别的任务里跑出来的回显（新的在前）：对比"这次和上次、
+   * 和别人那次"哪里不一样。只取文本证据。
+   */
+  lineageOutputs(lineageKey: string, excludeStepId: string, limit = 10): Array<{ taskId: string; taskTitle: string; stepId: string; evidence: Evidence }> {
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, t.id AS t_id, t.title AS t_title FROM evidence e
+         JOIN steps s ON s.id = e.step_id
+         JOIN runbooks r ON r.id = s.runbook_id
+         JOIN tasks t ON t.id = r.task_id
+         WHERE s.lineage_key = ? AND s.id != ? AND e.text IS NOT NULL AND e.image_path IS NULL
+         ORDER BY e.created_at DESC
+         LIMIT ?`,
+      )
+      .all(lineageKey, excludeStepId, limit) as Array<EvidenceRow & { t_id: string; t_title: string }>
+    return rows.map((r) => ({ taskId: r.t_id, taskTitle: r.t_title, stepId: r.step_id, evidence: toEvidence(r) }))
+  }
+
   // ── 知识：环境 / skill / 坑 ──────────────────────────────────
 
   listEnvironments(): Environment[] {
@@ -1141,6 +1281,60 @@ export class Store {
     return out
   }
 
+  /** 挂在整份文档上的问答（文档血缘：同一任务的各版本、复制品共用）。 */
+  lessonsForDoc(lineageKey: string): Lesson[] {
+    const rows = this.db
+      .prepare("SELECT * FROM lessons WHERE anchor_kind = 'runbook_lineage' AND anchor_ref = ? ORDER BY created_at")
+      .all(lineageKey) as LessonRow[]
+    return rows.map(toLesson)
+  }
+
+  /**
+   * 改一条问答（问、答、条件、原因）。改了已共享的，重新排队上传——
+   * 别人那边看到的跟着变（团队侧按作者覆盖）。
+   */
+  updateLesson(id: string, patch: { symptom?: string; fixMd?: string; condition?: string | null; cause?: string | null }): Lesson {
+    const run = this.db.transaction(() => {
+      const l = this.lessonById(id)
+      if (l === null) throw new Error('问答不存在')
+      const next = {
+        ...l,
+        ...(patch.symptom !== undefined ? { symptom: patch.symptom } : {}),
+        ...(patch.fixMd !== undefined ? { fixMd: patch.fixMd } : {}),
+        ...(patch.condition !== undefined ? { condition: patch.condition } : {}),
+        ...(patch.cause !== undefined ? { cause: patch.cause } : {}),
+      }
+      if (next.symptom.trim() === '' && next.fixMd.trim() === '') throw new Error('问和答至少要有一个')
+      this.db
+        .prepare(
+          `UPDATE lessons SET symptom = @symptom, fix_md = @fixMd, condition = @condition, cause = @cause,
+             fts_cjk = @ftsCjk, uploaded = CASE WHEN scope = 'team' AND author_name IS NULL THEN 0 ELSE uploaded END
+           WHERE id = @id`,
+        )
+        .run({ ...next, ftsCjk: lessonCjk(next) })
+      return this.lessonById(id)!
+    })
+    return run()
+  }
+
+  /** 删一条问答。已经共享给团队的删不掉（别人手里已经有了），只能改。 */
+  deleteLesson(id: string): boolean {
+    const r = this.db.prepare("DELETE FROM lessons WHERE id = ? AND author_name IS NULL AND NOT (scope = 'team' AND uploaded = 1)").run(id)
+    if (r.changes > 0) this.db.prepare('UPDATE questions SET lesson_id = NULL WHERE lesson_id = ?').run(id)
+    return r.changes > 0
+  }
+
+  /** 同步下来的问答内容变了（作者补了答案、改了问法）：跟着改，本机的统计不动。 */
+  refreshRemoteLesson(id: string, content: { symptom: string; fixMd: string; condition: string | null; cause: string | null }): boolean {
+    const l = this.lessonById(id)
+    if (l === null || l.authorName === null) return false
+    if (l.symptom === content.symptom && l.fixMd === content.fixMd && l.condition === content.condition && l.cause === content.cause) return false
+    this.db
+      .prepare('UPDATE lessons SET symptom = @symptom, fix_md = @fixMd, condition = @condition, cause = @cause, fts_cjk = @ftsCjk WHERE id = @id')
+      .run({ ...l, ...content, ftsCjk: lessonCjk({ ...l, ...content }) })
+    return true
+  }
+
   /** 待上传团队服务的坑（scope=team 且没传过）。 */
   listLessonsToUpload(): Lesson[] {
     const rows = this.db
@@ -1171,6 +1365,8 @@ export class Store {
   upsertRemoteLesson(l: {
     id: string
     anchorRef: string
+    /** 挂在步骤/章节上（默认）还是整份文档上。 */
+    anchorKind?: 'step_lineage' | 'runbook_lineage'
     symptom: string
     cause?: string | null
     fixMd: string
@@ -1188,7 +1384,7 @@ export class Store {
     // id 必须沿用团队侧的：确认/驳回按 id 回流
     const lesson: Lesson = {
       id: l.id,
-      anchorKind: 'step_lineage',
+      anchorKind: l.anchorKind ?? 'step_lineage',
       anchorRef: l.anchorRef,
       condition: l.condition ?? null,
       symptom: l.symptom,
@@ -1491,20 +1687,20 @@ export class Store {
 
   // ── 求助（M8：问发起人走团队服务）─────────────────────────
 
-  createQuestion(input: { taskId: string; stepId?: string | null; askerId: string; bodyMd: string }): { id: string } {
+  createQuestion(input: { taskId: string; stepId?: string | null; askerId: string; bodyMd: string; lessonId?: string | null }): { id: string } {
     const id = ids.question()
     this.db
       .prepare(
-        `INSERT INTO questions (id, task_id, step_id, asker_id, body_md, created_at, pushed)
-         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+        `INSERT INTO questions (id, task_id, step_id, asker_id, body_md, created_at, pushed, lesson_id)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
       )
-      .run(id, input.taskId, input.stepId ?? null, input.askerId, input.bodyMd, Date.now())
+      .run(id, input.taskId, input.stepId ?? null, input.askerId, input.bodyMd, Date.now(), input.lessonId ?? null)
     return { id }
   }
 
-  getQuestion(id: string): { id: string; taskId: string; stepId: string | null; bodyMd: string; answerMd: string | null; answeredByName: string | null; answeredAt: number | null; pushed: boolean } | null {
+  getQuestion(id: string): { id: string; taskId: string; stepId: string | null; bodyMd: string; answerMd: string | null; answeredByName: string | null; answeredAt: number | null; pushed: boolean; lessonId: string | null } | null {
     const row = this.db.prepare('SELECT * FROM questions WHERE id = ?').get(id) as
-      | { id: string; task_id: string; step_id: string | null; body_md: string; answer_md: string | null; answered_at: number | null; pushed: number }
+      | { id: string; task_id: string; step_id: string | null; body_md: string; answer_md: string | null; answered_at: number | null; pushed: number; lesson_id: string | null }
       | undefined
     if (row === undefined) return null
     return {
@@ -1516,7 +1712,16 @@ export class Store {
       answeredByName: null, // 本地表不存名字；团队回流的回答记在事件 payload 里
       answeredAt: row.answered_at,
       pushed: row.pushed === 1,
+      lessonId: row.lesson_id,
     }
+  }
+
+  /** 这条问答有没有还没回答的求助（界面显示"问过发起人，等回答"）。 */
+  openQuestionForLesson(lessonId: string): { id: string; createdAt: number } | null {
+    const row = this.db
+      .prepare('SELECT id, created_at FROM questions WHERE lesson_id = ? AND answer_md IS NULL ORDER BY created_at DESC LIMIT 1')
+      .get(lessonId) as { id: string; created_at: number } | undefined
+    return row === undefined ? null : { id: row.id, createdAt: row.created_at }
   }
 
   /** 团队侧回答回流：写答案并标记已推。 */
@@ -1667,9 +1872,14 @@ export class Store {
 export interface NewStep {
   kind: StepKind
   title: string
+  /** 标题按内容自动取（导入、粘贴来的块）。 */
+  titleAuto?: boolean
   whyMd?: string | null
   whySource?: string | null
   command?: string | null
+  bodyMd?: string | null
+  lang?: string | null
+  refMd?: string | null
   envId?: string | null
   expectation?: Expectation | null
   probe?: ReadinessProbe | null
@@ -1681,6 +1891,64 @@ export interface NewStep {
   lineageKey?: string
   sourceRef?: string | null
   children?: NewStep[]
+}
+
+/**
+ * 老写法兼容（v11 之前的接口调用、种子脚本、别的引擎）：
+ * - 带子节点的 note 是章节（原先"顶层的 note 就是章节"）；note 现在是叶子
+ * - 只给了标题的 note 是说明：标题就是正文（按内容自动取标题）
+ * 界面新建的文字块带 titleAuto，不走这条。
+ */
+function legacyShape(node: NewStep): NewStep {
+  if (node.kind !== 'note') return node
+  if ((node.children?.length ?? 0) > 0) return { ...node, kind: 'section' }
+  if ((node.bodyMd === undefined || node.bodyMd === null) && node.titleAuto !== true) {
+    const body = [node.title, node.whyMd ?? ''].filter((x) => x.trim() !== '').join('\n\n')
+    return { ...node, bodyMd: body, titleAuto: true }
+  }
+  return node
+}
+
+/** 块的自动标题：文字取第一行，命令/代码/回显取第一条有内容的行。 */
+export function autoTitle(s: Pick<Step, 'kind' | 'bodyMd' | 'command' | 'title'>): string {
+  if (s.kind === 'note') return noteTitle(s.bodyMd ?? '')
+  if (s.command !== null && s.command.trim() !== '') return codeTitle(s.kind, s.command)
+  return s.title
+}
+
+/**
+ * 已有的步骤（先序列表）→ 可以再插一遍的树。复制底稿、挑步骤拼接都用它：
+ * 内容与血缘保留，状态、证据、编辑记录不带。roots 给了就只从这些节点开始。
+ */
+export function toNewSteps(steps: Step[], opts: { keepLineage: boolean; origin: StepOrigin; roots?: string[] }): NewStep[] {
+  const childrenOf = new Map<string | null, Step[]>()
+  for (const s of steps) {
+    const list = childrenOf.get(s.parentId) ?? []
+    list.push(s)
+    childrenOf.set(s.parentId, list)
+  }
+  const toNew = (s: Step): NewStep => ({
+    kind: s.kind,
+    title: s.title,
+    titleAuto: s.titleAuto,
+    whyMd: s.whyMd,
+    whySource: s.whySource,
+    command: s.command,
+    bodyMd: s.bodyMd,
+    lang: s.lang,
+    refMd: s.refMd,
+    envId: s.envId,
+    expectation: s.expectation,
+    probe: s.probe,
+    timeoutMs: s.timeoutMs,
+    expectedMinutes: s.expectedMinutes,
+    origin: opts.origin,
+    ...(opts.keepLineage && s.lineageKey !== null ? { lineageKey: s.lineageKey } : {}),
+    ...(s.sourceRef !== null ? { sourceRef: s.sourceRef } : {}),
+    ...(childrenOf.get(s.id) !== undefined ? { children: (childrenOf.get(s.id) ?? []).map(toNew) } : {}),
+  })
+  const top = opts.roots !== undefined ? steps.filter((s) => opts.roots!.includes(s.id)) : (childrenOf.get(null) ?? [])
+  return top.map(toNew)
 }
 
 interface ModelProfileRow {
@@ -1750,6 +2018,7 @@ interface RunbookRow {
   base_runbook_id: string | null
   material_id: string | null
   origin: string | null
+  lineage_key: string | null
   source_skill_id: string | null
   source_skill_version: number | null
 }
@@ -1761,9 +2030,13 @@ interface StepRow {
   order_key: string
   kind: string
   title: string
+  title_auto: number
   why_md: string | null
   why_source: string | null
   command: string | null
+  body_md: string | null
+  lang: string | null
+  ref_md: string | null
   env_id: string | null
   expectation_json: string | null
   probe_json: string | null
@@ -2000,6 +2273,7 @@ function toRunbook(r: RunbookRow): Runbook {
     baseRunbookId: r.base_runbook_id,
     materialId: r.material_id,
     origin: (r.origin as Runbook['origin']) ?? null,
+    lineageKey: r.lineage_key,
     sourceSkillId: r.source_skill_id,
     sourceSkillVersion: r.source_skill_version,
   }
@@ -2013,9 +2287,13 @@ function toStep(r: StepRow): Step {
     orderKey: r.order_key,
     kind: r.kind as StepKind,
     title: r.title,
+    titleAuto: r.title_auto === 1,
     whyMd: r.why_md,
     whySource: r.why_source,
     command: r.command,
+    bodyMd: r.body_md,
+    lang: r.lang,
+    refMd: r.ref_md,
     envId: r.env_id,
     expectation: r.expectation_json === null ? null : (JSON.parse(r.expectation_json) as Expectation),
     probe: r.probe_json === null ? null : (JSON.parse(r.probe_json) as ReadinessProbe),

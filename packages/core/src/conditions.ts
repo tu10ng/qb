@@ -3,17 +3,18 @@
  *
  * 捕获卡片里的条件是一句可读的话，形如：
  *   DECODE_HOST == gpu-18 AND 环境.GPU contains H800
+ * 参数名可以是中文，也可以带字段（机器195.用户 == root）。
  * 匹配是确定性的——参数表与环境事实代入，全项成立才成立，不叫模型。
  * 解析不了、或引用的名字拿不到值 → null（无法判定），界面按第二层折叠。
  * 自由文本条件（如导入时生成的「步骤「启动 decode」」）也走这条 null 路径。
  */
 
-import type { EnvironmentFacts, Param } from './schema.ts'
+import { FIELD_KEY_SRC, PARAM_NAME_SRC, type EnvironmentFacts, type Param } from './schema.ts'
 
 export type CondOp = '==' | '!=' | 'contains'
 
 export interface CondTerm {
-  /** 参数名（大写下划线）或环境事实名（GPU / OS / SHELL / ARCH / CUDA，小写比对）。 */
+  /** 参数名（原样，区分大小写，可带 .字段）或环境事实名（gpu / os / shell / arch / cuda，小写）。 */
   name: string
   op: CondOp
   value: string
@@ -25,8 +26,12 @@ export interface ParsedCondition {
 }
 
 // 一项：参数或环境事实 + 运算符 + 值。中文「包含」与 contains 等价，
-// 捕获卡片预填用中文，人手写用哪个都行。
-const TERM_RE = /^(环境\.([A-Za-z]+)|([A-Z][A-Z0-9_]*))\s*(==|!=|contains|包含)\s*(.+)$/
+// 捕获卡片预填用中文，人手写用哪个都行。== / != 两边空格可省；包含/contains
+// 要空格隔开（中文名里"包含"两个字也是字母，不隔开分不清）。
+const TERM_RE = new RegExp(
+  String.raw`^(环境\.([A-Za-z]+)|(${PARAM_NAME_SRC}(?:\.${FIELD_KEY_SRC})?))(?:\s*(==|!=)\s*|\s+(contains|包含)\s+)(.+)$`,
+  'u',
+)
 
 /** 解析条件；解析不了返回 null（显示层照常展示原文）。 */
 export function parseCondition(text: string | null | undefined): ParsedCondition | null {
@@ -35,12 +40,10 @@ export function parseCondition(text: string | null | undefined): ParsedCondition
   for (const raw of text.split(/\s+AND\s+/i)) {
     const m = TERM_RE.exec(raw.trim())
     if (m === null) return null
-    terms.push({
-      name: (m[2] ?? m[3]!).toLowerCase(),
-      op: m[4] === '包含' ? 'contains' : (m[4] as CondOp),
-      value: m[5]!.trim(),
-      isEnv: m[2] !== undefined,
-    })
+    const isEnv = m[2] !== undefined
+    const name = isEnv ? m[2]!.toLowerCase() : m[3]!
+    const op = m[4] ?? (m[5] === '包含' ? 'contains' : m[5])
+    terms.push({ name, op: op as CondOp, value: m[6]!.trim(), isEnv })
   }
   return terms.length > 0 ? { terms } : null
 }
@@ -59,9 +62,12 @@ export function matchCondition(cond: ParsedCondition | null, params: Param[], en
       if (fact === undefined) return null
       if (!cmp(fact, t)) return false
     } else {
-      const p = byName.get(t.name.toUpperCase())
-      if (p === undefined || p.value === '') return null
-      if (!cmp(p.value, t)) return false
+      const [name, field] = t.name.split('.') as [string, string | undefined]
+      const p = byName.get(name)
+      if (p === undefined) return null
+      const value = field === undefined ? p.value : field === p.valueLabel ? p.value : p.fields?.find((f) => f.key === field)?.value
+      if (value === undefined || value === '') return null
+      if (!cmp(value, t)) return false
     }
   }
   return true

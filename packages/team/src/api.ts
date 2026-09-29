@@ -102,6 +102,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
         startedAt: z.number().int().nullable(),
         endedAt: z.number().int().nullable(),
         runbookVersion: z.number().int().positive().nullable(),
+        // 文档血缘：挂在整份文档上的问答按它路由（手册）
+        docLineage: z.string().nullable().optional(),
         steps: z
           .array(
             z.object({
@@ -112,6 +114,10 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
               kind: z.string(),
               title: z.string(),
               command: z.string().nullable(),
+              // 手册内容：发起人远程也要能读（文字、代码语言、参考回显）
+              bodyMd: z.string().max(20_000).nullable().optional(),
+              lang: z.string().max(40).nullable().optional(),
+              refMd: z.string().max(10_000).nullable().optional(),
               status: z.string(),
               expectedMinutes: z.number().nullable(),
               actualMs: z.number().int().nullable(),
@@ -161,6 +167,8 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
       z.object({
         id: z.string(),
         lineageKey: z.string().nullable(),
+        /** step_lineage（默认）= 挂在某一步/某一章；runbook_lineage = 挂在整份文档上。 */
+        anchorKind: z.enum(['step_lineage', 'runbook_lineage']).default('step_lineage'),
         symptom: z.string(),
         cause: z.string().nullable(),
         fixMd: z.string(),
@@ -279,7 +287,7 @@ export function createApp(opts: ApiOptions): Hono<AppEnv> {
     const lesson = store.lessonById(c.req.param('id'))
     if (lesson === null) return c.json({ error: 'not_found' }, 404)
     if (!me.isAdmin) {
-      const related = store.lineageInitiators(lesson.lineageKey)
+      const related = store.lineageInitiators(lesson.lineageKey, lesson.anchorKind)
       if (!related.includes(me.name)) {
         return c.json({ error: 'forbidden', message: '只有发起人（或管理员）能确认坑' }, 403)
       }

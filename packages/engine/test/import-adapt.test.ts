@@ -12,7 +12,8 @@ describe('importMaterial', () => {
     const llm = new FakeLlm({
       params: [
         { name: 'DECODE_HOST', value: 'gpu-18', description: 'decode 机器' },
-        { name: '中文参数', value: 'x' },
+        { name: '容器名', value: 'x' },
+        { name: '2号卡', value: 'y' },
       ],
       steps: [
         { section: '1 检查', kind: 'command', title: '查驱动', command: 'nvidia-smi', source: 'nvidia-smi --query-gpu=driver_version' },
@@ -24,7 +25,10 @@ describe('importMaterial', () => {
 
     const r = await importMaterial(llm, PERSONA, PROMPT, { material: '一堆文档', environments: [] })
 
-    expect(r.params).toEqual([{ name: 'DECODE_HOST', value: 'gpu-18', description: 'decode 机器' }])
+    expect(r.params).toEqual([
+      { name: 'DECODE_HOST', value: 'gpu-18', description: 'decode 机器' },
+      { name: '容器名', value: 'x' },
+    ])
     expect(r.steps).toHaveLength(2) // 两章
     expect(r.steps[0]!.title).toBe('1 检查')
     expect(r.steps[0]!.children![0]!.title).toBe('查驱动')
@@ -152,11 +156,12 @@ describe('proposeAdapt', () => {
     expect(parsed.stepEdits[0]!.stepIndex).toBe(-1)
   })
 
-  it('paramChanges 的名字归一成大写下划线，中文/非法名丢弃', async () => {
+  it('paramChanges 的名字归一：英文转大写下划线，中文名照留，非法名丢弃', async () => {
     const llm = new FakeLlm({
       paramChanges: [
         { name: 'decode_host', to: 'gpu-22' },
-        { name: '中文', to: 'x' },
+        { name: '容器名', to: 'x' },
+        { name: '2号卡', to: 'y' },
       ],
       newParams: [],
       stepEdits: [],
@@ -169,7 +174,10 @@ describe('proposeAdapt', () => {
       steps: [],
       lessons: [],
     })
-    expect(r.paramChanges).toEqual([{ name: 'DECODE_HOST', to: 'gpu-22' }])
+    expect(r.paramChanges).toEqual([
+      { name: 'DECODE_HOST', to: 'gpu-22' },
+      { name: '容器名', to: 'x' },
+    ])
   })
 
   it('素材里写着 {{environment}} 或替换模式字符，不会被模板填充吃掉', async () => {

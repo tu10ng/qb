@@ -97,8 +97,9 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
   })
 
   const AcceptBody = z.object({
-    symptom: z.string().trim().min(1).max(4000).optional(),
-    fixMd: z.string().trim().min(1).max(8000).optional(),
+    // 问（症状）和答（修法）可以只给一个；都空才拒绝
+    symptom: z.string().trim().max(4000).optional(),
+    fixMd: z.string().trim().max(8000).optional(),
     condition: z.string().trim().max(500).nullable().optional(),
     cause: z.string().trim().max(2000).nullable().optional(),
     /** personal=只记给自己；team=脱敏后共享（默认）。 */
@@ -106,8 +107,8 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
   })
 
   const QuestionLessonBody = z.object({
-    symptom: z.string().trim().min(1).max(4000).optional(),
-    fixMd: z.string().trim().min(1).max(8000).optional(),
+    symptom: z.string().trim().max(4000).optional(),
+    fixMd: z.string().trim().max(8000).optional(),
     condition: z.string().trim().max(500).nullable().optional(),
     scope: z.enum(['personal', 'team']).default('team'),
   })
@@ -209,8 +210,8 @@ export function registerM9Routes(router: Router, deps: M9Deps): void {
           : '见任务时间线'
     const symptom = redact(body.symptom ?? defaultSymptom).text
     const fixMd = redact(body.fixMd ?? defaultFix).text
-    if (symptom === '' || fixMd === '') {
-      sendJson(res, 400, { error: 'bad_request', message: '症状和修法不能为空' })
+    if (symptom.trim() === '' && fixMd.trim() === '') {
+      sendJson(res, 400, { error: 'bad_request', message: '问和答至少写一个' })
       return
     }
 

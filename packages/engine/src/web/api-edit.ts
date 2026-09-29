@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import { Expectation, ReadinessProbe, StepKind, StepPatch, type StepStatus } from '@qb/core'
+import { Expectation, isContent, ReadinessProbe, StepKind, StepPatch, type StepStatus } from '@qb/core'
 import { RevConflict, type Store } from '@qb/store'
 import { detectDeviationOffer, onStepOk } from '../agent/capture.ts'
 import { errMessage, sendJson, type Router } from './router.ts'
@@ -26,8 +26,12 @@ const PatchBody = StepPatch.extend({ rev: z.number().int().nonnegative() })
 const NewStepBody = z.object({
   kind: StepKind,
   title: z.string().trim().min(1),
+  titleAuto: z.boolean().optional(),
   whyMd: z.string().nullable().optional(),
   command: z.string().nullable().optional(),
+  bodyMd: z.string().nullable().optional(),
+  lang: z.string().max(40).nullable().optional(),
+  refMd: z.string().nullable().optional(),
   expectation: Expectation.nullable().optional(),
   probe: ReadinessProbe.nullable().optional(),
   timeoutMs: z.number().int().positive().nullable().optional(),
@@ -38,6 +42,13 @@ const InsertBody = z.object({
   parentId: z.string().nullable(),
   afterId: z.string().nullable(),
   step: NewStepBody,
+})
+
+/** 一次插入多个（粘贴多行命令拆成 N 步、贴一段拆成文字+命令），整体一次撤销。 */
+const InsertManyBody = z.object({
+  parentId: z.string().nullable(),
+  afterId: z.string().nullable(),
+  steps: z.array(NewStepBody).min(1).max(200),
 })
 
 const MoveBody = z.object({
@@ -127,6 +138,40 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
       })
       changed(runbook.taskId, step.id)
       sendJson(res, 201, { step })
+    } catch (e) {
+      sendJson(res, 400, { error: 'insert_failed', message: errMessage(e) })
+    }
+  })
+
+  /** 连着插几个（依次排在后面）：要么全插进去，要么一个都不插。 */
+  router.post('/runbooks/:id/steps/batch', (_req, res, ctx) => {
+    const runbook = store.getRunbook(ctx.params.id!)
+    if (runbook === null) {
+      sendJson(res, 404, { error: 'not_found', message: 'runbook 不存在' })
+      return
+    }
+    const parsed = InsertManyBody.safeParse(ctx.body ?? {})
+    if (!parsed.success) {
+      sendJson(res, 400, { error: 'bad_request', message: parsed.error.issues.map((i) => i.message).join('；') })
+      return
+    }
+    try {
+      const steps = store.inTransaction(() => {
+        const out = []
+        let after = parsed.data.afterId
+        for (const s of parsed.data.steps) {
+          const step = store.insertStep({ runbookId: runbook.id, parentId: parsed.data.parentId, afterId: after, step: s, origin: 'human' })
+          out.push(step)
+          after = step.id
+        }
+        return out
+      })
+      store.markTaskStarted(runbook.taskId, currentUserId())
+      for (const step of steps) {
+        store.appendEvent({ taskId: runbook.taskId, stepId: step.id, actorId: currentUserId(), kind: 'insert', payload: { title: step.title, parentId: step.parentId } })
+      }
+      changed(runbook.taskId, steps[0]!.id)
+      sendJson(res, 201, { steps })
     } catch (e) {
       sendJson(res, 400, { error: 'insert_failed', message: errMessage(e) })
     }
@@ -226,6 +271,10 @@ export function registerEditRoutes(router: Router, deps: EditDeps): void {
     const taskId = store.taskIdOfStep(stepId)
     if (step === null || taskId === null) {
       sendJson(res, 404, { error: 'not_found', message: '步骤不存在或已删除' })
+      return
+    }
+    if (isContent(step)) {
+      sendJson(res, 400, { error: 'not_doable', message: '这是文档内容（章节/文字/代码/回显），没有完成/跳过/失败' })
       return
     }
     if (deps.isRunning(stepId)) {

@@ -43,6 +43,8 @@ export interface TaskMirror {
   startedAt: number | null
   endedAt: number | null
   runbookVersion: number | null
+  /** 文档血缘（挂在整份文档上的问答按它路由）。 */
+  docLineage?: string | null
   updatedAt: number
 }
 
@@ -54,6 +56,11 @@ export interface StepMirror {
   kind: string
   title: string
   command: string | null
+  /** 文字块的 markdown。 */
+  bodyMd?: string | null
+  lang?: string | null
+  /** 参考回显。 */
+  refMd?: string | null
   status: string
   expectedMinutes: number | null
   actualMs: number | null
@@ -125,6 +132,8 @@ export interface PushChannel {
 export interface LessonMirror {
   id: string
   lineageKey: string | null
+  /** 挂在哪：step_lineage（某一步/某一章）或 runbook_lineage（整份文档）。 */
+  anchorKind: 'step_lineage' | 'runbook_lineage'
   symptom: string
   cause: string | null
   fixMd: string
@@ -171,6 +180,7 @@ export interface SyncPush {
   lessons: Array<{
     id: string
     lineageKey: string | null
+    anchorKind?: 'step_lineage' | 'runbook_lineage'
     symptom: string
     cause: string | null
     fixMd: string
@@ -279,10 +289,10 @@ export class TeamStore {
         this.db
           .prepare(
             `INSERT INTO tasks (id, title, brief_md, initiator_name, assignee_name, status, parent_step_id,
-                                expected_minutes, started_at, ended_at, runbook_version, updated_at)
+                                expected_minutes, started_at, ended_at, runbook_version, doc_lineage, updated_at)
              VALUES (@id, @title, @briefMd, @initiatorName, @assigneeName, @status,
                      COALESCE(@parentStepId, (SELECT parent_step_id FROM dispatched_tasks WHERE id = @id)),
-                     @expectedMinutes, @startedAt, @endedAt, @runbookVersion, @updatedAt)
+                     @expectedMinutes, @startedAt, @endedAt, @runbookVersion, @docLineage, @updatedAt)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title, brief_md = excluded.brief_md,
                initiator_name = excluded.initiator_name, assignee_name = excluded.assignee_name,
@@ -290,20 +300,22 @@ export class TeamStore {
                parent_step_id = COALESCE(excluded.parent_step_id, tasks.parent_step_id),
                expected_minutes = excluded.expected_minutes,
                started_at = excluded.started_at, ended_at = excluded.ended_at,
-               runbook_version = excluded.runbook_version, updated_at = excluded.updated_at`,
+               runbook_version = excluded.runbook_version,
+               doc_lineage = COALESCE(excluded.doc_lineage, tasks.doc_lineage),
+               updated_at = excluded.updated_at`,
           )
-          .run({ ...t, parentStepId: t.parentStepId ?? null, updatedAt: Date.now() })
+          .run({ ...t, parentStepId: t.parentStepId ?? null, docLineage: t.docLineage ?? null, updatedAt: Date.now() })
 
         if (t.steps !== undefined) {
           const del = this.db.prepare('DELETE FROM steps WHERE task_id = ?')
           const ins = this.db.prepare(
-            `INSERT INTO steps (task_id, id, parent_id, order_key, kind, title, command, status,
+            `INSERT INTO steps (task_id, id, parent_id, order_key, kind, title, command, body_md, lang, ref_md, status,
                                 expected_minutes, actual_ms, status_note, lineage_key, last_output, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           del.run(t.id)
           for (const s of t.steps) {
-            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.status, s.expectedMinutes, s.actualMs, s.statusNote, s.lineageKey ?? null, s.lastOutput ?? null, Date.now())
+            ins.run(s.taskId, s.id, s.parentId, s.orderKey, s.kind, s.title, s.command, s.bodyMd ?? null, s.lang ?? null, s.refMd ?? null, s.status, s.expectedMinutes, s.actualMs, s.statusNote, s.lineageKey ?? null, s.lastOutput ?? null, Date.now())
           }
         }
       }
@@ -326,34 +338,48 @@ export class TeamStore {
         insQ.run(q.id, q.taskId, q.stepId, push.user.name, q.body, q.createdAt)
       }
 
-      // 坑（M9）：按 id 幂等；新到的排下行序号，并给用同血缘任务的发起人
-      // 挂 🟡"新坑待确认"。作者自己不会被提醒。
+      // 问答（M9）：按 id 幂等；新到的排下行序号，并给用同血缘任务的发起人
+      // 挂 🟡"新问答待确认"。作者自己不会被提醒。已有的是作者改了内容
+      // （补了答案、改了问法）：更新并重排序号，别人那边跟着变。
       for (const l of push.lessons) {
-        if (this.lessonById(l.id) !== null) continue
+        const anchorKind = l.anchorKind ?? 'step_lineage'
+        const existing = this.lessonById(l.id)
+        if (existing !== null) {
+          if (existing.authorName !== push.user.name) continue // 只有作者能改
+          if (existing.symptom === l.symptom && existing.fixMd === l.fixMd && existing.condition === l.condition && existing.cause === l.cause) continue
+          this.db
+            .prepare('UPDATE lessons SET symptom = ?, fix_md = ?, condition = ?, cause = ?, down_seq = ? WHERE id = ?')
+            .run(l.symptom, l.fixMd, l.condition, l.cause, this.nextDownSeq(), l.id)
+          continue
+        }
         this.db
           .prepare(
-            `INSERT INTO lessons (id, lineage_key, symptom, cause, fix_md, condition,
+            `INSERT INTO lessons (id, lineage_key, anchor_kind, symptom, cause, fix_md, condition,
                                   author_name, task_id, task_title, status, created_at, down_seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?)`,
           )
-          .run(l.id, l.lineageKey, l.symptom, l.cause, l.fixMd, l.condition,
+          .run(l.id, l.lineageKey, anchorKind, l.symptom, l.cause, l.fixMd, l.condition,
                push.user.name, l.taskId, l.taskTitle, l.createdAt, this.nextDownSeq())
         if (l.lineageKey !== null) {
           const rows = this.db
             .prepare(
-              `SELECT DISTINCT t.id, t.initiator_name FROM tasks t
-               JOIN steps s ON s.task_id = t.id
-               WHERE s.lineage_key = ? AND t.initiator_name != ? AND t.initiator_name != ''`,
+              anchorKind === 'runbook_lineage'
+                ? `SELECT DISTINCT t.id, t.initiator_name FROM tasks t
+                   WHERE t.doc_lineage = ? AND t.initiator_name != ? AND t.initiator_name != ''`
+                : `SELECT DISTINCT t.id, t.initiator_name FROM tasks t
+                   JOIN steps s ON s.task_id = t.id
+                   WHERE s.lineage_key = ? AND t.initiator_name != ? AND t.initiator_name != ''`,
             )
             .all(l.lineageKey, push.user.name) as Array<{ id: string; initiator_name: string }>
           const now = Date.now()
+          const what = (l.symptom !== '' ? l.symptom : l.fixMd).slice(0, 60)
           for (const r of rows) {
             this.db
               .prepare(
                 `INSERT OR REPLACE INTO alerts (key, task_id, level, type, message, count, status, created_at, updated_at)
                  VALUES (?, ?, 'yellow', 'lesson_pending', ?, 1, 'open', ?, ?)`,
               )
-              .run(`lesson:${l.id}:${r.id}`, r.id, `新坑待确认：${l.symptom.slice(0, 60)}（${push.user.displayName} 记的）`, now, now)
+              .run(`lesson:${l.id}:${r.id}`, r.id, `新问答待确认：${what}（${push.user.displayName} 记的）`, now, now)
           }
         }
       }
@@ -471,13 +497,17 @@ export class TeamStore {
       .prepare(
         `SELECT l.* FROM lessons l
          WHERE l.lineage_key IS NOT NULL AND l.author_name != ?
-           AND l.lineage_key IN (
-             SELECT DISTINCT s.lineage_key FROM steps s
-             JOIN tasks t ON t.id = s.task_id
-             WHERE t.assignee_name = ? AND s.lineage_key IS NOT NULL)
+           AND (
+             (l.anchor_kind = 'step_lineage' AND l.lineage_key IN (
+               SELECT DISTINCT s.lineage_key FROM steps s
+               JOIN tasks t ON t.id = s.task_id
+               WHERE t.assignee_name = ? AND s.lineage_key IS NOT NULL))
+             OR (l.anchor_kind = 'runbook_lineage' AND l.lineage_key IN (
+               SELECT DISTINCT t.doc_lineage FROM tasks t
+               WHERE t.assignee_name = ? AND t.doc_lineage IS NOT NULL)))
          ORDER BY l.down_seq DESC LIMIT 500`,
       )
-      .all(userName, userName) as Array<Record<string, unknown>>
+      .all(userName, userName, userName) as Array<Record<string, unknown>>
     for (const l of lessons.reverse()) down.push({ kind: 'lesson', payload: toLessonMirror(l) })
 
     // 底稿提议：我手里有同血缘步骤、提议还没被人处理掉。与坑同理由：
@@ -557,7 +587,7 @@ export class TeamStore {
     if (recipient === undefined || recipient === '') return
 
     const counts = this.db
-      .prepare("SELECT count(*) total, sum(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) done FROM steps WHERE task_id = ? AND kind != 'note'")
+      .prepare("SELECT count(*) total, sum(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) done FROM steps WHERE task_id = ? AND kind NOT IN ('section','note','code','output')")
       .get(taskId) as { total: number; done: number | null }
     const worst = (this.db
       .prepare("SELECT level FROM alerts WHERE task_id = ? AND status = 'open' ORDER BY CASE level WHEN 'red' THEN 0 ELSE 1 END LIMIT 1")
@@ -634,12 +664,14 @@ export class TeamStore {
   }
 
   /** 用着这个血缘的任务的发起人（确认坑的权限判定：发起人=底稿负责人/PL）。 */
-  lineageInitiators(lineageKey: string | null): string[] {
+  lineageInitiators(lineageKey: string | null, anchorKind: 'step_lineage' | 'runbook_lineage' = 'step_lineage'): string[] {
     if (lineageKey === null) return []
     return (
       this.db
         .prepare(
-          `SELECT DISTINCT t.initiator_name FROM tasks t JOIN steps s ON s.task_id = t.id WHERE s.lineage_key = ?`,
+          anchorKind === 'runbook_lineage'
+            ? `SELECT DISTINCT t.initiator_name FROM tasks t WHERE t.doc_lineage = ?`
+            : `SELECT DISTINCT t.initiator_name FROM tasks t JOIN steps s ON s.task_id = t.id WHERE s.lineage_key = ?`,
         )
         .all(lineageKey) as Array<{ initiator_name: string }>
     ).map((r) => r.initiator_name)
@@ -791,7 +823,7 @@ export class TeamStore {
     return rows.map((r) => {
       const id = r.id as string
       const counts = this.db
-        .prepare("SELECT count(*) total, sum(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) done FROM steps WHERE task_id = ? AND kind != 'note'")
+        .prepare("SELECT count(*) total, sum(CASE WHEN status IN ('ok','skipped') THEN 1 ELSE 0 END) done FROM steps WHERE task_id = ? AND kind NOT IN ('section','note','code','output')")
         .get(id) as { total: number; done: number | null }
       const alert = this.db
         .prepare("SELECT level FROM alerts WHERE task_id = ? AND status = 'open' ORDER BY CASE level WHEN 'red' THEN 0 ELSE 1 END LIMIT 1")
@@ -929,6 +961,7 @@ function toTask(r: Record<string, unknown>): TaskMirror {
     startedAt: (r.started_at as number | null) ?? null,
     endedAt: (r.ended_at as number | null) ?? null,
     runbookVersion: (r.runbook_version as number | null) ?? null,
+    docLineage: (r.doc_lineage as string | null) ?? null,
     updatedAt: r.updated_at as number,
   }
 }
@@ -942,6 +975,9 @@ function toStep(r: Record<string, unknown>): StepMirror {
     kind: r.kind as string,
     title: r.title as string,
     command: (r.command as string | null) ?? null,
+    bodyMd: (r.body_md as string | null) ?? null,
+    lang: (r.lang as string | null) ?? null,
+    refMd: (r.ref_md as string | null) ?? null,
     status: r.status as string,
     expectedMinutes: (r.expected_minutes as number | null) ?? null,
     actualMs: (r.actual_ms as number | null) ?? null,
@@ -955,6 +991,7 @@ function toLessonMirror(r: Record<string, unknown>): LessonMirror {
   return {
     id: r.id as string,
     lineageKey: (r.lineage_key as string | null) ?? null,
+    anchorKind: r.anchor_kind === 'runbook_lineage' ? 'runbook_lineage' : 'step_lineage',
     symptom: r.symptom as string,
     cause: (r.cause as string | null) ?? null,
     fixMd: r.fix_md as string,

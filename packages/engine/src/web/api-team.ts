@@ -12,7 +12,7 @@
  */
 
 import { z } from 'zod'
-import { redact } from '@qb/core'
+import { redact, redactSecrets } from '@qb/core'
 import type { Store } from '@qb/store'
 import type { TeamConfig, TeamSettings } from '../sync/sync.ts'
 import type { Sync } from '../sync/sync.ts'
@@ -37,6 +37,8 @@ const TeamBody = z.object({
 const AskBody = z.object({
   stepId: z.string().nullable().optional(),
   body: z.string().trim().min(1, '求助内容是空的').max(8000),
+  /** 问的是某条还没答案的问答：回答回来就填进它的"答"。 */
+  lessonId: z.string().nullable().optional(),
 })
 
 const DelegateBody = z.object({
@@ -160,20 +162,23 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
     }
 
     try {
-      const clean = redact(parsed.data.body).text
+      const clean = redactSecrets(redact(parsed.data.body).text, store.getLatestRunbook(taskId)?.runbook.params ?? []).text
+      const lessonId = parsed.data.lessonId != null && store.lessonById(parsed.data.lessonId) !== null ? parsed.data.lessonId : null
       const { id } = store.createQuestion({
         taskId,
         stepId: parsed.data.stepId ?? null,
         askerId: currentUserId(),
         bodyMd: clean,
+        lessonId,
       })
       store.appendEvent({
         taskId,
         stepId: parsed.data.stepId ?? null,
         actorId: currentUserId(),
         kind: 'question_asked',
-        payload: { questionId: id, body: clean.slice(0, 200) },
+        payload: { questionId: id, body: clean.slice(0, 200), ...(lessonId !== null ? { lessonId } : {}) },
       })
+      ws.broadcast({ type: 'runbook.changed', taskId, stepId: parsed.data.stepId ?? null })
       sync.pushNow()
       sendJson(res, 202, { sent: true, questionId: id })
     } catch (e) {
@@ -340,8 +345,10 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       return
     }
     const body = (ctx.body ?? {}) as { symptom?: string; fix?: string; condition?: string; scope?: string }
-    if (typeof body.symptom !== 'string' || body.symptom.trim() === '' || typeof body.fix !== 'string' || body.fix.trim() === '') {
-      sendJson(res, 400, { error: 'bad_request', message: 'symptom 和 fix 不能为空' })
+    const symptomIn = typeof body.symptom === 'string' ? body.symptom.trim() : ''
+    const fixIn = typeof body.fix === 'string' ? body.fix.trim() : ''
+    if (symptomIn === '' && fixIn === '') {
+      sendJson(res, 400, { error: 'bad_request', message: '问和答至少写一个' })
       return
     }
     const canShare = step.lineageKey !== null
@@ -352,8 +359,8 @@ export function registerTeamRoutes(router: Router, deps: TeamDeps): void {
       anchorKind: canShare ? 'step_lineage' : 'free',
       anchorRef: step.lineageKey,
       condition: typeof body.condition === 'string' && body.condition !== '' ? redact(body.condition).text : null,
-      symptom: redact(body.symptom).text,
-      fixMd: redact(body.fix).text,
+      symptom: redact(symptomIn).text,
+      fixMd: redact(fixIn).text,
       authorId: currentUserId(),
       sourceTaskId: taskId,
       scope,

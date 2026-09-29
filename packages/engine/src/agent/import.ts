@@ -6,21 +6,20 @@
  */
 
 import { z } from 'zod'
-import type { Environment } from '@qb/core'
+import { normalizeParamName, type Environment } from '@qb/core'
 import { KINDS, toTree, type FlatStep, type StepOut } from './draft.ts'
 import { fillTemplate } from './prompt.ts'
 import type { Llm } from '../llm/port.ts'
 
 const ParamOut = z.object({
-  name: z.string().describe('大写下划线，如 PREFILL_IP').catch(''),
+  name: z.string().describe('大写下划线，如 PREFILL_IP；也可以用中文，如 容器名').catch(''),
   value: z.string().describe('原文里的取值').catch(''),
   description: z.string().optional().describe('一句话说明').catch(undefined),
 })
 
-/** 归一参数名；归一后仍不合法（原名是中文之类）返回 null。 */
+/** 归一参数名；归一后仍不合法（数字开头、只剩符号）返回 null。 */
 function normalizeName(raw: string): string | null {
-  const name = raw.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_')
-  return /^[A-Z][A-Z0-9_]*$/.test(name) ? name : null
+  return normalizeParamName(raw)
 }
 
 const ImportStep = z.object({

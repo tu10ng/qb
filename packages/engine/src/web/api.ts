@@ -13,13 +13,14 @@ import { registerSettingsRoutes } from './api-settings.ts'
 import { fidelityFor, registerM7Routes } from './api-m7.ts'
 import { registerM9Routes } from './api-m9.ts'
 import { registerTeamRoutes } from './api-team.ts'
+import { registerManualRoutes } from './api-manual.ts'
 import { AttachmentError, type Attachments } from './attachments.ts'
 import type { LocalGuard } from './local-guard.ts'
 import type { createWsHandler } from './ws.ts'
 import type { HostPort } from '../dsh/port.ts'
 import type { Store } from '@qb/store'
 import type { Param, Step, StepStatus, Verdict } from '@qb/core'
-import { assessDanger, checkExpectation, redact, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind, TaskStatus } from '@qb/core'
+import { assessDanger, checkExpectation, isContent, isRunnable, pickLines, redact, redactSecrets, renderCommand, sanitizeText, tailCap, Expectation, ReadinessProbe, StepKind, TaskStatus } from '@qb/core'
 
 /** 落库的证据文本上限。报错在尾部，截前面；整份详情接口扛不住几十 MB 的日志。 */
 const EVIDENCE_MAX_CHARS = 64 * 1024
@@ -54,9 +55,13 @@ const TaskStatusBody = z.object({
 interface StepInputT {
   kind: StepKind
   title: string
+  titleAuto?: boolean
   whyMd?: string | null
   whySource?: string | null
   command?: string | null
+  bodyMd?: string | null
+  lang?: string | null
+  refMd?: string | null
   envId?: string | null
   expectation?: z.infer<typeof Expectation> | null
   probe?: z.infer<typeof ReadinessProbe> | null
@@ -72,9 +77,13 @@ interface StepInputT {
 const StepInput: z.ZodType<StepInputT> = z.object({
   kind: StepKind,
   title: z.string().min(1),
+  titleAuto: z.boolean().optional(),
   whyMd: z.string().nullable().optional(),
   whySource: z.string().nullable().optional(),
   command: z.string().nullable().optional(),
+  bodyMd: z.string().nullable().optional(),
+  lang: z.string().max(40).nullable().optional(),
+  refMd: z.string().nullable().optional(),
   envId: z.string().nullable().optional(),
   expectation: Expectation.nullable().optional(),
   probe: ReadinessProbe.nullable().optional(),
@@ -235,8 +244,11 @@ export function buildApi(deps: ApiDeps): Router {
     }
 
     const latest = store.getLatestRunbook(taskId)
+    const initiator = store.getUser(task.initiatorId)
     sendJson(res, 200, {
       task,
+      // 谁派的活（任务页上显示、可以改）
+      initiator: initiator === null ? null : { name: initiator.name, displayName: initiator.displayName },
       runbook: latest?.runbook ?? null,
       steps: latest?.steps ?? [],
       events: store.listEvents(taskId),
@@ -410,15 +422,18 @@ export function buildApi(deps: ApiDeps): Router {
    */
   router.post('/steps/:id/run', (_req, res, ctx) => {
     const stepId = ctx.params.id!
-    const body = (ctx.body ?? {}) as { confirmed?: boolean; cwd?: string; env?: Record<string, string> }
+    const body = (ctx.body ?? {}) as { confirmed?: boolean; cwd?: string; env?: Record<string, string>; lines?: { from?: unknown; to?: unknown } }
 
     const step = store.getStep(stepId)
     if (step === null) {
       sendJson(res, 404, { error: 'not_found', message: '步骤不存在' })
       return
     }
-    if (step.command === null || step.command.trim() === '') {
-      sendJson(res, 400, { error: 'no_command', message: '这一步没有命令，不能运行' })
+    if (!isRunnable(step)) {
+      sendJson(res, 400, {
+        error: 'no_command',
+        message: step.kind === 'code' || step.kind === 'output' || step.kind === 'note' || step.kind === 'section' ? '这是文档内容（代码/回显/文字），只复制，不运行' : '这一步没有命令，不能运行',
+      })
       return
     }
     if (running.has(stepId)) {
@@ -428,11 +443,19 @@ export function buildApi(deps: ApiDeps): Router {
 
     const taskId = store.taskIdOfStep(stepId)
 
+    // 只跑选中的几行（长命令里挑一段）：一次性的，不改步骤、不判预期、不动状态
+    const lines =
+      body.lines !== undefined && Number.isInteger(body.lines.from) && Number.isInteger(body.lines.to)
+        ? { from: body.lines.from as number, to: body.lines.to as number }
+        : null
+    const template = lines !== null ? pickLines(step.command!, lines.from, lines.to) : step.command!
+
     // 命令是模板：先按当前参数表渲染。缺值的参数宁可拒绝运行，
     // 也不能把 {{DECODE_HOST}} 原样发给 shell——写错了名字的（未声明）
     // 同样要拦。
     const runbook = taskId === null ? null : store.getLatestRunbook(taskId)
-    const rendered = renderCommand(step.command, runbook?.runbook.params ?? [])
+    const params = runbook?.runbook.params ?? []
+    const rendered = renderCommand(template, params)
     const blocked = [...rendered.missing, ...rendered.undeclared]
     if (blocked.length > 0) {
       sendJson(res, 400, {
@@ -442,9 +465,13 @@ export function buildApi(deps: ApiDeps): Router {
       })
       return
     }
+    if (rendered.text.trim() === '') {
+      sendJson(res, 400, { error: 'no_command', message: '选中的几行是空的' })
+      return
+    }
 
     // wait 步骤带就绪条件：起命令并盯着，就绪即通过（见 runner/wait-step.ts）
-    if (step.kind === 'wait' && step.probe !== null) {
+    if (step.kind === 'wait' && step.probe !== null && lines === null) {
       const danger = assessDanger(rendered.text)
       if (danger.level === 'destructive' && body.confirmed !== true) {
         sendJson(res, 409, { error: 'needs_confirmation', message: `命令需要确认：${danger.matched.join('、')}`, matched: danger.matched, command: rendered.text })
@@ -464,7 +491,8 @@ export function buildApi(deps: ApiDeps): Router {
       handle = runStep(host, {
         stepId,
         command: rendered.text,
-        expectation: step.expectation as Expectation | null,
+        // 只跑几行时不判预期：预期说的是整条命令跑完的样子
+        expectation: lines !== null ? null : (step.expectation as Expectation | null),
         timeoutMs: step.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
         ...(body.env !== undefined ? { env: body.env } : {}),
@@ -488,23 +516,40 @@ export function buildApi(deps: ApiDeps): Router {
     const startedAt = Date.now()
     running.set(stepId, handle)
     activity.set(stepId, startedAt)
-    store.updateStepStatus(stepId, 'running', { startedAt })
+    // 只跑几行：这一步还没做完，状态不动（只是流式看输出）
+    if (lines === null) store.updateStepStatus(stepId, 'running', { startedAt })
     if (taskId !== null) {
       store.markTaskStarted(taskId, currentUserId())
       store.resumeIfBlocked(taskId, currentUserId())
-      store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'step_run', payload: {} })
+      store.appendEvent({ taskId, stepId, actorId: currentUserId(), kind: 'step_run', payload: lines !== null ? { lines } : {} })
     }
     ws.broadcast({ type: 'step.status', stepId, status: 'running' })
 
     handle.onChunk((chunk) => {
       activity.set(stepId, Date.now())
-      ws.broadcast({ type: 'step.output', stepId, text: chunk.text, lossy: chunk.lossy })
+      ws.broadcast({ type: 'step.output', stepId, text: redactSecrets(chunk.text, params).text, lossy: chunk.lossy })
     })
 
     void handle.outcome
       .then((outcome) => {
         running.delete(stepId)
         activity.delete(stepId)
+
+        // 输出落库（脱敏 + 截尾后的版本）。不存的话刷新页面就看不到了，
+        // 而复盘恰恰需要"当时到底输出了什么"。secret 参数的值一并打码。
+        const joined = redactSecrets(joinOutput(outcome.redactedStdout, outcome.redactedStderr), params)
+        const capped = tailCap(joined.text, EVIDENCE_MAX_CHARS)
+        const secretHits = joined.hits > 0 ? ['secret 参数'] : []
+
+        if (lines !== null) {
+          // 只跑了几行：输出留作证据，不判定、不改状态
+          store.addEvidence({ stepId, source: 'auto', text: `（只运行了第 ${lines.from}–${lines.to} 行）\n${capped.text}`, exitCode: outcome.result.exitCode, timedOut: outcome.result.timedOut, durationMs: outcome.result.durationMs, redacted: outcome.redactionHits.length + secretHits.length > 0 })
+          const current = store.getStep(stepId)
+          ws.broadcast({ type: 'step.status', stepId, status: current?.status ?? 'pending' })
+          ws.broadcast({ type: 'step.done', stepId, verdict: 'unclear', reason: `只运行了第 ${lines.from}–${lines.to} 行 · 退出码 ${outcome.result.exitCode ?? '无'}`, exitCode: outcome.result.exitCode, timedOut: outcome.result.timedOut, durationMs: outcome.result.durationMs, danger: outcome.danger, redactionHits: [...outcome.redactionHits, ...secretHits], partial: true })
+          if (taskId !== null) ws.broadcast({ type: 'runbook.changed', taskId, stepId })
+          return
+        }
 
         const status: StepStatus = outcome.verdict === 'pass' ? 'ok' : outcome.verdict === 'fail' ? 'failed' : 'running'
         const endedAt = Date.now()
@@ -514,9 +559,6 @@ export function buildApi(deps: ApiDeps): Router {
           store.updateStepStatus(stepId, status, { endedAt, actualMs: outcome.result.durationMs })
         }
 
-        // 输出落库（脱敏 + 截尾后的版本）。不存的话刷新页面就看不到了，
-        // 而复盘恰恰需要"当时到底输出了什么"。
-        const capped = tailCap(joinOutput(outcome.redactedStdout, outcome.redactedStderr), EVIDENCE_MAX_CHARS)
         store.addEvidence({
           stepId,
           source: 'auto',
@@ -524,7 +566,7 @@ export function buildApi(deps: ApiDeps): Router {
           exitCode: outcome.result.exitCode,
           timedOut: outcome.result.timedOut,
           durationMs: outcome.result.durationMs,
-          redacted: outcome.redactionHits.length > 0,
+          redacted: outcome.redactionHits.length + secretHits.length > 0,
         })
 
         if (taskId !== null) {
@@ -553,13 +595,13 @@ export function buildApi(deps: ApiDeps): Router {
           timedOut: outcome.result.timedOut,
           durationMs: outcome.result.durationMs,
           danger: outcome.danger,
-          redactionHits: outcome.redactionHits,
+          redactionHits: [...outcome.redactionHits, ...secretHits],
         })
       })
       .catch((e: unknown) => {
         running.delete(stepId)
         activity.delete(stepId)
-        store.updateStepStatus(stepId, 'failed', { endedAt: Date.now() })
+        if (lines === null) store.updateStepStatus(stepId, 'failed', { endedAt: Date.now() })
         ws.broadcast({ type: 'step.error', stepId, message: errMessage(e) })
       })
 
@@ -692,6 +734,10 @@ export function buildApi(deps: ApiDeps): Router {
       sendJson(res, 400, { error: 'bad_request', message: '没有内容' })
       return
     }
+    if (isContent(step)) {
+      sendJson(res, 400, { error: 'not_doable', message: '这是文档内容（章节/文字/代码/回显），没有"完成"，也不收输出' })
+      return
+    }
 
     // 先存图：格式或大小不对要在写任何东西之前就拒绝
     let imageName: string | null = null
@@ -707,15 +753,18 @@ export function buildApi(deps: ApiDeps): Router {
     const taskId = store.taskIdOfStep(stepId)
     let verdict: Verdict | null = null
     let reason = ''
+    // 贴回来的输出里可能带着 secret 参数的值（比如 echo 了密码）：落库前打码
+    const secretParams = taskId === null ? [] : (store.getLatestRunbook(taskId)?.runbook.params ?? [])
 
     if (hasText) {
       const clean = redact(sanitizeText(body.text!))
-      const capped = tailCap(clean.text, EVIDENCE_MAX_CHARS)
+      const masked = redactSecrets(clean.text, secretParams)
+      const capped = tailCap(masked.text, EVIDENCE_MAX_CHARS)
       store.addEvidence({
         stepId,
         source: 'paste',
         text: capped.text,
-        redacted: clean.hits.length > 0,
+        redacted: clean.hits.length > 0 || masked.hits > 0,
       })
 
       // 用户贴回来的输出同样要判定——他自己跑的和 QB 跑的一视同仁。
@@ -953,6 +1002,7 @@ export function buildApi(deps: ApiDeps): Router {
   registerM7Routes(router, { store, ws, jobs, llm, currentUserId, prompts })
   registerM9Routes(router, { store, ws, currentUserId, team: deps.team.settings, sync: deps.team.sync })
   registerTeamRoutes(router, { store, team: deps.team.settings, sync: deps.team.sync, ws, currentUserId, userName: () => deps.userName() })
+  registerManualRoutes(router, { store, ws, attachments, currentUserId, team: deps.team.settings, sync: deps.team.sync, mount })
 
   return router
 }

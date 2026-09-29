@@ -15,8 +15,13 @@
  * 决策集变了就把任务标脏推上去。
  */
 
-import { evaluateAlerts, redact, tailCap, type AlertDecision, type AlertThresholds, type Task } from '@qb/core'
+import { evaluateAlerts, redact, redactSecrets, tailCap, type AlertDecision, type AlertThresholds, type Task } from '@qb/core'
 import type { Store } from '@qb/store'
+
+/** 截头（正文、参考回显太长时只带开头）。 */
+function headCap(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max)}\n…（后面还有 ${text.length - max} 个字符）`
+}
 
 export interface TeamIdentity {
   name: string
@@ -254,14 +259,17 @@ export function createSync(deps: SyncDeps) {
     )
     for (const t of dirtyTasks) noteRaised(t, decisions.get(t.id) ?? [])
 
-    // 快照：脏任务的当前全量（任务 + 步骤树）。命令过脱敏——手写命令
-    // 里可能嵌着 token，模板参数值本来就不在内。
+    // 快照：脏任务的当前全量（任务 + 步骤树）。命令、正文过脱敏——手写
+    // 命令里可能嵌着 token；secret 参数的值一律打码（模板里只有 {{名字}}，
+    // 但正文、参考回显里可能直接写着）。
     const tasks = dirtyTasks.map((task) => {
       const latest = store.getLatestRunbook(task.id)
+      const params = latest?.runbook.params ?? []
+      const scrub = (t: string): string => redactSecrets(redact(t).text, params).text
       return {
         id: task.id,
         title: task.title,
-        briefMd: redact(task.briefMd).text,
+        briefMd: scrub(task.briefMd),
         initiatorName: nameOf(task.initiatorId, cfg),
         assigneeName: nameOf(task.assigneeId, cfg),
         status: task.status,
@@ -272,13 +280,15 @@ export function createSync(deps: SyncDeps) {
         startedAt: task.startedAt,
         endedAt: task.endedAt,
         runbookVersion: latest?.runbook.version ?? null,
+        // 文档血缘：挂在整份文档上的问答按它路由给发起人确认
+        docLineage: latest?.runbook.lineageKey ?? null,
         steps: (latest?.steps ?? []).map((s) => {
           // share_output 开启时带上最新输出（脱敏 + 4KB 截尾）
           let lastOutput: string | null = null
           if (s.shareOutput === true) {
             const evs = store.listEvidence(s.id)
             const last = [...evs].reverse().find((e) => e.text !== null)
-            if (last?.text != null) lastOutput = tailCap(redact(last.text).text, 4096).text
+            if (last?.text != null) lastOutput = tailCap(scrub(last.text), 4096).text
           }
           return {
             taskId: task.id,
@@ -287,7 +297,11 @@ export function createSync(deps: SyncDeps) {
             orderKey: s.orderKey,
             kind: s.kind,
             title: s.title,
-            command: s.command === null ? null : redact(s.command).text,
+            command: s.command === null ? null : scrub(s.command),
+            // 手册内容（文字、语言、参考回显）：发起人远程也要能读这份手册
+            ...(s.bodyMd !== null ? { bodyMd: headCap(scrub(s.bodyMd), 16_384) } : {}),
+            ...(s.lang !== null ? { lang: s.lang } : {}),
+            ...(s.refMd !== null ? { refMd: headCap(scrub(s.refMd), 8192) } : {}),
             status: s.status,
             expectedMinutes: s.expectedMinutes,
             actualMs: s.actualMs,
@@ -304,12 +318,12 @@ export function createSync(deps: SyncDeps) {
       (decisions.get(t.id) ?? []).map((d) => ({ key: d.key, taskId: d.taskId, stepId: d.stepId, level: d.level, type: d.type, message: d.message, at: d.at })),
     )
 
-    // 待共享的坑（M9）：脱敏后整条上传；只有血缘锚定的才值得共享。
-    // 上传名单在 fetch 前定死——事务里重新拉全量会把 fetch 窗口内（最长
-    // 20 秒）新接受的坑误标 uploaded=1，从此永不上传。
+    // 待共享的问答（M9）：脱敏后整条上传；挂在步骤/章节/整份文档血缘上的
+    // 才值得共享。上传名单在 fetch 前定死——事务里重新拉全量会把 fetch
+    // 窗口内（最长 20 秒）新接受的误标 uploaded=1，从此永不上传。
     const lessonsToSend = store
       .listLessonsToUpload()
-      .filter((l) => l.anchorKind === 'step_lineage' && l.anchorRef !== null)
+      .filter((l) => (l.anchorKind === 'step_lineage' || l.anchorKind === 'runbook_lineage') && l.anchorRef !== null)
 
     const res = await fetch(`${cfg.url.replace(/\/+$/, '')}/api/sync/push`, {
       method: 'POST',
@@ -329,17 +343,22 @@ export function createSync(deps: SyncDeps) {
         })),
         alerts,
         questions: unpushedQuestions.map((q) => ({ id: q.id, taskId: q.taskId, stepId: q.stepId, body: q.bodyMd, createdAt: q.createdAt })),
-        lessons: lessonsToSend.map((l) => ({
-          id: l.id,
-          lineageKey: l.anchorRef!,
-          symptom: redact(l.symptom).text,
-          cause: l.cause === null ? null : redact(l.cause).text,
-          fixMd: redact(l.fixMd).text,
-          condition: l.condition === null ? null : redact(l.condition).text,
-          taskId: l.sourceTaskId,
-          taskTitle: l.sourceTaskId !== null ? (store.getTask(l.sourceTaskId)?.title ?? null) : null,
-          createdAt: l.createdAt,
-        })),
+        lessons: lessonsToSend.map((l) => {
+          const params = l.sourceTaskId !== null ? (store.getLatestRunbook(l.sourceTaskId)?.runbook.params ?? []) : []
+          const scrub = (t: string): string => redactSecrets(redact(t).text, params).text
+          return {
+            id: l.id,
+            lineageKey: l.anchorRef!,
+            anchorKind: l.anchorKind,
+            symptom: scrub(l.symptom),
+            cause: l.cause === null ? null : scrub(l.cause),
+            fixMd: scrub(l.fixMd),
+            condition: l.condition === null ? null : scrub(l.condition),
+            taskId: l.sourceTaskId,
+            taskTitle: l.sourceTaskId !== null ? (store.getTask(l.sourceTaskId)?.title ?? null) : null,
+            createdAt: l.createdAt,
+          }
+        }),
       }),
       signal: AbortSignal.timeout(20_000),
     })
@@ -376,6 +395,22 @@ export function createSync(deps: SyncDeps) {
   /** 下行落地：派来的任务 / 评论 / 回答 / 已读 / 委派进度，都成为本地可见的东西。 */
   function applyDown(items: Array<{ kind: string; payload: Record<string, unknown> }>): void {
     const touchedTasks = new Set<string>()
+    /** 用着这个血缘的任务（步骤血缘找到那一步；文档血缘挂在整个任务上）。 */
+    const tasksWithLineage = (lineageKey: string, anchorKind: string): Array<{ taskId: string; stepId: string | null }> => {
+      if (lineageKey === '') return []
+      const out: Array<{ taskId: string; stepId: string | null }> = []
+      for (const task of store.listTasks({})) {
+        const latest = store.getLatestRunbook(task.id)
+        if (latest === null) continue
+        if (anchorKind === 'runbook_lineage') {
+          if (latest.runbook.lineageKey === lineageKey) out.push({ taskId: task.id, stepId: null })
+          continue
+        }
+        const step = latest.steps.find((s) => s.lineageKey === lineageKey)
+        if (step !== undefined) out.push({ taskId: task.id, stepId: step.id })
+      }
+      return out
+    }
     for (const item of items) {
       // 一项坏了只跳过这一项：原先一条落不了库的下行会让整批回滚、游标不动，
       // 这台引擎从此每一拍都失败，什么都同步不了
@@ -463,8 +498,14 @@ export function createSync(deps: SyncDeps) {
                 kind: 'question_answered',
                 payload: { answer, by: String(p.answered_by_name ?? '发起人'), questionId: qid },
               })
-              // 捕获时机 5：发起人回答到达 → 提议沉淀成坑（M9）
-              if (q.answerMd !== null) {
+              const lesson = q.lessonId !== null ? store.lessonById(q.lessonId) : null
+              if (lesson !== null && lesson.authorName === null) {
+                // 问的是某条还没答案的问答：回答直接填进它的"答"（已有答案的附在后面）
+                const by = String(p.answered_by_name ?? '发起人')
+                const fix = lesson.fixMd.trim() === '' ? answer : `${lesson.fixMd.trim()}\n\n${by}：${answer}`
+                store.updateLesson(lesson.id, { fixMd: fix })
+              } else if (q.answerMd !== null) {
+                // 捕获时机 5：发起人回答到达 → 提议沉淀成问答（M9）
                 store.createLessonOffer({
                   taskId: q.taskId,
                   stepId: q.stepId,
@@ -486,34 +527,44 @@ export function createSync(deps: SyncDeps) {
             if (store.lessonById(lessonId) !== null) store.setRemoteLessonStatus(lessonId, 'declined')
             continue
           }
-          if (store.lessonById(lessonId) !== null) continue // 幂等
+          const content = {
+            symptom: redact(String(p.symptom ?? '')).text,
+            fixMd: redact(String(p.fix_md ?? p.fixMd ?? '')).text,
+            condition: p.condition == null ? null : String(p.condition),
+            cause: p.cause == null ? null : redact(String(p.cause)).text,
+          }
+          if (store.lessonById(lessonId) !== null) {
+            // 已经有了：作者补了答案或改了问法，跟着更新（本机的帮上/没帮上计数不动）
+            if (store.refreshRemoteLesson(lessonId, content)) {
+              const l = store.lessonById(lessonId)!
+              for (const t of tasksWithLineage(l.anchorRef ?? '', l.anchorKind)) touchedTasks.add(t.taskId)
+            }
+            const l = store.lessonById(lessonId)!
+            if (p.status === 'confirmed' && l.confirmedAt === null) store.setRemoteLessonStatus(lessonId, 'confirmed')
+            continue
+          }
+          const anchorKind = p.anchor_kind === 'runbook_lineage' || p.anchorKind === 'runbook_lineage' ? 'runbook_lineage' : 'step_lineage'
           const lesson = store.upsertRemoteLesson({
             id: lessonId,
             anchorRef: String(p.lineage_key ?? p.lineageKey ?? ''),
-            symptom: redact(String(p.symptom ?? '')).text,
-            cause: p.cause == null ? null : redact(String(p.cause)).text,
-            fixMd: redact(String(p.fix_md ?? p.fixMd ?? '')).text,
-            condition: p.condition == null ? null : String(p.condition),
+            anchorKind,
+            ...content,
             authorName: String(p.author_name ?? p.authorName ?? '同事'),
             localAuthorId: meId(),
             confirmed: p.status === 'confirmed',
             createdAt: Number(p.created_at ?? p.createdAt ?? Date.now()),
           })
           // 挂到含该血缘的任务上：时间线可见"谁在这一步记了个坑"（宪法 15：透明）
-          if (lesson !== null && lesson.anchorRef !== '') {
-            for (const task of store.listTasks({})) {
-              const latest = store.getLatestRunbook(task.id)
-              if (latest === null) continue
-              const step = latest.steps.find((s) => s.lineageKey === lesson.anchorRef)
-              if (step === undefined) continue
+          if (lesson !== null && lesson.anchorRef !== null && lesson.anchorRef !== '') {
+            for (const hit of tasksWithLineage(lesson.anchorRef, lesson.anchorKind)) {
               store.appendEvent({
-                taskId: task.id,
-                stepId: step.id,
+                taskId: hit.taskId,
+                stepId: hit.stepId,
                 actorId: null,
                 kind: 'lesson_shared',
-                payload: { lessonId: lesson.id, by: lesson.authorName, symptom: lesson.symptom.slice(0, 80) },
+                payload: { lessonId: lesson.id, by: lesson.authorName, symptom: (lesson.symptom || lesson.fixMd).slice(0, 80) },
               })
-              touchedTasks.add(task.id)
+              touchedTasks.add(hit.taskId)
             }
           }
         } else if (item.kind === 'lesson_status') {

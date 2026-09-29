@@ -5,7 +5,7 @@
 
 import { z } from 'zod'
 import type { Lesson, Param, Step } from '@qb/core'
-import { renderCommand } from '@qb/core'
+import { adaptableSteps, normalizeParamName, renderCommand } from '@qb/core'
 import { fillTemplate } from './prompt.ts'
 import type { Llm } from '../llm/port.ts'
 
@@ -65,10 +65,9 @@ export async function proposeAdapt(
   input: AdaptInput,
   opts: { signal?: AbortSignal } = {},
 ): Promise<AdaptProposal> {
-  // 模型看到的步骤列表：只列有内容的行（跳过章节标题），带渲染后的命令
-  const indexed = input.steps
-    .map((s, index) => ({ s, index }))
-    .filter(({ s }) => s.kind !== 'note' || s.parentId !== null)
+  // 模型看到的步骤列表：跳过章节与回显（它们没有命令可改）；序号是这张
+  // 清单里的下标，界面用同一个 adaptableSteps 映射回步骤
+  const indexed = adaptableSteps(input.steps).map((s, index) => ({ s, index }))
 
   // 单趟填充：说明里写着 {{steps}} 之类的占位不会被吃掉
   const prompt = fillTemplate(adaptPrompt, {
@@ -114,19 +113,19 @@ export async function proposeAdapt(
   }
 
   // 改动引用了当前没有的参数名也没关系：应用时找不到就新建同名参数。
-  // 名字归一成大写下划线（与 newParams 一致），归一后仍非法的丢掉。
+  // 名字归一（与 newParams 一致；中文名照留），归一后仍非法的丢掉。
   const paramChanges = result.output.paramChanges
     .filter((c): c is NonNullable<typeof c> => c !== null && c.name !== '')
-    .map((c) => ({ ...c, name: c.name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_') }))
-    .filter((c) => /^[A-Z][A-Z0-9_]*$/.test(c.name))
+    .map((c) => ({ ...c, name: normalizeParamName(c.name) }))
+    .filter((c): c is typeof c & { name: string } => c.name !== null)
     .map((c) => ({ name: c.name, to: c.to, ...(c.reason !== undefined ? { reason: c.reason } : {}) }))
 
   return {
     paramChanges,
     newParams: result.output.newParams
       .filter((p): p is NonNullable<typeof p> => p !== null)
-      .map((p) => ({ ...p, name: p.name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_') }))
-      .filter((p) => /^[A-Z][A-Z0-9_]*$/.test(p.name)),
+      .map((p) => ({ ...p, name: normalizeParamName(p.name) }))
+      .filter((p): p is typeof p & { name: string } => p.name !== null),
     stepEdits,
     obsolete: result.output.obsolete.filter((o): o is NonNullable<typeof o> => o !== null && o.what !== ''),
     questions: result.output.questions.filter((q) => q.trim() !== ''),

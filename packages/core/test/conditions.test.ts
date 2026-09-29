@@ -11,12 +11,19 @@ const params = [
 const env = { os: 'Ubuntu 22.04', gpu: 'NVIDIA H800 x8' }
 
 describe('parseCondition', () => {
-  it('解析参数与环境项、中文包含', () => {
+  it('解析参数与环境项、中文包含（参数名原样保留）', () => {
     const c = parseCondition('DECODE_HOST == gpu-18 AND 环境.GPU 包含 H800')
     expect(c).not.toBeNull()
     expect(c!.terms).toEqual([
-      { name: 'decode_host', op: '==', value: 'gpu-18', isEnv: false },
+      { name: 'DECODE_HOST', op: '==', value: 'gpu-18', isEnv: false },
       { name: 'gpu', op: 'contains', value: 'H800', isEnv: true },
+    ])
+  })
+
+  it('中文参数名、带字段的参数', () => {
+    expect(parseCondition('机器195.用户 == root AND 容器名 != x')!.terms).toEqual([
+      { name: '机器195.用户', op: '==', value: 'root', isEnv: false },
+      { name: '容器名', op: '!=', value: 'x', isEnv: false },
     ])
   })
 
@@ -55,6 +62,15 @@ describe('matchCondition', () => {
 
   it('无条件 → true（血缘锚定本身算匹配）', () => {
     expect(matchCondition(null, params)).toBe(true)
+  })
+
+  it('字段：取参数的某个字段；主值的标签也能用', () => {
+    const machine = [
+      { name: '机器195', value: '10.9.8.195', valueLabel: 'IP', source: 'mine' as const, secret: false, fields: [{ key: '用户', value: 'root', secret: false }] },
+    ]
+    expect(matchCondition(parseCondition('机器195.用户 == root'), machine)).toBe(true)
+    expect(matchCondition(parseCondition('机器195.IP == 10.9.8.195'), machine)).toBe(true)
+    expect(matchCondition(parseCondition('机器195.端口 == 22'), machine)).toBeNull()
   })
 })
 

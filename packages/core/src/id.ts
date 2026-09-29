@@ -24,6 +24,7 @@ export const ids = {
   question: () => newId('qst'),
   user: () => newId('usr'),
   lineage: () => newId('lin'),
+  docLineage: () => newId('doc'),
   snapshot: () => newId('snp'),
   modelProfile: () => newId('mdl'),
   material: () => newId('mat'),

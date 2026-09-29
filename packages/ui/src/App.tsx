@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Event, Step, Task } from '@qb/core'
+import type { Event, Param, Step, StepKind, Task } from '@qb/core'
 import {
+  adaptableSteps,
+  depthOf,
   dropPosition,
+  exportMarkdown,
   insertionAfter,
   insertionAtEnd,
+  isContent,
+  isDoable,
   isSection,
+  machineName,
+  machineParam,
   movedPosition,
+  parseMachineLine,
   positionOf,
   type MoveDirection,
   type Position,
@@ -15,23 +23,25 @@ import {
   api,
   connectEvents,
   type AdaptProposal,
-  type BaseSuggestion,
   type Job,
   type LessonOfferView,
-  type LessonView,
   type NewStepInput,
   type PartialStep,
   type PurposeStatus,
+  type QaItem,
   type ServerEvent,
   type StepPatchInput,
   type SyncStatus,
   type TaskDetail,
   type TeamUser,
 } from './api.ts'
-import { StepCell, formatMs, type StepActions, type StepRunState } from './StepCell.tsx'
+import { StepCell, formatMs, readAsDataUrl, type StepActions, type StepRunState } from './StepCell.tsx'
 import { Settings } from './Settings.tsx'
 import { ParamsPanel } from './ParamsPanel.tsx'
 import { AdaptCard } from './AdaptCard.tsx'
+import { SidePanel } from './SidePanel.tsx'
+import { DocImportCard, GraftDialog, StartPanel, kindMark, useElapsed } from './StartPanel.tsx'
+import { renderMarkdown } from './highlight.ts'
 import { useHistory } from './history.ts'
 
 /** 大纲里拖拽步骤时 dataTransfer 用的类型。 */
@@ -42,6 +52,24 @@ interface Toast {
   text: string
   tone?: 'error'
   action?: { label: string; run: () => void }
+}
+
+/** 新块的默认内容：命令和文字都不用先起标题（按内容自动取）。 */
+function newBlock(kind: StepKind): NewStepInput {
+  switch (kind) {
+    case 'section':
+      return { kind, title: '新章节' }
+    case 'note':
+      return { kind, title: '文字', titleAuto: true }
+    case 'code':
+      return { kind, title: '代码', titleAuto: true, lang: 'bash' }
+    case 'output':
+      return { kind, title: '回显', titleAuto: true }
+    case 'manual':
+      return { kind, title: '新的一步' }
+    default:
+      return { kind: 'command', title: '命令', titleAuto: true, lang: 'bash' }
+  }
 }
 
 export function App() {
@@ -59,15 +87,15 @@ export function App() {
   const [jobs, setJobs] = useState<Record<string, Job>>({})
   // 起草时流式到达的步骤预览
   const [partials, setPartials] = useState<Record<string, PartialStep[]>>({})
-  // 刚插入的步骤：直接进入标题编辑
+  // 刚插入的块：直接进入编辑
   const [editTarget, setEditTarget] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [llmStatus, setLlmStatus] = useState<PurposeStatus | null>(null)
   const [teamEnabled, setTeamEnabled] = useState(false)
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
   const [teamUsers, setTeamUsers] = useState<TeamUser[]>([])
-  // 坑（M9）：步骤 → 两层坑；待确认的捕获提议
-  const [stepLessons, setStepLessons] = useState<Record<string, { layer1: LessonView[]; layer2: LessonView[] }>>({})
+  // 问答（原"坑"）与待确认的捕获提议
+  const [qa, setQa] = useState<QaItem[]>([])
   const [lessonOffers, setLessonOffers] = useState<LessonOfferView[]>([])
   const history = useHistory()
 
@@ -90,11 +118,11 @@ export function App() {
     const d = await api.taskDetail(taskId)
     if (activeRef.current !== taskId) return
     setDetail(d)
-    // 坑（M9）：分层显示与捕获提议跟 detail 一起刷；失败不影响主界面
+    // 问答与捕获提议跟 detail 一起刷；失败不影响主界面
     void api
-      .stepLessons(taskId)
-      .then((steps) => {
-        if (activeRef.current === taskId) setStepLessons(steps)
+      .qa(taskId)
+      .then((items) => {
+        if (activeRef.current === taskId) setQa(items)
       })
       .catch(() => undefined)
     void api
@@ -151,7 +179,7 @@ export function App() {
 
   useEffect(() => {
     setDetail(null)
-    setStepLessons({})
+    setQa([])
     setLessonOffers([])
     if (activeId === null) return
     void refreshDetail(activeId)
@@ -162,85 +190,88 @@ export function App() {
     const refreshIfActive = (taskId: string): void => {
       if (activeRef.current === taskId) void refreshDetail(taskId)
     }
-    return connectEvents((e: ServerEvent) => {
-      switch (e.type) {
-        case 'step.status':
-          setRunStates((s) => ({
-            ...s,
-            [e.stepId]: { ...(s[e.stepId] ?? { output: '' }), running: e.status === 'running' },
-          }))
-          break
+    return connectEvents(
+      (e: ServerEvent) => {
+        switch (e.type) {
+          case 'step.status':
+            setRunStates((s) => ({
+              ...s,
+              [e.stepId]: { ...(s[e.stepId] ?? { output: '' }), running: e.status === 'running' },
+            }))
+            break
 
-        case 'step.output':
-          setRunStates((s) => {
-            const prev = s[e.stepId] ?? { output: '', running: true }
-            return { ...s, [e.stepId]: { ...prev, output: prev.output + e.text } }
-          })
-          break
+          case 'step.output':
+            setRunStates((s) => {
+              const prev = s[e.stepId] ?? { output: '', running: true }
+              return { ...s, [e.stepId]: { ...prev, output: prev.output + e.text } }
+            })
+            break
 
-        case 'step.done':
-          setRunStates((s) => ({
-            ...s,
-            [e.stepId]: {
-              ...(s[e.stepId] ?? { output: '' }),
-              running: false,
-              verdict: e.verdict,
-              reason: e.reason,
-              durationMs: e.durationMs,
-              redactionHits: e.redactionHits,
-            },
-          }))
-          // 状态已落库，重新拉一次让步骤标记与任务状态同步
-          if (activeRef.current !== null) void refreshDetail(activeRef.current)
-          void refreshTasks()
-          break
+          case 'step.done':
+            setRunStates((s) => ({
+              ...s,
+              [e.stepId]: {
+                ...(s[e.stepId] ?? { output: '' }),
+                running: false,
+                verdict: e.verdict,
+                reason: e.reason,
+                durationMs: e.durationMs,
+                redactionHits: e.redactionHits,
+                partial: e.partial === true,
+              },
+            }))
+            // 状态已落库，重新拉一次让步骤标记与任务状态同步
+            if (activeRef.current !== null) void refreshDetail(activeRef.current)
+            void refreshTasks()
+            break
 
-        case 'step.error':
-          setRunStates((s) => ({
-            ...s,
-            [e.stepId]: { ...(s[e.stepId] ?? { output: '' }), running: false, verdict: 'fail', reason: e.message },
-          }))
-          break
+          case 'step.error':
+            setRunStates((s) => ({
+              ...s,
+              [e.stepId]: { ...(s[e.stepId] ?? { output: '' }), running: false, verdict: 'fail', reason: e.message },
+            }))
+            break
 
-        case 'step.probe':
-          setProbes((p) => ({ ...p, [e.stepId]: { attempt: e.attempt, detail: e.detail } }))
-          break
+          case 'step.probe':
+            setProbes((p) => ({ ...p, [e.stepId]: { attempt: e.attempt, detail: e.detail } }))
+            break
 
-        case 'runbook.updated':
-          setPartials((p) => ({ ...p, [e.taskId]: [] }))
-          refreshIfActive(e.taskId)
-          break
+          case 'runbook.updated':
+            setPartials((p) => ({ ...p, [e.taskId]: [] }))
+            refreshIfActive(e.taskId)
+            break
 
-        case 'runbook.changed':
-          refreshIfActive(e.taskId)
-          break
+          case 'runbook.changed':
+            refreshIfActive(e.taskId)
+            break
 
-        case 'job.update':
-          setJobs((m) => ({ ...m, [e.job.subjectId]: e.job }))
-          break
+          case 'job.update':
+            setJobs((m) => ({ ...m, [e.job.subjectId]: e.job }))
+            break
 
-        case 'job.partial':
-          setPartials((p) => ({ ...p, [e.subjectId]: e.steps }))
-          break
-      }
-    },
-    // 每次连上（含断线重连）都重拉一次：断线期间的完成/失败事件补不
-    // 回来，重拉数据是唯一可靠的恢复方式
-    () => {
-      void refreshTasks()
-      if (activeRef.current !== null) void refreshDetail(activeRef.current)
-    })
+          case 'job.partial':
+            setPartials((p) => ({ ...p, [e.subjectId]: e.steps }))
+            break
+        }
+      },
+      // 每次连上（含断线重连）都重拉一次：断线期间的完成/失败事件补不
+      // 回来，重拉数据是唯一可靠的恢复方式
+      () => {
+        void refreshTasks()
+        if (activeRef.current !== null) void refreshDetail(activeRef.current)
+      },
+    )
   }, [refreshDetail, refreshTasks])
 
   const steps = detail?.steps ?? []
   const runbook = detail?.runbook ?? null
 
-  // 当前步：优先第一个在跑的、再是第一个没做的（章节标题不算），用户点击可覆盖。
+  // 当前步：优先第一个在跑的、再是第一个没做的（文档内容不算），用户点击可覆盖。
   // QB 在盯着的 wait 步骤、交给别人的委派步骤不占"当前"——"我盯着，你先看下一步"
   const autoCurrent = useMemo(
     () =>
       steps.find((s) => s.status === 'running' && s.kind !== 'wait' && s.kind !== 'delegate') ??
-      steps.find((s) => s.status === 'pending' && !isSection(s)) ??
+      steps.find((s) => s.status === 'pending' && isDoable(s)) ??
       steps.find((s) => s.status === 'running') ??
       steps.find((s) => !isSection(s)),
     [steps],
@@ -301,13 +332,24 @@ export function App() {
     [history, reload, withFreshRev],
   )
 
+  /** 确保有 runbook（自己写的第一块、挑步骤进来之前）。 */
+  const ensureRunbook = useCallback(async (): Promise<string | null> => {
+    const d = detailRef.current
+    if (d === null) return null
+    if (d.runbook !== null) return d.runbook.id
+    const r = await api.blankRunbook(d.task.id)
+    await reload()
+    return r.runbook.id
+  }, [reload])
+
   const insertAt = useCallback(
-    async (pos: Position, input: NewStepInput = { kind: 'command', title: '新步骤' }): Promise<Step | null> => {
-      if (runbook === null) return null
+    async (pos: Position, input: NewStepInput = newBlock('command')): Promise<Step | null> => {
       try {
-        const step = await api.insertStep(runbook.id, { ...pos, step: input })
+        const runbookId = await ensureRunbook()
+        if (runbookId === null) return null
+        const step = await api.insertStep(runbookId, { ...pos, step: input })
         history.push({
-          label: '插入一步',
+          label: '插入一块',
           undo: async () => {
             await api.deleteStep(step.id)
             await reload()
@@ -326,7 +368,7 @@ export function App() {
         return null
       }
     },
-    [runbook, history, reload, toast],
+    [ensureRunbook, history, reload, toast],
   )
 
   const removeStep = useCallback(
@@ -422,38 +464,40 @@ export function App() {
     [history, reload, toast],
   )
 
-  /** 多行命令拆成多步：第一行留在原步骤，其余依次插在后面。整体一次撤销。 */
+  /**
+   * 拆开：第一段留在原块（原块是命令就换成第一条命令；第一段是说明时，原块
+   * 变成那段说明），其余依次插在后面。整体一次撤销。
+   */
   const splitStep = useCallback(
-    async (step: Step, lines: string[]): Promise<void> => {
-      if (runbook === null || lines.length < 2) return
-      const beforeCommand = step.command
+    async (step: Step, parts: NewStepInput[]): Promise<void> => {
+      if (runbook === null || parts.length < 2) return
+      const before: StepPatchInput = { kind: step.kind, title: step.title, titleAuto: step.titleAuto, command: step.command, bodyMd: step.bodyMd, lang: step.lang }
+      const [first, ...rest] = parts
+      const firstPatch: StepPatchInput =
+        first!.kind === 'note'
+          ? { kind: 'note', bodyMd: first!.bodyMd ?? null, command: null, titleAuto: true }
+          : { kind: step.kind === 'note' ? 'command' : step.kind, command: first!.command ?? null, lang: first!.lang ?? step.lang, ...(first!.titleAuto === false ? { title: first!.title } : { titleAuto: true }) }
       try {
-        await editStep(step, { command: lines[0]! }, false)
-        const inserted: string[] = []
-        let after = step.id
-        for (const line of lines.slice(1)) {
-          const s = await api.insertStep(runbook.id, {
-            parentId: step.parentId,
-            afterId: after,
-            step: { kind: step.kind === 'note' ? 'command' : step.kind, title: titleFromCommand(line), command: line },
-          })
-          inserted.push(s.id)
-          after = s.id
-        }
+        await editStep(step, firstPatch, false)
+        const inserted = await api.insertSteps(runbook.id, {
+          parentId: step.parentId,
+          afterId: step.id,
+          steps: rest.map((p) => (p.kind === 'command' && step.kind !== 'note' && step.kind !== 'command' ? { ...p, kind: step.kind } : p)),
+        })
         history.push({
-          label: `拆成 ${lines.length} 步`,
+          label: `拆成 ${parts.length} 块`,
           undo: async () => {
-            for (const id of [...inserted].reverse()) await api.deleteStep(id)
-            await withFreshRev(step.id, (rev) => api.updateStep(step.id, rev, { command: beforeCommand }))
+            for (const s of [...inserted].reverse()) await api.deleteStep(s.id)
+            await withFreshRev(step.id, (rev) => api.updateStep(step.id, rev, before))
             await reload()
           },
           redo: async () => {
-            for (const id of inserted) await api.restoreStep(id)
-            await withFreshRev(step.id, (rev) => api.updateStep(step.id, rev, { command: lines[0]! }))
+            for (const s of inserted) await api.restoreStep(s.id)
+            await withFreshRev(step.id, (rev) => api.updateStep(step.id, rev, firstPatch))
             await reload()
           },
         })
-        toast(`已拆成 ${lines.length} 步`)
+        toast(`已拆成 ${parts.length} 块`)
         await reload()
       } catch (e) {
         toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
@@ -518,10 +562,11 @@ export function App() {
       const d = detailRef.current
       if (d === null || d.runbook === null) return
       const have = new Set(d.runbook.params.map((p) => p.name))
-      const next = [...d.runbook.params, ...names.filter((n) => !have.has(n)).map((name) => ({ name, value: '', source: 'mine' as const, secret: false }))]
+      const next: Param[] = [...d.runbook.params, ...names.filter((n) => !have.has(n)).map((name) => ({ name, value: '', source: 'mine' as const, secret: false }))]
       try {
         await api.updateParams(d.task.id, next)
         toast(`已声明 ${names.join('、')}，在参数面板里填上值就能运行`)
+        setFocusParam(names[0] ?? null)
         await reload()
       } catch (e) {
         toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
@@ -530,19 +575,56 @@ export function App() {
     [reload, toast],
   )
 
+  /** 贴进来一行 "IP 用户 密码"：存成机器参数（密码是 secret，只存本机）。 */
+  const addMachine = useCallback(
+    async (step: Step, text: string): Promise<string | null> => {
+      const d = detailRef.current
+      if (d === null || d.runbook === null) return null
+      const m = parseMachineLine(text)
+      if (m === null) {
+        toast('没认出这台机器的 IP 或主机名', { tone: 'error' })
+        return null
+      }
+      const existing = d.runbook.params.find((p) => p.value === m.host && p.fields !== undefined)
+      const p = existing ?? machineParam(m, machineName(m.host, new Set(d.runbook.params.map((x) => x.name))))
+      try {
+        if (existing === undefined) await api.updateParams(d.task.id, [...d.runbook.params, p])
+        const hint = `ssh ${m.user !== null ? `{{${p.name}.用户}}@` : ''}{{${p.name}}}${m.port !== null ? ` -p {{${p.name}.端口}}` : ''}`
+        // 这一步本来是空的：直接写上登录命令（密码不进命令，用 {{名字.密码}} 引用）
+        if (step.command === null || step.command.trim() === '') await editStep(step, { command: hint }, false)
+        toast(existing !== undefined ? `这台机器已经是参数 ${p.name} 了` : `已存成参数 ${p.name}（密码打码、只存本机）。命令里写 {{${p.name}}}、{{${p.name}.用户}}、{{${p.name}.密码}}`)
+        setFocusParam(p.name)
+        await reload()
+        return p.name
+      } catch (e) {
+        toast(e instanceof Error ? e.message : String(e), { tone: 'error' })
+        return null
+      }
+    },
+    [editStep, reload, toast],
+  )
+
+  const [focusParam, setFocusParam] = useState<string | null>(null)
+  const [qaFor, setQaFor] = useState<string | null>(null)
+  const [askFor, setAskFor] = useState<{ stepId: string | null; lessonId?: string; question?: string } | null>(null)
+
   const actionsFor = useCallback(
     (step: Step): StepActions => ({
       edit: (patch) => editStep(step, patch),
-      insertAfter: () => void insertAt(insertionAfter(step)),
+      insertAfter: (kind = 'command') => void insertAt(insertionAfter(step, detailRef.current?.steps ?? []), newBlock(kind)),
       remove: () => void removeStep(step),
       move: (dir) => moveStep(step, dir),
       setStatus: (status, note) => void setStatus(step, status, note),
-      split: (lines) => void splitStep(step, lines),
+      split: (parts) => void splitStep(step, parts),
       uploadImage: (file) => void uploadImage(step, file),
       delegate: (input) => delegateStep(step, input),
       declareParams: (names) => void declareParams(names),
+      addMachine: (text) => addMachine(step, text),
+      focusParam: (name) => setFocusParam(name),
+      addQa: () => setQaFor(step.id),
+      ask: () => setAskFor({ stepId: step.id }),
     }),
-    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage, delegateStep, declareParams],
+    [editStep, insertAt, removeStep, moveStep, setStatus, splitStep, uploadImage, delegateStep, declareParams, addMachine],
   )
 
   // ── 键盘与粘贴 ───────────────────────────────────────────────
@@ -570,9 +652,9 @@ export function App() {
         if (next >= 0 && next < steps.length) setCurrentStepId(steps[next]!.id)
         return
       }
-      if (e.key === '/' && runbook !== null) {
+      if (e.key === '/') {
         e.preventDefault()
-        void insertAt(current !== null ? insertionAfter(current) : insertionAtEnd(steps))
+        void insertAt(current !== null ? insertionAfter(current, steps) : insertionAtEnd(steps))
         return
       }
       if (current === null) return
@@ -589,12 +671,13 @@ export function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [view, detail, steps, current, currentId, runbook, undo, redo, insertAt, moveStep, removeStep])
+  }, [view, detail, steps, current, currentId, undo, redo, insertAt, moveStep, removeStep])
 
-  // 截图直接 Ctrl+V：贴到当前步。不需要先找输入框。
+  // 截图直接 Ctrl+V：贴到当前步（要做的步骤）。不需要先找输入框。
   useEffect(() => {
     const onPaste = (e: ClipboardEvent): void => {
-      if (view !== 'task' || current === null || isSection(current)) return
+      if (view !== 'task' || current === null || isContent(current)) return
+      if (isTyping(e.target)) return
       const file = [...(e.clipboardData?.files ?? [])].find((f) => f.type.startsWith('image/'))
       if (file === undefined) return
       e.preventDefault()
@@ -638,24 +721,30 @@ export function App() {
           {ongoing.map((t) => (
             <TaskItem key={t.id} task={t} active={t.id === activeId && view === 'task'} onOpen={() => openTask(t.id)} />
           ))}
-          {ongoing.length === 0 && <p className="dim" style={{ padding: '6px 9px' }}>没有进行中的任务。</p>}
+          {ongoing.length === 0 && (
+            <p className="dim" style={{ padding: '6px 9px' }}>
+              没有进行中的任务。
+            </p>
+          )}
           {finished.length > 0 && <FinishedTasks tasks={finished} activeId={view === 'task' ? activeId : null} onOpen={openTask} />}
         </div>
         <div className="sidebar-foot">
-          <button className={`btn ghost${view === 'settings' ? ' on' : ''}`} onClick={() => { setView('settings'); setSidebarOpen(false) }}>
+          <button
+            className={`btn ghost${view === 'settings' ? ' on' : ''}`}
+            onClick={() => {
+              setView('settings')
+              setSidebarOpen(false)
+            }}
+          >
             ⚙ 设置
           </button>
           {llmStatus !== null && !llmStatus.ok && (
-            <span className="verdict unclear" style={{ fontSize: 12 }}>
-              还没配置模型
+            <span className="dim" style={{ fontSize: 12 }} title="不配模型也能用：自己写、导入 md/org、从别的任务挑。起草、整理素材、诊断要模型">
+              没配模型（自己写、导入都能用）
             </span>
           )}
           {teamEnabled && syncStatus !== null && (
-            <span
-              className={`verdict ${syncStatus.ok === false ? 'fail' : 'pass'}`}
-              style={{ fontSize: 12 }}
-              title={syncStatus.detail}
-            >
+            <span className={`verdict ${syncStatus.ok === false ? 'fail' : 'pass'}`} style={{ fontSize: 12 }} title={syncStatus.detail}>
               {syncStatus.ok === false ? `团队同步失败：${syncStatus.detail}` : syncStatus.ok === true ? '团队：已同步' : '团队：连接中…'}
             </span>
           )}
@@ -666,8 +755,6 @@ export function App() {
         <Settings jobs={jobs} />
       ) : activeId === null ? (
         <NewTask
-          teamUsers={teamUsers}
-          teamEnabled={teamEnabled}
           onOpenNav={() => setSidebarOpen(true)}
           onCreated={async (task) => {
             await refreshTasks()
@@ -691,8 +778,11 @@ export function App() {
             setCurrentStepId(id)
             if (id !== editTarget) setEditTarget(null)
           }}
-          onInsert={(pos) => void insertAt(pos)}
-          onDrop={(dragged, target) => void moveTo(dragged, dropPosition(steps, target, dragged))}
+          onInsert={(pos, kind) => void insertAt(pos, newBlock(kind ?? 'command'))}
+          onDrop={(dragged, target) => {
+            const to = dropPosition(steps, target, dragged)
+            if (to !== null) void moveTo(dragged, to)
+          }}
           onChanged={() => {
             void reload()
             void refreshTasks()
@@ -702,8 +792,14 @@ export function App() {
           teamEnabled={teamEnabled}
           teamUsers={teamUsers}
           toast={toast}
-          lessons={stepLessons}
+          qa={qa}
           offers={lessonOffers}
+          focusParam={focusParam}
+          onFocusParam={setFocusParam}
+          qaFor={qaFor}
+          onQaFor={setQaFor}
+          askFor={askFor}
+          onAskFor={setAskFor}
         />
       )}
 
@@ -743,7 +839,7 @@ interface TaskPageProps {
   editTarget: string | null
   actionsFor: (step: Step) => StepActions
   onSelectStep: (id: string) => void
-  onInsert: (pos: Position) => void
+  onInsert: (pos: Position, kind?: StepKind) => void
   onDrop: (dragged: Step, target: Step) => void
   onChanged: () => void
   onOpenSettings: () => void
@@ -753,9 +849,16 @@ interface TaskPageProps {
   teamEnabled: boolean
   teamUsers: TeamUser[]
   toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
-  /** M9：步骤 → 两层坑；待确认提议。 */
-  lessons: Record<string, { layer1: LessonView[]; layer2: LessonView[] }>
+  qa: QaItem[]
   offers: LessonOfferView[]
+  focusParam: string | null
+  onFocusParam: (name: string | null) => void
+  /** 在哪一步上记问答（弹出表单）。 */
+  qaFor: string | null
+  onQaFor: (stepId: string | null) => void
+  /** 问发起人（带上某一步 / 某条问答）。 */
+  askFor: { stepId: string | null; lessonId?: string; question?: string } | null
+  onAskFor: (v: { stepId: string | null; lessonId?: string; question?: string } | null) => void
 }
 
 function TaskPage({
@@ -777,29 +880,51 @@ function TaskPage({
   teamEnabled,
   teamUsers,
   toast,
-  lessons,
+  qa,
   offers,
+  focusParam,
+  onFocusParam,
+  qaFor,
+  onQaFor,
+  askFor,
+  onAskFor,
 }: TaskPageProps) {
   const { task, runbook, steps } = detail
   const currentRef = useRef<HTMLDivElement>(null)
+  const paramsRef = useRef<HTMLDivElement>(null)
   const [dragId, setDragId] = useState<string | null>(null)
   // 差异卡片：job 一次一换 id，按 id 记住"先不用"
   const [adaptDismissedJob, setAdaptDismissedJob] = useState<string | null>(null)
   const [situationOpen, setSituationOpen] = useState(false)
   const [transcriptOpen, setTranscriptOpen] = useState(false)
-  const [askOpen, setAskOpen] = useState(false)
   const [retroOpen, setRetroOpen] = useState(false)
   const [blockedOpen, setBlockedOpen] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
-  // 窄屏（和 SecureCRT 并排）时大纲与 QB 面板收成抽屉
+  const [graftAt, setGraftAt] = useState<Position | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+  // 窄屏（和 SecureCRT 并排）时大纲与侧栏收成抽屉
   const [outlineOpen, setOutlineOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
+  // 折叠的章节（本机记住，按任务）
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(task.id))
+  useEffect(() => setCollapsed(loadCollapsed(task.id)), [task.id])
+  const toggleCollapse = (id: string): void =>
+    setCollapsed((c) => {
+      const next = new Set(c)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      saveCollapsed(task.id, next)
+      return next
+    })
 
   useEffect(() => {
     currentRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
   }, [currentId])
+  useEffect(() => {
+    if (focusParam !== null) paramsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [focusParam])
 
-  const real = steps.filter((s) => !isSection(s))
+  const real = steps.filter(isDoable)
   const done = real.filter((s) => s.status === 'ok' || s.status === 'skipped').length
   const ended = task.status === 'done' || task.status === 'abandoned'
   // 每一步都做完了（或跳过），任务却还没完成：提示一句，完成即复盘
@@ -808,11 +933,24 @@ function TaskPage({
   const draftJob = startJob?.kind === 'draft' ? startJob : undefined
   const importJob = startJob?.kind === 'import' ? startJob : undefined
   const adaptJob = startJob?.kind === 'adapt' ? startJob : undefined
-  const adaptProposal =
-    adaptJob?.status === 'done' ? (adaptJob.result as AdaptProposal | null) : null
+  const adaptProposal = adaptJob?.status === 'done' ? (adaptJob.result as AdaptProposal | null) : null
   const showAdapt = adaptProposal !== null && adaptDismissedJob !== adaptJob!.id
   const params = runbook?.params ?? []
   const fidelityByStep = new Map((detail.fidelity?.items ?? []).map((i) => [i.stepId, i]))
+  const sections = steps.filter(isSection)
+
+  // 被折叠的章节里的块不显示（大纲和正文都是）
+  const hidden = useMemo(() => {
+    const out = new Set<string>()
+    for (const s of steps) if (s.parentId !== null && (collapsed.has(s.parentId) || out.has(s.parentId))) out.add(s.id)
+    return out
+  }, [steps, collapsed])
+  const depths = useMemo(() => new Map(steps.map((s) => [s.id, depthOf(steps, s)])), [steps])
+  const qaByStep = useMemo(() => {
+    const m: Record<string, QaItem[]> = {}
+    for (const q of qa) if (q.stepId !== null) (m[q.stepId] ??= []).push(q)
+    return m
+  }, [qa])
 
   // 每一步最近一次内容编辑：悬停"我改的"时显示改前改后
   const lastEdits = useMemo(() => {
@@ -852,20 +990,36 @@ function TaskPage({
       .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
   }
 
+  const exportMd = (): void => {
+    const md = exportMarkdown(task.title, steps, params)
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `${task.title.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60)}.md`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000)
+  }
+
+  const initiatorName = detail.initiator?.displayName ?? null
+  const noRunbook = runbook === null || steps.length === 0
+
   return (
     <div className="task-page">
       <header className="task-header">
         <button className="btn ghost nav-toggle" title="任务列表" onClick={onOpenNav}>
           ☰
         </button>
-        <h1>{task.title}</h1>
+        <h1>
+          <TitleEdit task={task} onChanged={onChanged} toast={toast} />
+        </h1>
         <span className="task-meta">
-          <span className={`gem ${gemClass(task)}`}>{gem(task)}</span> {statusLabel(task)} · {done}/{real.length}
+          <span className={`gem ${gemClass(task)}`}>{gem(task)}</span> {statusLabel(task)}
+          {real.length > 0 && ` · ${done}/${real.length}`}
           {task.expectedMinutes !== null && ` · 预计 ${task.expectedMinutes} 分钟`}
         </span>
         <span className="spacer" />
         <span className="task-meta keys" title="快捷键">
-          / 插入 · Alt+↑↓ 移动 · Tab 进出章节 · Delete 删除 · Ctrl+Z 撤销
+          / 插入 · Alt+↑↓ 移动 · Tab 缩进 · Delete 删除 · Ctrl+Z 撤销
         </span>
         <div className="header-actions">
           <button className="btn ghost outline-toggle" onClick={() => setOutlineOpen((v) => !v)}>
@@ -876,16 +1030,16 @@ function TaskPage({
               <button
                 className="btn"
                 title={teamEnabled ? 'QB 整理好求助发给发起人，回答会回到这一步' : '临时方案：整理好求助内容复制到剪贴板，你贴到 IM 里发给发起人'}
-                onClick={() => setAskOpen(true)}
+                onClick={() => onAskFor({ stepId: current?.id ?? null })}
               >
                 问发起人{teamEnabled ? '' : '（复制到 IM）'}
               </button>
               {steps.length > 0 && (
                 <>
-                  <button className="btn" onClick={() => setSituationOpen(true)}>
+                  <button className="btn" onClick={() => setSituationOpen(true)} disabled={llmStatus !== null && !llmStatus.ok} title={llmStatus !== null && !llmStatus.ok ? '要先配模型' : undefined}>
                     情况变了…
                   </button>
-                  <button className="btn" onClick={() => setTranscriptOpen(true)} title="自己在外部终端里跑了几步？把整段输出贴进来，QB 按命令分回各步">
+                  <button className="btn" onClick={() => setTranscriptOpen(true)} title="自己在外部终端里跑了几步？把整段回显贴进来，QB 按命令分回各步">
                     贴终端记录
                   </button>
                 </>
@@ -915,7 +1069,40 @@ function TaskPage({
             </button>
             {moreOpen && (
               <div className="menu" onMouseLeave={() => setMoreOpen(false)}>
-                {steps.length > 0 && !ended && <RedraftButton taskId={task.id} job={draftJob} asMenuItem />}
+                {!noRunbook && (
+                  <button
+                    className="menu-item"
+                    onClick={() => {
+                      setMoreOpen(false)
+                      setGraftAt(insertionAtEnd(steps))
+                    }}
+                  >
+                    从别的任务挑章节/步骤…
+                  </button>
+                )}
+                {!noRunbook && (
+                  <button
+                    className="menu-item"
+                    onClick={() => {
+                      setMoreOpen(false)
+                      setImportOpen(true)
+                    }}
+                  >
+                    导入 md / org（替换或接在后面）…
+                  </button>
+                )}
+                {!noRunbook && (
+                  <button
+                    className="menu-item"
+                    onClick={() => {
+                      setMoreOpen(false)
+                      exportMd()
+                    }}
+                  >
+                    导出 markdown
+                  </button>
+                )}
+                {steps.length > 0 && !ended && (llmStatus === null || llmStatus.ok) && <RedraftButton taskId={task.id} job={draftJob} asMenuItem />}
                 {!ended && (
                   <button
                     className="menu-item"
@@ -929,12 +1116,24 @@ function TaskPage({
                   </button>
                 )}
                 {ended && (
-                  <button className="menu-item" onClick={() => { setMoreOpen(false); setStatus('active') }}>
+                  <button
+                    className="menu-item"
+                    onClick={() => {
+                      setMoreOpen(false)
+                      setStatus('active')
+                    }}
+                  >
                     重新打开
                   </button>
                 )}
-                <button className="menu-item panel-toggle" onClick={() => { setMoreOpen(false); setPanelOpen(true) }}>
-                  看 QB 时间线
+                <button
+                  className="menu-item panel-toggle"
+                  onClick={() => {
+                    setMoreOpen(false)
+                    setPanelOpen(true)
+                  }}
+                >
+                  看这一步 / 问答 / 记录
                 </button>
               </div>
             )}
@@ -944,42 +1143,46 @@ function TaskPage({
 
       <div className="task-body">
         <nav className={`outline${outlineOpen ? ' open' : ''}`} onClick={() => setOutlineOpen(false)}>
-          {steps.map((s) => (
-            <button
-              key={s.id}
-              draggable
-              onDragStart={(e) => {
-                // 被拖的是哪一步放在 dataTransfer 里：drop 时不依赖 React 状态是否已刷新
-                e.dataTransfer.setData(DRAG_TYPE, s.id)
-                e.dataTransfer.effectAllowed = 'move'
-                setDragId(s.id)
-              }}
-              onDragEnd={() => setDragId(null)}
-              onDragOver={(e) => {
-                if (e.dataTransfer.types.includes(DRAG_TYPE)) e.preventDefault()
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                const id = e.dataTransfer.getData(DRAG_TYPE)
-                setDragId(null)
-                const dragged = steps.find((x) => x.id === id)
-                if (dragged !== undefined && dragged.id !== s.id) onDrop(dragged, s)
-              }}
-              className={`outline-item${s.id === currentId ? ' current' : ''}${s.parentId !== null ? ' depth-1' : ''}${
-                isSection(s) ? ' section' : ''
-              }${dragId === s.id ? ' dragging' : ''}`}
-              onClick={() => onSelectStep(s.id)}
-            >
-              <span title={lessons[s.id] !== undefined ? '这一步有坑记录' : undefined}>
-                {isSection(s) ? '§' : outlineMark(s)}
-                {!isSection(s) && lessons[s.id] !== undefined && <span className="lesson-dot">⚠</span>}
-              </span>
-              <span className="t">{s.title}</span>
-            </button>
-          ))}
+          {steps
+            .filter((s) => !hidden.has(s.id))
+            .map((s) => (
+              <button
+                key={s.id}
+                draggable
+                onDragStart={(e) => {
+                  // 被拖的是哪一步放在 dataTransfer 里：drop 时不依赖 React 状态是否已刷新
+                  e.dataTransfer.setData(DRAG_TYPE, s.id)
+                  e.dataTransfer.effectAllowed = 'move'
+                  setDragId(s.id)
+                }}
+                onDragEnd={() => setDragId(null)}
+                onDragOver={(e) => {
+                  if (e.dataTransfer.types.includes(DRAG_TYPE)) e.preventDefault()
+                }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  const id = e.dataTransfer.getData(DRAG_TYPE)
+                  setDragId(null)
+                  const dragged = steps.find((x) => x.id === id)
+                  if (dragged !== undefined && dragged.id !== s.id) onDrop(dragged, s)
+                }}
+                className={`outline-item kind-${s.kind}${s.id === currentId ? ' current' : ''}${isSection(s) ? ' section' : ''}${dragId === s.id ? ' dragging' : ''}`}
+                style={{ paddingLeft: 8 + (depths.get(s.id) ?? 0) * 14 }}
+                onClick={() => onSelectStep(s.id)}
+                onDoubleClick={() => isSection(s) && toggleCollapse(s.id)}
+              >
+                <span title={qaByStep[s.id] !== undefined ? '这一步有问答' : undefined}>
+                  {isSection(s) ? (collapsed.has(s.id) ? '▸' : '▾') : isContent(s) ? kindMark(s.kind) : outlineMark(s)}
+                  {qaByStep[s.id] !== undefined && <span className="lesson-dot">？</span>}
+                </span>
+                <span className="t">{s.title}</span>
+              </button>
+            ))}
         </nav>
 
         <main className="runbook">
+          <TaskInfo task={task} initiatorName={initiatorName} teamUsers={teamUsers} teamEnabled={teamEnabled} onChanged={onChanged} toast={toast} />
+
           {/* 重新起草 / 导入也流式显示：不用等整份写完才知道 QB 在写什么 */}
           {(draftJob?.status === 'running' || importJob?.status === 'running') && steps.length > 0 && (
             <div className="redrafting">
@@ -989,9 +1192,7 @@ function TaskPage({
               </p>
               {partial.map((s, i) => (
                 <div className="ghost-step" key={i}>
-                  {(i === 0 || partial[i - 1]!.section !== s.section) && s.section !== '' && (
-                    <div className="ghost-section">{s.section}</div>
-                  )}
+                  {(i === 0 || partial[i - 1]!.section !== s.section) && s.section !== '' && <div className="ghost-section">{s.section}</div>}
                   <div className="ghost-title">○ {s.title}</div>
                   {s.command !== undefined && <pre className="ghost-cmd">{s.command}</pre>}
                 </div>
@@ -1005,7 +1206,7 @@ function TaskPage({
             <AdaptCard
               key={adaptJob!.id}
               taskId={task.id}
-              steps={steps}
+              steps={adaptableSteps(steps)}
               params={params}
               runbookVersion={runbook?.version ?? 1}
               proposal={adaptProposal}
@@ -1049,14 +1250,16 @@ function TaskPage({
             </div>
           )}
 
-          {runbook !== null && <ParamsPanel taskId={task.id} params={params} onChanged={onChanged} toast={toast} />}
+          {runbook !== null && (
+            <div ref={paramsRef}>
+              <ParamsPanel taskId={task.id} params={params} sections={sections} steps={steps} focus={focusParam} onChanged={onChanged} toast={toast} />
+            </div>
+          )}
 
           {/* 导入来的 runbook：保真概况一行（参数一改会跟着变） */}
           {detail.fidelity !== null && (
             <div className="fidelity-strip">
-              来自素材：{detail.fidelity.items.filter((i) => i.verbatim).length}/{detail.fidelity.items.length} 条命令逐字 ·{' '}
-              {detail.fidelity.items.filter((i) => !i.verbatim && !i.unverified).length} 条 QB 改写过 ·{' '}
-              素材里 {detail.fidelity.uncoveredCount} 行命令没用上
+              来自素材：{detail.fidelity.items.filter((i) => i.verbatim).length}/{detail.fidelity.items.length} 条命令逐字 · {detail.fidelity.items.filter((i) => !i.verbatim && !i.unverified).length} 条 QB 改写过 · 素材里 {detail.fidelity.uncoveredCount} 行命令没用上
             </div>
           )}
 
@@ -1072,8 +1275,8 @@ function TaskPage({
             </div>
           )}
 
-          {steps.length === 0 && (
-            <DraftPrompt
+          {noRunbook && (
+            <StartPanel
               taskId={task.id}
               title={task.title}
               brief={task.briefMd}
@@ -1083,86 +1286,99 @@ function TaskPage({
               material={detail.material}
               onOpenSettings={onOpenSettings}
               onChanged={onChanged}
+              onStartBlank={(kind) => onInsert({ parentId: null, afterId: null }, kind)}
               toast={toast}
             />
           )}
 
-          {steps.map((s) => (
-            <div key={s.id} ref={s.id === currentId ? currentRef : undefined}>
-              <StepCell
-                step={s}
-                current={s.id === currentId}
-                runState={runStates[s.id]}
-                evidence={detail.evidence[s.id] ?? []}
-                params={params}
-                fidelity={fidelityByStep.get(s.id)}
-                job={jobs[s.id]}
-                lastEdit={lastEdits[s.id]}
-                autoEdit={s.id === editTarget}
-                canMove={canMoveOf(s)}
-                lessons={lessons[s.id]}
-                offers={offers.filter((o) => o.stepId === s.id)}
-                comments={commentsByStep[s.id]}
-                delegation={detail.delegations[s.id]}
-                probe={probes[s.id]}
-                teamUsers={teamUsers}
-                teamEnabled={teamEnabled}
-                actions={actionsFor(s)}
-                onFocus={() => onSelectStep(s.id)}
-                onChanged={onChanged}
-              />
-              <InsertBar onClick={() => onInsert(insertionAfter(s))} />
-            </div>
-          ))}
+          {steps
+            .filter((s) => !hidden.has(s.id))
+            .map((s) => (
+              <div key={s.id} ref={s.id === currentId ? currentRef : undefined}>
+                <StepCell
+                  step={s}
+                  steps={steps}
+                  depth={depths.get(s.id) ?? 0}
+                  current={s.id === currentId}
+                  collapsed={collapsed.has(s.id)}
+                  onToggleCollapse={() => toggleCollapse(s.id)}
+                  runState={runStates[s.id]}
+                  evidence={detail.evidence[s.id] ?? []}
+                  params={params}
+                  fidelity={fidelityByStep.get(s.id)}
+                  job={jobs[s.id]}
+                  lastEdit={lastEdits[s.id]}
+                  autoEdit={s.id === editTarget}
+                  canMove={canMoveOf(s)}
+                  qa={qaByStep[s.id] ?? []}
+                  offers={offers.filter((o) => o.stepId === s.id)}
+                  comments={commentsByStep[s.id]}
+                  delegation={detail.delegations[s.id]}
+                  probe={probes[s.id]}
+                  teamUsers={teamUsers}
+                  teamEnabled={teamEnabled}
+                  actions={actionsFor(s)}
+                  onFocus={() => onSelectStep(s.id)}
+                  onChanged={onChanged}
+                />
+                {qaFor === s.id && <QaFormFor taskId={task.id} step={s} onDone={() => { onQaFor(null); onChanged() }} />}
+                <InsertBar
+                  onInsert={(kind) => onInsert(insertionAfter(s, steps, collapsed.has(s.id)), kind)}
+                  onGraft={() => setGraftAt(insertionAfter(s, steps, collapsed.has(s.id)))}
+                />
+              </div>
+            ))}
 
           {runbook !== null && steps.length > 0 && (
-            <button className="btn ghost add-step" onClick={() => onInsert(insertionAtEnd(steps))}>
-              ＋ 添加一步
-            </button>
+            <div className="add-row">
+              {(['command', 'note', 'section', 'code', 'output'] as const).map((k) => (
+                <button key={k} className="btn ghost" onClick={() => onInsert(insertionAtEnd(steps), k)}>
+                  ＋ {KIND_NAME[k]}
+                </button>
+              ))}
+              <button className="btn ghost" onClick={() => setGraftAt(insertionAtEnd(steps))}>
+                ＋ 从别的任务挑…
+              </button>
+            </div>
           )}
         </main>
 
         <aside className={`qb-panel${panelOpen ? ' open' : ''}`}>
-          <h2>
-            QB
-            <button className="btn ghost drawer-close" onClick={() => setPanelOpen(false)}>
-              ✕
-            </button>
-          </h2>
-          <div className="qb-feed">
-            {detail.events.length === 0 ? (
-              <p style={{ color: 'var(--text-faint)' }}>还没有事件。</p>
-            ) : (
-              detail.events
-                .slice()
-                .reverse()
-                .map((e) => (
-                  <div className={`qb-msg${e.kind === 'alert_raised' ? ' raised' : ''}`} key={e.id}>
-                    {eventText(e, steps)}
-                    {e.kind === 'alert_raised' && typeof e.payload.key === 'string' && !ended && (
-                      <div>
-                        <button
-                          className="btn ghost"
-                          title="30 分钟内这条不再推给发起人；到点还没解决会重新告诉他"
-                          onClick={() => {
-                            api
-                              .snoozeAlert(task.id, String(e.payload.key))
-                              .then(() => {
-                                toast('好，30 分钟内这条不再推给发起人')
-                                onChanged()
-                              })
-                              .catch((err: unknown) => toast(err instanceof Error ? err.message : String(err), { tone: 'error' }))
-                          }}
-                        >
-                          我能搞定，先别提醒他
-                        </button>
-                      </div>
-                    )}
-                    <div className="when">{new Date(e.createdAt).toLocaleTimeString('zh-CN')}</div>
-                  </div>
-                ))
-            )}
-          </div>
+          <SidePanel
+            steps={steps}
+            params={params}
+            events={detail.events}
+            qa={qa}
+            current={current}
+            taskId={task.id}
+            ended={ended}
+            onClose={() => setPanelOpen(false)}
+            onChanged={onChanged}
+            onAsk={(opts) => onAskFor(opts)}
+            onFocusParam={(n) => onFocusParam(n)}
+            eventText={(e) => eventText(e, steps)}
+            renderAlertAction={(e) =>
+              e.kind === 'alert_raised' && typeof e.payload.key === 'string' ? (
+                <div>
+                  <button
+                    className="btn ghost"
+                    title="30 分钟内这条不再推给发起人；到点还没解决会重新告诉他"
+                    onClick={() => {
+                      api
+                        .snoozeAlert(task.id, String(e.payload.key))
+                        .then(() => {
+                          toast('好，30 分钟内这条不再推给发起人')
+                          onChanged()
+                        })
+                        .catch((err: unknown) => toast(err instanceof Error ? err.message : String(err), { tone: 'error' }))
+                    }}
+                  >
+                    我能搞定，先别提醒他
+                  </button>
+                </div>
+              ) : null
+            }
+          />
         </aside>
 
         {blockedOpen && (
@@ -1187,29 +1403,33 @@ function TaskPage({
         )}
 
         {retroOpen && (
-          <RetroDialog taskId={task.id} onDone={() => { setRetroOpen(false); onChanged() }} toast={toast} />
+          <RetroDialog
+            taskId={task.id}
+            onDone={() => {
+              setRetroOpen(false)
+              onChanged()
+            }}
+            toast={toast}
+          />
         )}
 
-        {askOpen && (
+        {askFor !== null && (
           <AskDialog
             enabled={teamEnabled}
-            initial={askText(
-              task,
-              current,
-              current !== null ? (detail.evidence[current.id] ?? []) : [],
-              current !== null ? detail.events : [],
-            )}
+            initial={askText(task, askFor.stepId !== null ? (steps.find((s) => s.id === askFor.stepId) ?? null) : current, askFor.stepId !== null ? (detail.evidence[askFor.stepId] ?? []) : current !== null ? (detail.evidence[current.id] ?? []) : [], detail.events, params, askFor.question)}
             onDone={(body) => {
-              setAskOpen(false)
+              const target = askFor
+              onAskFor(null)
               if (body === null) return
               api
-                .askInitiator(task.id, { stepId: current?.id ?? null, body })
+                .askInitiator(task.id, { stepId: target.stepId ?? current?.id ?? null, body, ...(target.lessonId !== undefined ? { lessonId: target.lessonId } : {}) })
                 .then((r) => {
-                  if (r.sent) toast('已发给发起人，回答会出现在 QB 面板和这一步')
+                  if (r.sent) toast(target.lessonId !== undefined ? '已发给发起人，回答回来会自动填进这条问答' : '已发给发起人，回答会出现在这一步')
                   else {
                     void navigator.clipboard.writeText(body)
                     toast('还没配置团队服务：求助内容已复制，贴到 IM 里发（临时 · 复制到 IM）')
                   }
+                  onChanged()
                 })
                 .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
             }}
@@ -1225,9 +1445,7 @@ function TaskPage({
                 .submitTranscript(task.id, text)
                 .then((r) =>
                   toast(
-                    r.matched > 0
-                      ? `已把 ${r.matched} 段输出分回对应步骤${r.unmatched.length > 0 ? `，${r.unmatched.length} 条命令没对上步骤（runbook 之外的）` : ''}`
-                      : '没认出任何对应步骤的命令',
+                    r.matched > 0 ? `已把 ${r.matched} 段回显分回对应步骤${r.unmatched.length > 0 ? `，${r.unmatched.length} 条命令没对上步骤（runbook 之外的）` : ''}` : '没认出任何对应步骤的命令',
                     r.unmatched.length > 0 ? { action: { label: '看看没对上的', run: () => toast(r.unmatched.join('\n')) } } : undefined,
                   ),
                 )
@@ -1235,9 +1453,263 @@ function TaskPage({
             }}
           />
         )}
+
+        {graftAt !== null && <GraftDialog taskId={task.id} target={graftAt} onClose={() => setGraftAt(null)} onDone={onChanged} toast={toast} />}
+
+        {importOpen && (
+          <div className="modal-backdrop" onClick={() => setImportOpen(false)}>
+            <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+              <h3>导入 md / org</h3>
+              <p className="dim">导入会整份替换现在的内容（先留快照，可以在 ⋯ 里找回）。要接在后面，用"从别的任务挑"或先导进一个新任务。</p>
+              <DocImportCard
+                taskId={task.id}
+                compact
+                onDone={() => {
+                  setImportOpen(false)
+                  onChanged()
+                }}
+                toast={toast}
+              />
+              <div className="row">
+                <button className="btn ghost" onClick={() => setImportOpen(false)}>
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
+}
+
+const KIND_NAME: Record<'command' | 'note' | 'section' | 'code' | 'output', string> = {
+  command: '命令',
+  note: '文字',
+  section: '章节',
+  code: '代码',
+  output: '回显',
+}
+
+/** 在某一步上记一条问答（从 ⋯ 或"＋ 问答"打开）。 */
+function QaFormFor({ taskId, step, onDone }: { taskId: string; step: Step; onDone: () => void }) {
+  const [QaForm, setQaForm] = useState<typeof import('./StepCell.tsx').QaForm | null>(null)
+  useEffect(() => {
+    void import('./StepCell.tsx').then((m) => setQaForm(() => m.QaForm))
+  }, [])
+  if (QaForm === null) return null
+  return (
+    <div className="qa-inline-form">
+      <div className="dim">在「{step.title}」上记一条问答</div>
+      <QaForm
+        withScope
+        onCancel={onDone}
+        onSubmit={async (v) => {
+          await api.addQa(taskId, { question: v.question, answer: v.answer, stepId: step.id, condition: v.condition === '' ? null : v.condition, scope: v.scope })
+          onDone()
+        }}
+      />
+    </div>
+  )
+}
+
+/** 标题：点一下就改。 */
+function TitleEdit({ task, onChanged, toast }: { task: Task; onChanged: () => void; toast: (text: string, opts?: { tone?: 'error' }) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(task.title)
+  useEffect(() => setDraft(task.title), [task.title])
+  if (!editing)
+    return (
+      <span className="editable" title="点击改标题" onClick={() => setEditing(true)}>
+        {task.title}
+      </span>
+    )
+  const save = (): void => {
+    setEditing(false)
+    const t = draft.trim()
+    if (t === '' || t === task.title) return
+    api
+      .updateTask(task.id, { title: t })
+      .then(onChanged)
+      .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+  }
+  return (
+    <input
+      className="inline-edit editing title-edit"
+      autoFocus
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={save}
+      onKeyDown={(e) => {
+        e.stopPropagation()
+        if (e.key === 'Enter') save()
+        if (e.key === 'Escape') {
+          setDraft(task.title)
+          setEditing(false)
+        }
+      }}
+    />
+  )
+}
+
+/**
+ * 任务信息：说明、发起人、预期都是建完再补的（建任务只要一句"要做什么"）。
+ * 空着的就折成一行"＋ 补充说明 · ＋ 谁派的活"，不占地方。
+ */
+function TaskInfo({
+  task,
+  initiatorName,
+  teamUsers,
+  teamEnabled,
+  onChanged,
+  toast,
+}: {
+  task: Task
+  initiatorName: string | null
+  teamUsers: TeamUser[]
+  teamEnabled: boolean
+  onChanged: () => void
+  toast: (text: string, opts?: { tone?: 'error' }) => void
+}) {
+  const [editing, setEditing] = useState<'brief' | 'initiator' | 'minutes' | null>(null)
+  const [brief, setBrief] = useState(task.briefMd)
+  const [who, setWho] = useState('')
+  const [minutes, setMinutes] = useState(task.expectedMinutes === null ? '' : String(task.expectedMinutes))
+  useEffect(() => setBrief(task.briefMd), [task.briefMd])
+  useEffect(() => setMinutes(task.expectedMinutes === null ? '' : String(task.expectedMinutes)), [task.expectedMinutes])
+  const selfTask = task.initiatorId === task.assigneeId
+  const briefHtml = useMemo(() => (task.briefMd.trim() === '' ? '' : markdownOf(task.briefMd)), [task.briefMd])
+
+  const save = (patch: Parameters<typeof api.updateTask>[1]): void => {
+    setEditing(null)
+    api
+      .updateTask(task.id, patch)
+      .then(onChanged)
+      .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+  }
+  const matched = teamUsers.find((u) => u.name === who.trim() || u.displayName === who.trim())
+  const unknown = teamEnabled && who.trim() !== '' && teamUsers.length > 0 && matched === undefined
+
+  return (
+    <div className="task-info" onKeyDown={(e) => e.stopPropagation()}>
+      {editing === 'brief' ? (
+        <div>
+          <textarea
+            className="inline-edit editing brief-edit"
+            autoFocus
+            rows={4}
+            value={brief}
+            placeholder="目标、约束、完成标准、已知的坑（markdown）"
+            onChange={(e) => setBrief(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setBrief(task.briefMd)
+                setEditing(null)
+              } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save({ briefMd: brief })
+            }}
+          />
+          <div className="cap-actions">
+            <button className="btn primary" onClick={() => save({ briefMd: brief })}>
+              保存
+            </button>
+            <button
+              className="btn ghost"
+              onClick={() => {
+                setBrief(task.briefMd)
+                setEditing(null)
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      ) : task.briefMd.trim() !== '' ? (
+        <div className="brief md" title="点击编辑" onClick={(e) => (e.target as HTMLElement).closest('a') === null && setEditing('brief')} dangerouslySetInnerHTML={{ __html: briefHtml }} />
+      ) : null}
+
+      <div className="info-row">
+        {task.briefMd.trim() === '' && editing !== 'brief' && (
+          <button className="lesson-fold" onClick={() => setEditing('brief')}>
+            ＋ 补充说明
+          </button>
+        )}
+        {editing === 'initiator' ? (
+          <span className="info-edit">
+            <input
+              className="inline-edit editing"
+              autoFocus
+              list="qb-team-users"
+              placeholder={teamEnabled ? '谁派的活？从团队成员里选；空着 = 自己' : '谁派的活？空着 = 自己'}
+              value={who}
+              onChange={(e) => setWho(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !unknown) save({ initiatorName: matched?.name ?? who.trim() })
+                if (e.key === 'Escape') setEditing(null)
+              }}
+            />
+            <datalist id="qb-team-users">
+              {teamUsers.map((u) => (
+                <option key={u.name} value={u.name}>
+                  {u.displayName}
+                </option>
+              ))}
+            </datalist>
+            <button className="btn primary" disabled={unknown} onClick={() => save({ initiatorName: matched?.name ?? who.trim() })}>
+              好
+            </button>
+            <button className="btn ghost" onClick={() => setEditing(null)}>
+              取消
+            </button>
+            {unknown && <span className="verdict unclear">团队里没有"{who.trim()}"——从下拉里选，或者让他先拿邀请链接注册</span>}
+          </span>
+        ) : (
+          <button
+            className="lesson-fold"
+            onClick={() => {
+              setWho(selfTask ? '' : (initiatorName ?? ''))
+              setEditing('initiator')
+            }}
+            title={teamEnabled ? '发起人会实时看到进度、收到告警和求助' : '配好团队服务后，发起人会实时看到进度与告警'}
+          >
+            {selfTask ? '＋ 谁派的活' : `发起人：${initiatorName ?? '（未知）'}`}
+          </button>
+        )}
+        {editing === 'minutes' ? (
+          <span className="info-edit">
+            <input
+              className="inline-edit editing"
+              autoFocus
+              style={{ width: 80 }}
+              placeholder="分钟"
+              value={minutes}
+              onChange={(e) => setMinutes(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const n = Number(minutes)
+                  save({ expectedMinutes: minutes.trim() === '' ? null : Number.isInteger(n) && n > 0 ? n : task.expectedMinutes })
+                }
+                if (e.key === 'Escape') setEditing(null)
+              }}
+              onBlur={() => setEditing(null)}
+            />
+          </span>
+        ) : (
+          <button className="lesson-fold" onClick={() => setEditing('minutes')}>
+            {task.expectedMinutes === null ? '＋ 预计多久' : `预计 ${task.expectedMinutes} 分钟`}
+          </button>
+        )}
+        {task.briefMd.trim() !== '' && editing !== 'brief' && (
+          <button className="lesson-fold" onClick={() => setEditing('brief')}>
+            改说明
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function markdownOf(md: string): string {
+  return renderMarkdown(md)
 }
 
 /** 卡住了：一句原因（可选）。QB 带着它替执行者告诉发起人。 */
@@ -1250,7 +1722,7 @@ function BlockedDialog({ teamEnabled, onDone }: { teamEnabled: boolean; onDone: 
         <h3>卡住了</h3>
         <p className="dim">
           {teamEnabled ? 'QB 会马上替你告诉发起人（🔴），带上这句原因。' : '没配团队服务：会标记卡住，但发起人收不到。'}
-          之后你一跑步骤或贴输出，就自动算"不卡了"。
+          之后你一跑步骤或贴回显，就自动算"不卡了"。
         </p>
         <div className="chip-row">
           {quick.map((q) => (
@@ -1303,21 +1775,15 @@ function blockedNote(events: Event[]): string {
   return note !== '' ? `卡住了：${note}` : '卡住了'
 }
 
-/** 问发起人：QB 代拟的正文（目标/命令/输出尾部/试过什么），可改可发。 */
+/** 问发起人：QB 代拟的正文（目标/命令/回显尾部/试过什么），可改可发。 */
 function AskDialog({ enabled, initial, onDone }: { enabled: boolean; initial: string; onDone: (body: string | null) => void }) {
   const [text, setText] = useState(initial)
   return (
     <div className="modal-backdrop" onClick={() => onDone(null)}>
-      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
         <h3>{enabled ? '问发起人' : '问发起人（临时 · 复制到 IM）'}</h3>
-        <p className="dim">QB 按上下文代拟了正文（报错尾部、已试过什么都在），改完再发。</p>
-        <textarea
-          autoFocus
-          className="mono"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={12}
-        />
+        <p className="dim">QB 按上下文代拟了正文（回显尾部、已试过什么都在，secret 已打码），改完再发。</p>
+        <textarea autoFocus className="mono" value={text} onChange={(e) => setText(e.target.value)} rows={12} />
         <div className="row">
           <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text)}>
             {enabled ? '发给发起人' : '复制全文'}
@@ -1340,7 +1806,7 @@ function SituationDialog({ onDone }: { onDone: (message: string | null) => void 
   const [text, setText] = useState('')
   return (
     <div className="modal-backdrop" onClick={() => onDone(null)}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
         <h3>情况变了</h3>
         <div className="chip-row">
           {SITUATION_QUICK.map((q) => (
@@ -1349,13 +1815,7 @@ function SituationDialog({ onDone }: { onDone: (message: string | null) => void 
             </button>
           ))}
         </div>
-        <textarea
-          autoFocus
-          placeholder="这次和原计划有什么不同？（QB 会对照当前 runbook 出差异，逐项确认后应用）"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={3}
-        />
+        <textarea autoFocus placeholder="这次和原计划有什么不同？（QB 会对照当前 runbook 出差异，逐项确认后应用）" value={text} onChange={(e) => setText(e.target.value)} rows={3} />
         <div className="row">
           <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text.trim())}>
             让 QB 出差异
@@ -1374,17 +1834,10 @@ function TranscriptDialog({ onDone }: { onDone: (text: string | null) => void })
   const [text, setText] = useState('')
   return (
     <div className="modal-backdrop" onClick={() => onDone(null)}>
-      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
         <h3>贴一段终端记录</h3>
-        <p className="dim">整段复制粘贴（带提示符）。QB 按提示符切成"命令 + 输出"，命令对得上步骤的自动归档成证据并判定预期。</p>
-        <textarea
-          autoFocus
-          className="mono"
-          placeholder={'[root@gpu-17 ~]# nvidia-smi\n…\n[root@gpu-17 ~]# vllm serve …\n…'}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          rows={10}
-        />
+        <p className="dim">整段复制粘贴（带提示符）。QB 按提示符切成"命令 + 回显"，命令对得上步骤的自动归档成证据并判定预期。</p>
+        <textarea autoFocus className="mono" placeholder={'[root@gpu-17 ~]# nvidia-smi\n…\n[root@gpu-17 ~]# vllm serve …\n…'} value={text} onChange={(e) => setText(e.target.value)} rows={10} />
         <div className="row">
           <button className="btn primary" disabled={text.trim() === ''} onClick={() => onDone(text)}>
             分回各步
@@ -1398,26 +1851,20 @@ function TranscriptDialog({ onDone }: { onDone: (text: string | null) => void })
   )
 }
 
-/** 单元之间的插入条：悬停时出现"＋"。 */
 /**
  * 复盘清单（捕获时机 7）：任务收尾时把沉淀候选列一遍——
  * 待确认的提议（失败后修好/情况变了/别人的底稿提议）+
- * 已回答但还没沉淀成坑的求助。逐条勾选，不想记的跳过。
+ * 已回答但还没沉淀成问答的求助。逐条勾选，不想记的跳过。
  */
-function RetroDialog({
-  taskId,
-  onDone,
-  toast,
-}: {
-  taskId: string
-  onDone: () => void
-  toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void
-}) {
+function RetroDialog({ taskId, onDone, toast }: { taskId: string; onDone: () => void; toast: (text: string, opts?: Omit<Toast, 'id' | 'text'>) => void }) {
   const [data, setData] = useState<{ offers: LessonOfferView[]; questions: Array<{ id: string; stepId: string | null; bodyMd: string; answerMd: string }> } | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
   useEffect(() => {
-    api.retro(taskId).then(setData).catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
+    api
+      .retro(taskId)
+      .then(setData)
+      .catch((e: unknown) => toast(e instanceof Error ? e.message : String(e), { tone: 'error' }))
   }, [taskId, toast])
 
   const act = async (id: string, fn: () => Promise<unknown>): Promise<void> => {
@@ -1436,9 +1883,9 @@ function RetroDialog({
     const at = o.stepTitle !== null ? `（${o.stepTitle}）` : ''
     switch (o.kind) {
       case 'fix':
-        return `失败后改了命令才跑通${at}——记成坑`
+        return `失败后改了命令才跑通${at}——记一条问答`
       case 'question':
-        return `发起人的回答${at}——沉淀成坑`
+        return `发起人的回答${at}——记成问答`
       case 'situation':
         return `情况变了：${String(o.payload.reason ?? '')}`
       case 'proposal':
@@ -1455,7 +1902,7 @@ function RetroDialog({
         {data === null ? (
           <p className="dim">整理中……</p>
         ) : data.offers.length + data.questions.length === 0 ? (
-          <p className="dim">没有待沉淀的候选。这次执行的过程已经都留在时间线里了。</p>
+          <p className="dim">没有待沉淀的候选。这次执行的过程已经都留在记录里了。</p>
         ) : (
           <>
             {data.offers.map((o) => (
@@ -1465,7 +1912,7 @@ function RetroDialog({
                   {(o.kind === 'fix' || o.kind === 'question' || o.kind === 'situation') && (
                     <>
                       <button className="btn primary" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id, { scope: 'team' }))}>
-                        记成坑并共享
+                        记下并共享
                       </button>
                       <button className="btn" disabled={busy === o.id} onClick={() => void act(o.id, () => api.acceptLessonOffer(o.id, { scope: 'personal' }))}>
                         只记给自己
@@ -1491,11 +1938,12 @@ function RetroDialog({
             {data.questions.map((q) => (
               <div key={q.id} className="retro-item">
                 <span>
-                  求助「{q.bodyMd.slice(0, 40)}{q.bodyMd.length > 40 ? '…' : ''}」已回答——沉淀成坑
+                  求助「{q.bodyMd.slice(0, 40)}
+                  {q.bodyMd.length > 40 ? '…' : ''}」已回答——记成问答
                 </span>
                 <span className="retro-actions">
                   <button className="btn primary" disabled={busy === q.id} onClick={() => void act(q.id, () => api.questionLesson(q.id, { scope: 'team' }))}>
-                    记成坑并共享
+                    记下并共享
                   </button>
                   <button className="btn ghost" disabled={busy === q.id} onClick={() => void act(q.id, () => api.questionLesson(q.id, { scope: 'personal' }))}>
                     只记给自己
@@ -1515,182 +1963,24 @@ function RetroDialog({
   )
 }
 
-function InsertBar({ onClick }: { onClick: () => void }) {
+/** 单元之间的插入条：悬停时出现，可以插不同种类的块，或从别的任务挑。 */
+function InsertBar({ onInsert, onGraft }: { onInsert: (kind: StepKind) => void; onGraft: () => void }) {
   return (
-    <div className="insert-bar" onClick={onClick} title="在这里插入一步（/）">
-      <span>＋</span>
+    <div className="insert-bar" title="在这里插入（/）">
+      <span className="insert-line" />
+      <span className="insert-choices" onClick={(e) => e.stopPropagation()}>
+        <button onClick={() => onInsert('command')}>＋ 命令</button>
+        <button onClick={() => onInsert('note')}>文字</button>
+        <button onClick={() => onInsert('section')}>章节</button>
+        <button onClick={() => onInsert('code')}>代码</button>
+        <button onClick={() => onInsert('output')}>回显</button>
+        <button onClick={onGraft}>挑…</button>
+      </span>
     </div>
   )
 }
 
 // ── 起草 ──────────────────────────────────────────────────────
-
-/** 起草期间显示已等待时长。干等一个不知道要多久的转圈是最烦人的。 */
-function useElapsed(since: number | null): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (since === null) return
-    const t = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(t)
-  }, [since])
-  return since === null ? 0 : Math.floor((now - since) / 1000)
-}
-
-/**
- * 空 runbook 时的入口（方案 §3）：按优先级排四条路——
- * B 贴了素材 → 从素材整理；A 有底稿可推荐 → 以它为基础（复制 + 出差异）；
- * D 兜底 → 让 QB 起草；C 终端日志先落成素材再整理。
- */
-function DraftPrompt({
-  taskId,
-  title,
-  brief,
-  job,
-  partial,
-  llmStatus,
-  material,
-  onOpenSettings,
-  onChanged,
-  toast,
-}: {
-  taskId: string
-  title: string
-  brief: string
-  job: Job | undefined
-  partial: PartialStep[]
-  llmStatus: PurposeStatus | null
-  material: { id: string; kind: string; filename: string | null } | null
-  onOpenSettings: () => void
-  onChanged: () => void
-  toast: (text: string, opts?: { tone?: 'error' }) => void
-}) {
-  const [error, setError] = useState<string | null>(null)
-  const [bases, setBases] = useState<BaseSuggestion[] | null>(null)
-  const running = job?.status === 'running'
-  const elapsed = useElapsed(running ? job!.startedAt : null)
-
-  useEffect(() => {
-    api
-      .suggestBases(title)
-      .then((list) => setBases(list.filter((b) => b.taskId !== taskId)))
-      .catch(() => setBases([]))
-  }, [title, taskId])
-
-  const start = (): void => {
-    setError(null)
-    api.draft(taskId).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-  }
-
-  const importFromMaterial = (): void => {
-    if (material === null) return
-    setError(null)
-    api
-      .importFromMaterial(taskId, material.id)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-  }
-
-  /** 模式 A：复制底稿（血缘与参数跟着来），再拿这次的说明出差异。 */
-  const startFromBase = (runbookId: string): void => {
-    setError(null)
-    api
-      .basedOn(taskId, runbookId)
-      .then(() => {
-        onChanged()
-        return api.adapt(taskId, brief.trim() !== '' ? brief.trim() : title)
-      })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-  }
-
-  if (running) {
-    return (
-      <div>
-        <p style={{ color: 'var(--text-dim)' }}>
-          {job!.kind === 'import' ? 'QB 正在从素材整理' : 'QB 正在起草'}
-          ……{job!.progress ?? ''} · 已等待 {elapsed} 秒
-        </p>
-        {partial.map((s, i) => (
-          <div className="ghost-step" key={i}>
-            {(i === 0 || partial[i - 1]!.section !== s.section) && s.section !== '' && (
-              <div className="ghost-section">{s.section}</div>
-            )}
-            <div className="ghost-title">○ {s.title}</div>
-            {s.command !== undefined && <pre className="ghost-cmd">{s.command}</pre>}
-          </div>
-        ))}
-      </div>
-    )
-  }
-
-  const failure = error ?? (job?.status === 'failed' ? job.error : null)
-  const unconfigured = llmStatus !== null && !llmStatus.ok
-
-  return (
-    <div style={{ color: 'var(--text-dim)' }}>
-      <p>还没有 runbook。</p>
-
-      {unconfigured ? (
-        <p>
-          还没有配置模型。{' '}
-          <button className="btn primary" onClick={onOpenSettings}>
-            去设置
-          </button>
-        </p>
-      ) : (
-        <>
-          {/* B：贴了素材——最高优先级，命令逐字来自原文 */}
-          {material !== null && (
-            <p>
-              <button className="btn primary" onClick={importFromMaterial}>
-                从素材整理
-              </button>{' '}
-              <span className="paste-hint">
-                已有贴进来的{material.kind === 'terminal' ? '终端记录' : material.kind === 'script' ? '脚本' : '文档'}
-                {material.filename !== null ? `（${material.filename}）` : ''}：QB 忠实整理，命令逐字保留、提取参数，标出改写与缺口。
-              </span>
-            </p>
-          )}
-
-          {/* A：底稿推荐 */}
-          {bases !== null && bases.length > 0 && (
-            <div className="base-suggestions">
-              <p style={{ marginBottom: 4 }}>QB 找到了可以当底稿的：</p>
-              {bases.map((b) => (
-                <div key={b.taskId} className="base-row">
-                  <span className="base-title">{b.title}</span>
-                  <span className="dim">v{b.version} · {new Date(b.updatedAt).toLocaleDateString('zh-CN')}</span>
-                  <button className="btn" onClick={() => startFromBase(b.runbookId)}>
-                    以它为基础
-                  </button>
-                </div>
-              ))}
-              <p className="paste-hint">以它为基础 = 复制步骤和参数（血缘保留），再拿这次的说明出差异，逐项接受。</p>
-            </div>
-          )}
-
-          {/* D：兜底 */}
-          <p>
-            <button className="btn" onClick={start}>
-              让 QB 起草
-            </button>{' '}
-            <span className="paste-hint">没有素材也没有相似任务时才用：QB 起草的是猜测，每条命令都会标成"QB 写的"。</span>
-          </p>
-
-          {material === null && (
-            <p className="paste-hint">
-              更好的起点：把同事发的文档 / 脚本 / 聊天记录贴成素材（新任务页的"手头有什么"），QB 整理出来命令逐字可用。
-            </p>
-          )}
-        </>
-      )}
-
-      {failure !== null && (
-        <p className="verdict fail" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
-          {failure}
-        </p>
-      )}
-    </div>
-  )
-}
 
 /** 重新起草。旧版本会保留，不会丢。 */
 function RedraftButton({ taskId, job, asMenuItem = false }: { taskId: string; job: Job | undefined; asMenuItem?: boolean }) {
@@ -1721,44 +2011,25 @@ function RedraftButton({ taskId, job, asMenuItem = false }: { taskId: string; jo
 
 // ── 新任务 ────────────────────────────────────────────────────
 
-function NewTask({
-  onCreated,
-  teamUsers,
-  teamEnabled,
-  onOpenNav,
-}: {
-  onCreated: (t: Task) => void | Promise<void>
-  teamUsers: TeamUser[]
-  teamEnabled: boolean
-  onOpenNav: () => void
-}) {
+/**
+ * 新任务只要一句"要做什么"。说明、发起人、预期建完了在任务页上补；
+ * 怎么开始（自己写 / 导入 md·org / 从别的任务挑 / 让 QB 帮忙）也在任务页选。
+ */
+function NewTask({ onCreated, onOpenNav }: { onCreated: (t: Task) => void | Promise<void>; onOpenNav: () => void }) {
   const [title, setTitle] = useState('')
-  const [brief, setBrief] = useState('')
-  const [material, setMaterial] = useState('')
-  const [initiator, setInitiator] = useState('')
   const [busy, setBusy] = useState(false)
-  // 发起人必须是团队里的名字：原先手打，打错了（或打成显示名）发起人永远看不到这个任务
-  const matched = teamUsers.find((u) => u.name === initiator.trim() || u.displayName === initiator.trim())
-  const unknownInitiator = teamEnabled && initiator.trim() !== '' && teamUsers.length > 0 && matched === undefined
+  const [error, setError] = useState<string | null>(null)
 
   const submit = async (): Promise<void> => {
     if (title.trim() === '') return
     setBusy(true)
+    setError(null)
     try {
-      const initiatorName = matched?.name ?? initiator.trim()
-      const task = await api.createTask({
-        title: title.trim(),
-        briefMd: brief,
-        ...(initiatorName !== '' ? { initiatorName } : {}),
-      })
-      if (material.trim() !== '') {
-        await api.createMaterial(task.id, { kind: 'doc', text: material })
-      }
+      const task = await api.createTask({ title: title.trim() })
       setTitle('')
-      setBrief('')
-      setMaterial('')
-      setInitiator('')
       await onCreated(task)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -1771,7 +2042,7 @@ function NewTask({
       </button>
       <div className="new-task-form">
         <input
-          placeholder="要做什么？"
+          placeholder="要做什么？比如：用 2、3 号卡部署 qwen3.6 27b"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => {
@@ -1779,41 +2050,11 @@ function NewTask({
           }}
           autoFocus
         />
-        <textarea
-          placeholder="详细说明（就像给 agent 写 prompt：目标、约束、已知的坑）"
-          value={brief}
-          onChange={(e) => setBrief(e.target.value)}
-        />
-        <input
-          placeholder={teamEnabled ? '发起人（谁派的活？从团队成员里选；留空 = 自己）' : '发起人（谁派的活？留空 = 自己。配好团队后他会实时看到进度与告警）'}
-          value={initiator}
-          list="qb-team-users"
-          onChange={(e) => setInitiator(e.target.value)}
-        />
-        <datalist id="qb-team-users">
-          {teamUsers.map((u) => (
-            <option key={u.name} value={u.name}>
-              {u.displayName}
-            </option>
-          ))}
-        </datalist>
-        {unknownInitiator && (
-          <span className="verdict unclear" style={{ fontSize: 12.5 }}>
-            团队里没有"{initiator.trim()}"——这样发起人看不到这个任务。从下拉里选一个人，或者让他先拿邀请链接注册。
-          </span>
-        )}
-        {matched !== undefined && initiator.trim() !== matched.name && (
-          <span className="dim">将记为 {matched.displayName}（{matched.name}）</span>
-        )}
-        <textarea
-          className="mono"
-          placeholder="手头有什么？贴同事发的文档 / 脚本 / 聊天记录 / 终端日志——QB 会忠实整理成 runbook，命令逐字保留"
-          value={material}
-          onChange={(e) => setMaterial(e.target.value)}
-        />
-        <button className="btn primary" onClick={() => void submit()} disabled={busy}>
+        <button className="btn primary" onClick={() => void submit()} disabled={busy || title.trim() === ''}>
           创建
         </button>
+        <p className="dim">建好以后再选怎么开始：自己写、导入 md/org 笔记、从别的任务挑步骤拼、或者让 QB 帮忙。说明和发起人也在任务页上补。</p>
+        {error !== null && <div className="verdict fail">{error}</div>}
       </div>
     </div>
   )
@@ -1830,59 +2071,66 @@ function isTyping(target: EventTarget | null): boolean {
   )
 }
 
-function readAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader()
-    r.onload = () => resolve(String(r.result))
-    r.onerror = () => reject(r.error ?? new Error('读不了这张图片'))
-    r.readAsDataURL(file)
-  })
+const COLLAPSE_KEY = 'qb-collapsed'
+
+function loadCollapsed(taskId: string): Set<string> {
+  try {
+    const all = JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? '{}') as Record<string, string[]>
+    return new Set(all[taskId] ?? [])
+  } catch {
+    return new Set()
+  }
 }
 
-/** 拆出来的步骤先用命令本身当标题（去掉环境变量前缀），用户随手改。 */
-function titleFromCommand(line: string): string {
-  const core = line.replace(/^(\w+=\S+\s+)+/, '').replace(/^nohup\s+/, '')
-  return core.length > 48 ? `${core.slice(0, 48)}…` : core
+function saveCollapsed(taskId: string, ids: Set<string>): void {
+  try {
+    const all = JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? '{}') as Record<string, string[]>
+    if (ids.size === 0) delete all[taskId]
+    else all[taskId] = [...ids]
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(all))
+  } catch {
+    /* 存不下就算了：折叠只是本机的显示偏好 */
+  }
 }
 
 /**
- * 求助文本（临时 · 复制到 IM）：目标、卡在哪一步、命令、输出尾部、
- * 已经试过什么。发起人不用追问上下文就能回答。
+ * 求助文本（临时 · 复制到 IM）：目标、卡在哪一步、命令、回显尾部、
+ * 已经试过什么。发起人不用追问上下文就能回答。secret 参数的值打码。
  */
-function askText(
-  task: Task,
-  step: Step | null,
-  evidence: Array<{ text: string | null; imagePath: string | null }>,
-  events: Event[],
-): string {
+function askText(task: Task, step: Step | null, evidence: Array<{ text: string | null; imagePath: string | null }>, events: Event[], params: Param[], question?: string): string {
+  const secrets = params.flatMap((p) => [...(p.secret ? [p.value] : []), ...(p.fields ?? []).filter((f) => f.secret).map((f) => f.value)]).filter((v) => v.length >= 3)
+  const mask = (t: string): string => secrets.reduce((acc, v) => acc.split(v).join('***'), t)
   const lines = [`【求助】${task.title}`]
+  if (question !== undefined && question.trim() !== '') lines.push(`问题：${question.trim()}`)
   if (step !== null) {
-    lines.push(`卡在：${step.title}${step.statusNote !== null ? `（${step.statusNote}）` : ''}`)
-    if (step.command !== null) lines.push(`命令：${step.command}`)
+    lines.push(`${question !== undefined ? '在这一步' : '卡在'}：${step.title}${step.statusNote !== null ? `（${step.statusNote}）` : ''}`)
+    if (step.command !== null && step.kind !== 'note') lines.push(`命令：${step.command}`)
     const last = [...evidence].reverse().find((e) => e.text !== null)
     if (last?.text != null) {
       const tail = last.text.trim().split('\n').slice(-15).join('\n')
-      lines.push(`现象（输出尾部）：\n${tail}`)
+      lines.push(`现象（回显尾部）：\n${tail}`)
     }
     if (evidence.some((e) => e.imagePath !== null)) lines.push('（我这边还有截图，需要的话发你）')
 
-    // 已经试过什么：最近在这条步骤上的失败、超时和改动
-    const tried = events
-      .filter((e) => e.stepId === step.id && (e.kind === 'step_failed' || e.kind === 'step_timeout' || e.kind === 'edit'))
-      .slice(-3)
-      .map((e) => {
-        if (e.kind === 'step_timeout') return '等到超时'
-        if (e.kind === 'step_failed') {
-          const r = typeof e.payload.reason === 'string' && e.payload.reason !== '' ? `（${e.payload.reason}）` : ''
-          return `失败${r}`
-        }
-        const changes = Array.isArray(e.payload.changes) ? (e.payload.changes as Array<{ field: string }>) : []
-        return changes.some((c) => c.field === 'command') ? '改过命令' : '改过这步'
-      })
-    lines.push(`我试过：${tried.length > 0 ? tried.join('；') : '（还没试过别的办法）'}`)
+    if (question === undefined) {
+      // 已经试过什么：最近在这条步骤上的失败、超时和改动
+      const tried = events
+        .filter((e) => e.stepId === step.id && (e.kind === 'step_failed' || e.kind === 'step_timeout' || e.kind === 'edit'))
+        .slice(-3)
+        .map((e) => {
+          if (e.kind === 'step_timeout') return '等到超时'
+          if (e.kind === 'step_failed') {
+            const r = typeof e.payload.reason === 'string' && e.payload.reason !== '' ? `（${e.payload.reason}）` : ''
+            return `失败${r}`
+          }
+          const changes = Array.isArray(e.payload.changes) ? (e.payload.changes as Array<{ field: string }>) : []
+          return changes.some((c) => c.field === 'command') ? '改过命令' : '改过这步'
+        })
+      lines.push(`我试过：${tried.length > 0 ? tried.join('；') : '（还没试过别的办法）'}`)
+    }
   }
   lines.push('—— QB 整理')
-  return lines.join('\n')
+  return mask(lines.join('\n'))
 }
 
 /** 灵魂宝石：亮 = 顺利，变暗 = 有波折，熄灭 = 卡住需要介入。 */
@@ -1928,24 +2176,40 @@ const FIELD_LABEL: Record<string, string> = {
   title: '标题',
   whyMd: '为什么',
   command: '命令',
+  bodyMd: '正文',
+  lang: '语言',
+  refMd: '参考回显',
   expectation: '预期',
   expectedMinutes: '预计耗时',
   kind: '类型',
   status: '状态',
+  params: '参数',
+}
+
+const TASK_FIELD: Record<string, string> = {
+  title: '标题',
+  briefMd: '说明',
+  initiatorId: '发起人',
+  expectedMinutes: '预计耗时',
+  definitionOfDone: '完成标准',
 }
 
 function eventText(e: Event, steps: Step[]): string {
   const payload = e.payload
   const reason = typeof payload.reason === 'string' ? payload.reason : ''
   const ms = typeof payload.durationMs === 'number' ? ` (${formatMs(payload.durationMs)})` : ''
-  const title =
-    typeof payload.title === 'string' ? payload.title : (steps.find((s) => s.id === e.stepId)?.title ?? '')
+  const title = typeof payload.title === 'string' ? payload.title : (steps.find((s) => s.id === e.stepId)?.title ?? '')
   const which = title !== '' ? `「${title}」` : '这一步'
   const byQb = payload.by === 'qb'
 
   switch (e.kind) {
     case 'task_created':
       return typeof payload.by === 'string' && payload.by !== '' && payload.remote === true ? `${payload.by} 派来了这个任务` : '创建了任务'
+    case 'task_updated': {
+      const fields = Array.isArray(payload.fields) ? (payload.fields as string[]).map((f) => TASK_FIELD[f] ?? f) : []
+      if (typeof payload.initiator === 'string') return `发起人改成了 ${payload.initiator}`
+      return `改了任务的${fields.join('、') || '信息'}`
+    }
     case 'task_started':
       return '任务开始'
     case 'task_done':
@@ -1973,28 +2237,37 @@ function eventText(e: Event, steps: Step[]): string {
       return `${who}${st}${progress}${payload.worstAlert === 'red' ? '（需要你看一眼）' : ''}`
     }
     case 'step_run':
+      if (payload.lines !== undefined && typeof payload.lines === 'object' && payload.lines !== null) {
+        const l = payload.lines as { from?: number; to?: number }
+        return `运行了${which}的第 ${l.from}–${l.to} 行`
+      }
       return payload.watch === 'only' ? `QB 开始盯着${which}` : payload.watch === 'run' ? `运行并盯着${which}` : `开始执行${which}`
     case 'step_ok':
       if (payload.source === 'delegate') return `${which}完成了（${typeof payload.by === 'string' ? payload.by : '对方'}做完了委派）`
-      return payload.source === 'image' && byQb
-        ? `QB 看了截图：${which}通过${reason !== '' ? ` — ${reason}` : ''}`
-        : `${which}通过${ms}${reason !== '' ? ` — ${reason}` : ''}`
+      return payload.source === 'image' && byQb ? `QB 看了截图：${which}通过${reason !== '' ? ` — ${reason}` : ''}` : `${which}通过${ms}${reason !== '' ? ` — ${reason}` : ''}`
     case 'step_failed':
       if (typeof payload.diagnosis === 'string') return `QB 诊断${which}：${payload.diagnosis}`
-      return payload.source === 'image' && byQb
-        ? `QB 看了截图：${which}没通过${reason !== '' ? ` — ${reason}` : ''}`
-        : `${which}失败${ms}${reason !== '' ? ` — ${reason}` : ''}`
+      return payload.source === 'image' && byQb ? `QB 看了截图：${which}没通过${reason !== '' ? ` — ${reason}` : ''}` : `${which}失败${ms}${reason !== '' ? ` — ${reason}` : ''}`
     case 'step_timeout':
       return `${which}超时${ms}`
     case 'step_skipped':
       return `跳过了${which}${reason !== '' ? `：${reason}` : ''}`
     case 'edit': {
+      if (payload.renamedParam !== undefined && typeof payload.renamedParam === 'object' && payload.renamedParam !== null) {
+        const r = payload.renamedParam as { from?: string; to?: string }
+        return `参数 ${r.from} 改名为 ${r.to}`
+      }
+      if (Array.isArray(payload.paramChanges)) {
+        const names = (payload.paramChanges as Array<{ name: string }>).map((c) => c.name)
+        return `改了参数 ${names.join('、')}`
+      }
+      if (e.stepId === null) return '改了参数'
       const changes = Array.isArray(payload.changes) ? (payload.changes as Array<{ field: string }>) : []
-      const fields = [...new Set(changes.map((c) => FIELD_LABEL[c.field] ?? c.field).filter((f) => f !== '超时'))]
+      const fields = [...new Set(changes.map((c) => FIELD_LABEL[c.field] ?? c.field).filter((f) => f !== '超时' && f !== 'titleAuto'))]
       return `改了${which}的${fields.join('、') || '内容'}`
     }
     case 'insert':
-      return `插入一步${which}`
+      return typeof payload.from === 'string' && payload.from !== '' ? `从「${payload.from}」接过来${which}` : `插入${which}`
     case 'reorder':
       return `调整了${which}的位置`
     case 'step_deleted':
@@ -2013,7 +2286,7 @@ function eventText(e: Event, steps: Step[]): string {
       return `${author} 评论：${body}`
     }
     case 'question_asked':
-      return '发出了求助（已通知发起人）'
+      return typeof payload.lessonId === 'string' ? '把一条问答拿去问了发起人' : '发出了求助（已通知发起人）'
     case 'question_answered': {
       const by = typeof payload.by === 'string' ? payload.by : '发起人'
       const answer = typeof payload.answer === 'string' ? payload.answer : ''
@@ -2022,26 +2295,25 @@ function eventText(e: Event, steps: Step[]): string {
     case 'alert_acked':
       return '发起人知道了'
     case 'lesson_proposed':
-      return payload.shared === true ? '记了个坑（已共享给团队）' : '记了个坑'
+      return payload.shared === true ? `记了一条问答（已共享给团队）：${String(payload.symptom ?? '')}` : `记了一条问答：${String(payload.symptom ?? '')}`
     case 'lesson_confirmed':
-      return payload.status === 'confirmed'
-        ? `${typeof payload.by === 'string' && payload.by !== '' ? payload.by : '发起人'} 确认了这个坑`
-        : `这个坑被判定无效，降回只给自己`
+      return payload.status === 'confirmed' ? `${typeof payload.by === 'string' && payload.by !== '' ? payload.by : '发起人'} 确认了一条问答` : `一条问答被判定无效，降回只给自己`
     case 'lesson_shared': {
       const by = typeof payload.by === 'string' ? payload.by : '同事'
       const symptom = typeof payload.symptom === 'string' ? payload.symptom : ''
-      return `${by} 在这一步记了个坑：${symptom}`
+      return `${by} 在这里记了一条问答：${symptom}`
     }
     case 'base_proposal': {
       const from = typeof payload.from === 'string' && payload.from !== '' ? payload.from : null
-      const title = typeof payload.stepTitle === 'string' ? payload.stepTitle : '某一步'
-      if (payload.sent === true) return `把「${title}」的改动发给底稿负责人`
-      if (payload.applied === 'accepted') return `底稿提议已应用：「${title}」`
-      if (payload.applied === 'conflict') return `底稿提议冲突（自己的命令已改过）：「${title}」`
+      const t = typeof payload.stepTitle === 'string' ? payload.stepTitle : '某一步'
+      if (payload.sent === true) return `把「${t}」的改动发给底稿负责人`
+      if (payload.applied === 'accepted') return `底稿提议已应用：「${t}」`
+      if (payload.applied === 'conflict') return `底稿提议冲突（自己的命令已改过）：「${t}」`
       if (payload.decided !== undefined) return `${typeof payload.by === 'string' && payload.by !== '' ? payload.by : '对方'}处理了你的底稿提议（${String(payload.decided)}）`
-      return `${from !== null ? from : '同事'} 提议把「${title}」的命令改回底稿`
+      return `${from !== null ? from : '同事'} 提议把「${t}」的命令改回底稿`
     }
     default:
       return e.kind
   }
 }
+

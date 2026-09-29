@@ -19,6 +19,7 @@
  */
 
 import type { Event, EventKind, Step, Task } from './schema.ts'
+import { isDoable } from './tree.ts'
 
 export type AlertLevel = 'red' | 'yellow'
 
@@ -288,7 +289,7 @@ function failStreakOf(events: Event[], stepId: string): number {
   return streak
 }
 
-/** 当前步：文档顺序里第一个还没做完的步骤（章节标题和说明不算）。 */
+/** 当前步：文档顺序里第一个还没做完的步骤（章节、文字、代码、回显不算）。 */
 function currentStep(steps: Step[]): Step | undefined {
-  return steps.find((s) => s.kind !== 'note' && (s.status === 'pending' || s.status === 'failed' || s.status === 'blocked'))
+  return steps.find((s) => isDoable(s) && (s.status === 'pending' || s.status === 'failed' || s.status === 'blocked'))
 }

@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@qb/core": "workspace:*",
+    "highlight.js": "11.11.1",
+    "markdown-it": "15.0.2",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

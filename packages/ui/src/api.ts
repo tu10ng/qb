@@ -102,6 +102,8 @@ export interface TeamSettingsView {
 
 export interface TaskDetail {
   task: Task
+  /** 谁派的活。 */
+  initiator: { name: string; displayName: string } | null
   runbook: Runbook | null
   steps: Step[]
   events: Event[]
@@ -197,13 +199,62 @@ export interface PartialStep {
 export interface NewStepInput {
   kind: StepKind
   title: string
+  titleAuto?: boolean
   whyMd?: string | null
   command?: string | null
+  bodyMd?: string | null
+  lang?: string | null
+  refMd?: string | null
   expectation?: Expectation | null
   expectedMinutes?: number | null
 }
 
-export type StepPatchInput = Partial<Pick<Step, 'kind' | 'title' | 'whyMd' | 'command' | 'expectation' | 'expectedMinutes' | 'timeoutMs' | 'shareOutput'>>
+export type StepPatchInput = Partial<
+  Pick<Step, 'kind' | 'title' | 'titleAuto' | 'whyMd' | 'command' | 'bodyMd' | 'lang' | 'refMd' | 'expectation' | 'expectedMinutes' | 'timeoutMs' | 'shareOutput'>
+>
+
+/** 问答（原"坑"）：问和答都可以空一个。 */
+export interface QaItem {
+  id: string
+  question: string
+  answer: string
+  condition: string | null
+  matched: boolean | null
+  author: string
+  mine: boolean
+  status: 'personal' | 'unverified' | 'confirmed'
+  stale: boolean
+  hits: number
+  stepId: string | null
+  stepTitle: string | null
+  askedAt: number | null
+  /** 答里能直接跑的修复命令；没有就不给"按这个修"。 */
+  fixCommand: string | null
+  createdAt: number
+}
+
+/** 能挑步骤的任务（从别的任务拼接）。 */
+export interface GraftSource {
+  taskId: string
+  title: string
+  status: string
+  runbookId: string
+  steps: Array<{ id: string; parentId: string | null; kind: StepKind; title: string }>
+}
+
+/** 一步的回显：参考回显、这次历次的、同一步在别的任务里的。 */
+export interface StepOutputs {
+  reference: string | null
+  mine: Array<{ id: string; source: string; text: string | null; exitCode: number | null; createdAt: number }>
+  others: Array<{ id: string; taskId: string; taskTitle: string; source: string; text: string | null; createdAt: number }>
+}
+
+export interface DocImportResult {
+  version: number
+  title: string | null
+  stats: { sections: number; notes: number; commands: number; code: number; outputs: number; missingImages: number }
+  missingImages: string[]
+}
 
 // ── 模型设置 ─────────────────────────────────────────────────
 
@@ -287,10 +338,53 @@ export const api = {
   listTasks: (scope: 'mine' | 'delegated' = 'mine') =>
     req<{ tasks: Task[] }>(`/tasks?scope=${scope}`).then((r) => r.tasks),
 
-  createTask: (input: { title: string; briefMd?: string; initiatorName?: string; materialText?: string }) => {
-    const { materialText, ...rest } = input
-    return req<Task>('/tasks', { method: 'POST', body: JSON.stringify(rest) })
-  },
+  createTask: (input: { title: string; briefMd?: string; initiatorName?: string }) =>
+    req<Task>('/tasks', { method: 'POST', body: JSON.stringify(input) }),
+
+  /** 建完再补：标题、说明、发起人（空串 = 自己）、预期。 */
+  updateTask: (taskId: string, patch: { title?: string; briefMd?: string; initiatorName?: string; expectedMinutes?: number | null; definitionOfDone?: string | null }) =>
+    req<{ task: Task; changes: string[] }>(`/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+
+  /** 自己写：空白的 runbook（不需要模型）。 */
+  blankRunbook: (taskId: string) => req<{ runbook: Runbook; steps: Step[]; existing: boolean }>(`/tasks/${taskId}/runbook/blank`, { method: 'POST' }),
+
+  /** 导入 md / org（带上文档里引用的图片）。 */
+  importDoc: (
+    taskId: string,
+    input: { text: string; filename?: string; format?: 'md' | 'org'; imageUrls?: Record<string, string>; mode?: 'replace' | 'append' },
+  ) => req<DocImportResult>(`/tasks/${taskId}/import-doc`, { method: 'POST', body: JSON.stringify(input) }),
+
+  /** 文字块里贴的图：存下来，返回可以写进 markdown 的地址。 */
+  uploadAttachment: (base64: string, mediaType: string) =>
+    req<{ url: string }>('/attachments', { method: 'POST', body: JSON.stringify({ base64, mediaType }) }).then((r) => r.url),
+
+  /** 能挑步骤的任务。 */
+  graftSources: (taskId: string, q = '') =>
+    req<{ sources: GraftSource[] }>(`/tasks/${taskId}/graft-sources?q=${encodeURIComponent(q)}`).then((r) => r.sources),
+
+  /** 把挑中的章节/步骤接进来。 */
+  graft: (taskId: string, input: { sourceTaskId: string; stepIds: string[]; parentId?: string | null; afterId?: string | null }) =>
+    req<{ inserted: string[]; addedParams: string[] }>(`/tasks/${taskId}/graft`, { method: 'POST', body: JSON.stringify(input) }),
+
+  insertSteps: (runbookId: string, input: { parentId: string | null; afterId: string | null; steps: NewStepInput[] }) =>
+    req<{ steps: Step[] }>(`/runbooks/${runbookId}/steps/batch`, { method: 'POST', body: JSON.stringify(input) }).then((r) => r.steps),
+
+  // ── 问答 ────────────────────────────────────────────────
+  qa: (taskId: string) => req<{ items: QaItem[] }>(`/tasks/${taskId}/qa`).then((r) => r.items),
+
+  addQa: (taskId: string, input: { question: string; answer: string; stepId: string | null; condition?: string | null; scope?: 'personal' | 'team' }) =>
+    req<{ item: QaItem }>(`/tasks/${taskId}/qa`, { method: 'POST', body: JSON.stringify(input) }).then((r) => r.item),
+
+  updateQa: (id: string, patch: { question?: string; answer?: string; condition?: string | null }) =>
+    req<{ ok: boolean }>(`/qa/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+
+  deleteQa: (id: string) => req<{ ok: boolean }>(`/qa/${id}`, { method: 'DELETE' }),
+
+  // ── 回显 ────────────────────────────────────────────────
+  stepOutputs: (stepId: string) => req<StepOutputs>(`/steps/${stepId}/outputs`),
+
+  setReference: (stepId: string, input: { evidenceId?: string; text?: string }) =>
+    req<{ refMd: string }>(`/steps/${stepId}/reference`, { method: 'POST', body: JSON.stringify(input) }),
 
   taskDetail: (taskId: string) => req<TaskDetail>(`/tasks/${taskId}/runbook`),
 
@@ -330,7 +424,7 @@ export const api = {
 
   job: (jobId: string) => req<Job>(`/jobs/${jobId}`),
 
-  runStep: (stepId: string, opts: { confirmed?: boolean } = {}) =>
+  runStep: (stepId: string, opts: { confirmed?: boolean; lines?: { from: number; to: number } } = {}) =>
     req<{ stepId: string; status: string }>(`/steps/${stepId}/run`, {
       method: 'POST',
       body: JSON.stringify(opts),
@@ -436,6 +530,10 @@ export const api = {
   updateParams: (taskId: string, params: Param[]) =>
     req<{ params: Param[] }>(`/tasks/${taskId}/params`, { method: 'PATCH', body: JSON.stringify({ params }) }),
 
+  /** 参数改名：命令里的 {{旧名}} 一起换。 */
+  renameParam: (taskId: string, from: string, to: string) =>
+    req<{ touchedSteps: number }>(`/tasks/${taskId}/params/rename`, { method: 'POST', body: JSON.stringify({ from, to }) }),
+
   suggestParams: (taskId: string) =>
     req<{ suggestions: LiteralSuggestionView[] }>(`/tasks/${taskId}/params/suggest`, { method: 'POST' }).then(
       (r) => r.suggestions,
@@ -520,7 +618,7 @@ export const api = {
     req<{ ok: boolean; detail: string }>('/settings/team/test', { method: 'POST', body: JSON.stringify(input) }),
 
   /** 问发起人：配好团队服务才真正发送；sent=false 时界面退回复制到 IM。 */
-  askInitiator: (taskId: string, input: { stepId?: string | null; body: string }) =>
+  askInitiator: (taskId: string, input: { stepId?: string | null; body: string; lessonId?: string | null }) =>
     req<{ sent: boolean; questionId?: string; reason?: string }>(`/tasks/${taskId}/ask`, {
       method: 'POST',
       body: JSON.stringify(input),
@@ -566,6 +664,8 @@ export type ServerEvent =
       durationMs: number
       danger: string
       redactionHits: string[]
+      /** 只运行了选中的几行（不判定、不改状态）。 */
+      partial?: boolean
     }
   | { type: 'step.error'; stepId: string; message: string }
   | { type: 'step.probe'; stepId: string; attempt: number; detail: string }

@@ -39,7 +39,7 @@ function pushBody(over: Partial<SyncPush> = {}): SyncPush {
         endedAt: null,
         runbookVersion: 1,
         steps: [
-          { taskId: 'tsk_1', id: 's1', parentId: null, orderKey: 'V', kind: 'note', title: '1 启动', command: null, status: 'pending', expectedMinutes: null, actualMs: null, statusNote: null },
+          { taskId: 'tsk_1', id: 's1', parentId: null, orderKey: 'V', kind: 'section', title: '1 启动', command: null, status: 'pending', expectedMinutes: null, actualMs: null, statusNote: null },
           { taskId: 'tsk_1', id: 's2', parentId: 's1', orderKey: 'k', kind: 'command', title: '起 decode', command: 'vllm serve', status: 'failed', expectedMinutes: 8, actualMs: 90000, statusNote: 'NCCL' },
         ],
       },
@@ -215,7 +215,7 @@ describe('免打扰与渠道过滤', () => {
 
 describe('坑库与底稿提议（M9）', () => {
   const linSteps = [
-    { taskId: 'tsk_1', id: 's1', parentId: null, orderKey: 'V', kind: 'note', title: '1 启动', command: null, status: 'pending', expectedMinutes: null, actualMs: null, statusNote: null, lineageKey: null },
+    { taskId: 'tsk_1', id: 's1', parentId: null, orderKey: 'V', kind: 'section', title: '1 启动', command: null, status: 'pending', expectedMinutes: null, actualMs: null, statusNote: null, lineageKey: null },
     { taskId: 'tsk_1', id: 's2', parentId: 's1', orderKey: 'k', kind: 'command', title: '起 decode', command: 'vllm serve', status: 'failed', expectedMinutes: 8, actualMs: 90000, statusNote: null, lineageKey: 'lin_decode' },
   ]
 

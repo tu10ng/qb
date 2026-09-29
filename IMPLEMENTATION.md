@@ -320,6 +320,14 @@ src/
 这些已在 Phase 0 修好，每一条都有 `pnpm e2e` 的场景证明，见 `测试手册.md` 的"功能真相表"。**从此"做完了"只认受版本管理的 e2e**（原先 e2e 和浏览器检查都在被忽略的 `.spike/` 里，结果无法复现）。
 Phase 0 之后的路线（dsh 生态、团队底稿库、缺氧式界面、终端接入）见评估方案；专注模式与"只看主线"已删除。
 
+**手册化（2026-09-29，手测反馈的 13 条）**：runbook 从"执行清单"改成"可以执行的手册"。落点：
+- 块：`StepKind` 加 `section / note / code / output`（文档内容，只读可复制、不算进度），`@qb/core/tree.ts` 的 `isContent / isDoable / canContain` 定嵌套规则（章节任意层；要做的步骤能挂子步骤和说明、不能挂章节；内容块是叶子）。步骤加 `bodyMd / lang / refMd / titleAuto`，runbook 加 `lineageKey`（文档血缘）。迁移 v11：顶层 note → section，嵌套 note 的标题 → 正文。
+- 导入/导出：`@qb/core/doc-import.ts` 确定性解析 md / org（不叫模型），`export-md.ts` 导出；`shell-split.ts` 按 shell 语法切命令（续行、多行引号、heredoc、块结构），粘贴拆步、判断代码块是命令还是回显都用它。
+- 参数：名字可以带中文（`PARAM_NAME_SRC`：大写英文或含非 ASCII，纯小写英文不认——那是 jinja/mustache）；`fields`（机器参数：IP 是主值，用户/密码/端口是字段，`{{机器195.密码}}`）、`scope`（归到某一章，只影响显示）；`redactSecrets` 在证据落库、同步、求助文本里打码 secret 的值。
+- 问答：坑的 `symptom / fixMd` 当作问 / 答，至少一个非空；`anchorKind` 加 `runbook_lineage`（挂在整份文档上）；问答可以拿去问发起人（`questions.lesson_id`），回答回流时填进"答"。团队侧 v6：镜像带 `body_md / lang / ref_md / doc_lineage`，问答按文档血缘路由、作者改了内容重排下行。
+- 界面：`StepCell` 按块类型分发；`CodeBlock`（透明 textarea 叠高亮层、随内容长高、没有抓手；只读视图报告选中的行）；`StartPanel`（空白任务的四条路）；`SidePanel`（这一步 / 问答 / 记录）；`ParamsPanel` 重写（改名、字段、机器、按章节分组）。建任务只要标题，其余 `PATCH /tasks/:id` 建完再补。
+- 验证：`pnpm e2e manual`（52 项）。
+
 **待做（按顺序）**。设计见 AGENTS.md §12；每个里程碑以 typecheck + `pnpm test` + `pnpm smoke` + `pnpm e2e` 全绿收尾（不再做两路审查），并把场景写进 `测试手册.md`。
 
 **M6 · 可编辑的活文档 + 换模型层**

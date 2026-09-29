@@ -43,6 +43,17 @@ export const Task = z.object({
 })
 export type Task = z.infer<typeof Task>
 
+/** 建完任务之后能改的信息：说明、发起人、预期都是边做边补的，不在建任务时强填。 */
+export const TaskPatch = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  briefMd: z.string().max(20_000).optional(),
+  /** 发起人的名字；空串 = 自己。 */
+  initiatorName: z.string().trim().max(40).optional(),
+  expectedMinutes: z.number().int().positive().nullable().optional(),
+  definitionOfDone: z.string().max(2000).nullable().optional(),
+})
+export type TaskPatch = z.infer<typeof TaskPatch>
+
 // ── Runbook ────────────────────────────────────────────────────────
 
 /**
@@ -66,14 +77,43 @@ export type Assumption = z.infer<typeof Assumption>
 export const ParamSource = z.enum(['origin', 'base', 'mine', 'qb_guess', 'env'])
 export type ParamSource = z.infer<typeof ParamSource>
 
+/**
+ * 参数名：原来的大写下划线（DECODE_HOST），或带中文的名字（容器名、机器195）。
+ * 纯小写英文不算——{{name}} 这种多半是 jinja / mustache 模板，不能当成参数
+ * 拦住运行。不以数字开头；点留给字段（{{机器195.密码}}）。
+ */
+export const PARAM_NAME_SRC = String.raw`(?:[A-Z_][A-Z0-9_]*|(?=[\p{L}\p{N}_]*[^\x00-\x7f])[\p{L}_][\p{L}\p{N}_]*)`
+/** 字段名：任何字母开头（IP、用户、密码、port 都行）。 */
+export const FIELD_KEY_SRC = String.raw`[\p{L}_][\p{L}\p{N}_]*`
+export const PARAM_NAME_RE = new RegExp(`^${PARAM_NAME_SRC}$`, 'u')
+const ParamName = z.string().regex(PARAM_NAME_RE, '参数名用大写英文、数字、下划线（如 DECODE_HOST），或带中文（如 容器名、机器195）；不能以数字开头')
+
+/** 参数的一个字段（一台机器的 IP / 用户 / 密码）。 */
+export const ParamField = z.object({
+  key: z.string().regex(new RegExp(`^${FIELD_KEY_SRC}$`, 'u'), '字段名只能用字母（含中文）、数字和下划线'),
+  value: z.string(),
+  secret: z.boolean().default(false),
+})
+export type ParamField = z.infer<typeof ParamField>
+
 export const Param = z.object({
-  /** 大写下划线，模板里写 {{NAME}}。 */
-  name: z.string().regex(/^[A-Z][A-Z0-9_]*$/, '参数名要大写下划线'),
+  /** 模板里写 {{名字}}；有字段时写 {{名字.字段}}。 */
+  name: ParamName,
+  /** 主值：{{名字}} 渲染成它（机器参数就是 IP）。 */
   value: z.string(),
   description: z.string().optional(),
   source: ParamSource,
   /** secret 只存本机：界面打码、证据脱敏、永不上传。 */
   secret: z.boolean().default(false),
+  /** 一组相关取值，比如贴进来的 "IP 用户 密码" 一行。 */
+  fields: z.array(ParamField).optional(),
+  /** 主值的标签（机器参数是 "IP"）：{{名字.IP}} 也能取到主值。 */
+  valueLabel: z.string().optional(),
+  /**
+   * 归到哪一章（章节步骤的血缘）；空 = 整份文档。只影响在哪里显示——
+   * 名字在整份 runbook 里唯一，渲染不看它。
+   */
+  scope: z.string().nullable().optional(),
 })
 export type Param = z.infer<typeof Param>
 
@@ -93,9 +133,14 @@ export const Runbook = z.object({
   baseRunbookId: Id.nullable(),
   /** 从哪份素材整理而来（模式 B）——保真报告对着它比。 */
   materialId: Id.nullable(),
-  /** 这份 runbook 怎么来的：import=贴素材整理，copy=以底稿为基础，
-   * adapt=在底稿上应用过差异，draft=空白起草。 */
-  origin: z.enum(['import', 'copy', 'adapt', 'draft', 'human']).nullable(),
+  /** 这份 runbook 怎么来的：import=贴素材让 QB 整理，doc=导入 md/org 文件，
+   * copy=以底稿为基础，adapt=在底稿上应用过差异，draft=空白起草，human=自己写。 */
+  origin: z.enum(['import', 'doc', 'copy', 'adapt', 'draft', 'human']).nullable(),
+  /**
+   * 文档血缘：同一任务的各版本、从它复制出来的 runbook 共用。挂在整份
+   * 文档上的问答锚在它上面，跟着复制品走。
+   */
+  lineageKey: z.string().nullable().default(null),
   sourceSkillId: Id.nullable(),
   sourceSkillVersion: z.number().int().positive().nullable(),
 })
@@ -103,6 +148,10 @@ export type Runbook = z.infer<typeof Runbook>
 
 // ── 步骤 ───────────────────────────────────────────────────────────
 
+/**
+ * runbook 是一份可以执行的手册：前六种是要"做"的步骤（有完成/跳过/失败），
+ * 后四种是文档内容（章节、文字、代码、回显），只读、可复制，不算进度。
+ */
 export const StepKind = z.enum([
   /** 一条命令，可点运行也可复制手动跑。 */
   'command',
@@ -116,8 +165,14 @@ export const StepKind = z.enum([
   'delegate',
   /** 需要发起人或专家拍板，变成一条求助。 */
   'decision',
-  /** 说明、链接、图片。 */
+  /** 章节：任意层级，下面可以放任何块。 */
+  'section',
+  /** 文字：markdown（说明、链接、图片、表格）。 */
   'note',
+  /** 代码/配置片段（带语言）：复制用，不运行。 */
+  'code',
+  /** 回显/日志片段：参考用，不运行。 */
+  'output',
 ])
 export type StepKind = z.infer<typeof StepKind>
 
@@ -168,11 +223,23 @@ export const Step = z.object({
   orderKey: z.string().min(1),
   kind: StepKind,
   title: z.string().min(1),
+  /**
+   * 标题是按内容自动取的（导入/粘贴来的块没有标题）：界面不单独显示，
+   * 内容一改就跟着重算；人写了标题就不再自动。
+   */
+  titleAuto: z.boolean().default(false),
   /** 为什么要做这步，一句话。 */
   whyMd: z.string().nullable(),
   /** 出处，如 "skill:pd-deploy§3" 或 "lesson:xxx"。 */
   whySource: z.string().nullable(),
+  /** 命令/代码/回显的正文（command 与 code 按参数渲染，output 原样）。 */
   command: z.string().nullable(),
+  /** 文字块的 markdown。 */
+  bodyMd: z.string().nullable().default(null),
+  /** 命令/代码的语言（bash、python、json……），决定高亮。 */
+  lang: z.string().nullable().default(null),
+  /** 参考回显：跑完应该看到什么（文本围栏或截图的 markdown），随文档复制。 */
+  refMd: z.string().nullable().default(null),
   envId: Id.nullable(),
   expectation: Expectation.nullable(),
   probe: ReadinessProbe.nullable(),
@@ -207,8 +274,13 @@ export type Step = z.infer<typeof Step>
 export const StepPatch = z.object({
   kind: StepKind.optional(),
   title: z.string().min(1).optional(),
+  /** true = 标题改回按内容自动取。 */
+  titleAuto: z.boolean().optional(),
   whyMd: z.string().nullable().optional(),
   command: z.string().nullable().optional(),
+  bodyMd: z.string().nullable().optional(),
+  lang: z.string().max(40).nullable().optional(),
+  refMd: z.string().nullable().optional(),
   expectation: Expectation.nullable().optional(),
   probe: ReadinessProbe.nullable().optional(),
   timeoutMs: z.number().int().positive().nullable().optional(),
@@ -262,6 +334,8 @@ export const EventKind = z.enum([
   'base_proposal',
   'replanned',
   'task_created',
+  /** 改了任务信息（标题、说明、发起人、预期）。 */
+  'task_updated',
   'task_started',
   'task_done',
   /** 执行者点了"卡住了"；payload.note 是一句原因。 */
@@ -328,10 +402,10 @@ export type SkillVersion = z.infer<typeof SkillVersion>
 // ── 坑 ─────────────────────────────────────────────────────────────
 
 /**
- * 坑锚定在哪：优先锚到步骤血缘（M9 主路径——同血缘的所有复制品都看得见），
- * 其次 skill 步骤 / 环境，最后自由。
+ * 问答（原"坑"）锚定在哪：步骤或章节的血缘（同血缘的所有复制品都看得见）、
+ * 整份文档的血缘、环境，或者不挂靠（只进检索）。
  */
-export const LessonAnchor = z.enum(['skill_step', 'environment', 'free', 'step_lineage'])
+export const LessonAnchor = z.enum(['skill_step', 'environment', 'free', 'step_lineage', 'runbook_lineage'])
 export type LessonAnchor = z.infer<typeof LessonAnchor>
 
 /** personal = 作者自己立即生效；team = 负责人确认后全队可见。 */
@@ -341,11 +415,13 @@ export type LessonScope = z.infer<typeof LessonScope>
 export const Lesson = z.object({
   id: Id,
   anchorKind: LessonAnchor,
-  /** skill_step → "skillId:stepTitle"；step_lineage → lineageKey；environment → envId；free → null。 */
+  /** skill_step → "skillId:stepTitle"；step_lineage → lineageKey；runbook_lineage → 文档血缘；environment → envId；free → null。 */
   anchorRef: z.string().nullable(),
   condition: z.string().nullable(),
+  /** 问（原"症状"）。问和答至少有一个，另一个可以空着。 */
   symptom: z.string(),
   cause: z.string().nullable(),
+  /** 答（原"修法"）。空着的问可以拿去问发起人，回答回来就填上。 */
   fixMd: z.string(),
   /** 下次起草时该怎么改计划。 */
   nextTimeMd: z.string().nullable(),

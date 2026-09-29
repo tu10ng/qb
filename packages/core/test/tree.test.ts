@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import type { Step } from '../src/schema.ts'
 import {
+  ancestorsOf,
+  canContain,
+  depthOf,
   dropPosition,
   insertionAfter,
   insertionAtEnd,
+  isContent,
+  isDoable,
   isSection,
   movedPosition,
   positionOf,
+  sectionOf,
   topLevelOf,
-  type Position,
+  withSubtrees,
 } from '../src/tree.ts'
 
 /**
@@ -16,18 +22,20 @@ import {
  * 拖拽、插入、撤销都建立在这些函数上——位置算错，编辑全跟着错。
  */
 
-let n = 0
-function step(partial: Partial<Step> & { title: string }): Step {
+function step(partial: Partial<Step> & { id: string }): Step {
   return {
-    id: partial.id ?? `s${++n}`,
     runbookId: 'rbk',
-    parentId: partial.parentId ?? null,
-    orderKey: partial.orderKey ?? 'V',
-    kind: partial.kind ?? 'command',
-    title: partial.title,
+    parentId: null,
+    orderKey: 'V',
+    kind: 'command',
+    title: partial.id,
+    titleAuto: false,
     whyMd: null,
     whySource: null,
     command: null,
+    bodyMd: null,
+    lang: null,
+    refMd: null,
     envId: null,
     expectation: null,
     probe: null,
@@ -44,140 +52,184 @@ function step(partial: Partial<Step> & { title: string }): Step {
     editedBy: null,
     sourceRef: null,
     statusNote: null,
+    shareOutput: false,
+    ...partial,
   }
 }
 
-function section(title: string): Step {
-  return step({ title, kind: 'note', parentId: null })
-}
-
-/** 两章各两步：[sec1, a, b, sec2, c, d]。子步骤的 parentId 指向所属章节。 */
-function twoSections(): { steps: Step[]; by: (t: string) => Step } {
-  const sec1 = section('1 准备')
-  sec1.id = 'sec1'
-  const sec2 = section('2 启动')
-  sec2.id = 'sec2'
-  const flat = [sec1, ...flatChildren(sec1), sec2, ...flatChildren2(sec2)]
-  const by = (t: string): Step => flat.find((s) => s.title === t)!
-  return { steps: flat, by }
-}
-
-// 展平辅助：直接手写先序，避免工厂函数复杂化
-function flatChildren(sec1: Step): Step[] {
-  return [
-    step({ id: 'a', title: 'a', parentId: sec1.id, orderKey: 'k1' }),
-    step({ id: 'b', title: 'b', parentId: sec1.id, orderKey: 'k2' }),
+/**
+ * 文档（先序）：
+ *   sec1
+ *     a
+ *     b
+ *       b1
+ *   sec2
+ *     sub（章节）
+ *       c
+ *     d
+ *   loose
+ */
+function doc(): { steps: Step[]; by: (id: string) => Step } {
+  const steps = [
+    step({ id: 'sec1', kind: 'section' }),
+    step({ id: 'a', parentId: 'sec1', orderKey: 'k1' }),
+    step({ id: 'b', parentId: 'sec1', orderKey: 'k2' }),
+    step({ id: 'b1', parentId: 'b', kind: 'note', orderKey: 'k1' }),
+    step({ id: 'sec2', kind: 'section', orderKey: 'W' }),
+    step({ id: 'sub', parentId: 'sec2', kind: 'section', orderKey: 'k1' }),
+    step({ id: 'c', parentId: 'sub', orderKey: 'k1' }),
+    step({ id: 'd', parentId: 'sec2', orderKey: 'k2' }),
+    step({ id: 'loose', orderKey: 'X' }),
   ]
-}
-function flatChildren2(sec2: Step): Step[] {
-  return [
-    step({ id: 'c', title: 'c', parentId: sec2.id, orderKey: 'k1' }),
-    step({ id: 'd', title: 'd', parentId: sec2.id, orderKey: 'k2' }),
-  ]
+  return { steps, by: (id) => steps.find((s) => s.id === id)! }
 }
 
-describe('isSection / topLevelOf', () => {
-  it('顶层的 note 是章节；嵌套的 note 不是', () => {
-    const { by } = twoSections()
-    expect(isSection(by('1 准备'))).toBe(true)
-    expect(isSection(by('a'))).toBe(false)
+describe('块的种类', () => {
+  it('章节、文字、代码、回显是内容；其余是要做的步骤', () => {
+    expect(isSection({ kind: 'section' })).toBe(true)
+    expect(isSection({ kind: 'note' })).toBe(false)
+    for (const kind of ['section', 'note', 'code', 'output'] as const) {
+      expect(isContent({ kind })).toBe(true)
+      expect(isDoable({ kind })).toBe(false)
+    }
+    for (const kind of ['command', 'check', 'wait', 'manual', 'delegate', 'decision'] as const) expect(isDoable({ kind })).toBe(true)
   })
 
-  it('沿父链走到顶层', () => {
-    const { by, steps } = twoSections()
+  it('章节里放什么都行；步骤下面能挂子步骤和说明，不能挂章节；内容块是叶子', () => {
+    expect(canContain({ kind: 'section' }, { kind: 'section' })).toBe(true)
+    expect(canContain({ kind: 'command' }, { kind: 'command' })).toBe(true)
+    expect(canContain({ kind: 'command' }, { kind: 'note' })).toBe(true)
+    expect(canContain({ kind: 'command' }, { kind: 'section' })).toBe(false)
+    expect(canContain({ kind: 'note' }, { kind: 'command' })).toBe(false)
+    expect(canContain({ kind: 'delegate' }, { kind: 'command' })).toBe(false)
+    expect(canContain(null, { kind: 'section' })).toBe(true)
+  })
+})
+
+describe('祖先 / 深度 / 所属章节', () => {
+  it('沿父链走', () => {
+    const { steps, by } = doc()
+    expect(ancestorsOf(steps, by('c')).map((s) => s.id)).toEqual(['sub', 'sec2'])
+    expect(depthOf(steps, by('c'))).toBe(2)
+    expect(depthOf(steps, by('sec1'))).toBe(0)
     expect(topLevelOf(steps, by('c')).id).toBe('sec2')
-    expect(topLevelOf(steps, by('1 准备')).id).toBe('sec1')
+  })
+
+  it('所属章节是最近的那个；章节自己就是自己', () => {
+    const { steps, by } = doc()
+    expect(sectionOf(steps, by('c'))!.id).toBe('sub')
+    expect(sectionOf(steps, by('b1'))!.id).toBe('sec1')
+    expect(sectionOf(steps, by('sec2'))!.id).toBe('sec2')
+    expect(sectionOf(steps, by('loose'))).toBeNull()
   })
 })
 
-describe('insertionAfter', () => {
-  it('章节标题下面 = 这一章的第一步', () => {
-    const { by } = twoSections()
-    expect(insertionAfter(by('1 准备'))).toEqual({ parentId: 'sec1', afterId: null })
+describe('insertionAfter：插在界面上那条插入线的位置', () => {
+  it('章节下面 = 这一章的第一项；折叠着的章节插在它后面', () => {
+    const { steps, by } = doc()
+    expect(insertionAfter(by('sec1'), steps)).toEqual({ parentId: 'sec1', afterId: null })
+    expect(insertionAfter(by('sec1'), steps, true)).toEqual({ parentId: null, afterId: 'sec1' })
   })
 
-  it('普通步骤下面 = 同层紧随其后', () => {
-    const { by } = twoSections()
-    expect(insertionAfter(by('a'))).toEqual({ parentId: 'sec1', afterId: 'a' })
-    expect(insertionAfter(by('b'))).toEqual({ parentId: 'sec1', afterId: 'b' })
+  it('挂着子步骤的步骤下面 = 它的第一个子节点；叶子步骤下面 = 同层紧随其后', () => {
+    const { steps, by } = doc()
+    expect(insertionAfter(by('b'), steps)).toEqual({ parentId: 'b', afterId: null })
+    expect(insertionAfter(by('a'), steps)).toEqual({ parentId: 'sec1', afterId: 'a' })
   })
 })
 
-describe('insertionAtEnd', () => {
+describe('insertionAtEnd：落在最后一个最深的章节末尾', () => {
   it('空文档放最前', () => {
     expect(insertionAtEnd([])).toEqual({ parentId: null, afterId: null })
   })
 
-  it('最后一章有步骤时追加到章内末尾', () => {
-    const { steps } = twoSections()
-    expect(insertionAtEnd(steps)).toEqual({ parentId: 'sec2', afterId: 'd' })
+  it('最后是散着的步骤时排在它后面', () => {
+    const { steps } = doc()
+    expect(insertionAtEnd(steps)).toEqual({ parentId: null, afterId: 'loose' })
   })
 
-  it('最后一章没有步骤时成为第一步', () => {
-    const sec = section('1 准备')
-    sec.id = 'sec1'
-    expect(insertionAtEnd([sec])).toEqual({ parentId: 'sec1', afterId: null })
+  it('最后一章的最后一项又是章节：钻进去', () => {
+    const steps = [step({ id: 's', kind: 'section' }), step({ id: 'x', parentId: 's' }), step({ id: 'inner', parentId: 's', kind: 'section', orderKey: 'W' }), step({ id: 'y', parentId: 'inner' })]
+    expect(insertionAtEnd(steps)).toEqual({ parentId: 'inner', afterId: 'y' })
+    expect(insertionAtEnd([step({ id: 'only', kind: 'section' })])).toEqual({ parentId: 'only', afterId: null })
   })
 })
 
 describe('movedPosition', () => {
-  it('上移越过前一个；已在最前时不可移', () => {
-    const { by } = twoSections()
-    expect(movedPosition(twoSections().steps, by('b'), 'up')).toEqual({ parentId: 'sec1', afterId: null })
-    expect(movedPosition(twoSections().steps, by('a'), 'up')).toBeNull()
+  it('上下移只在同层；到头了不能移', () => {
+    const { steps, by } = doc()
+    expect(movedPosition(steps, by('b'), 'up')).toEqual({ parentId: 'sec1', afterId: null })
+    expect(movedPosition(steps, by('a'), 'up')).toBeNull()
+    expect(movedPosition(steps, by('a'), 'down')).toEqual({ parentId: 'sec1', afterId: 'b' })
+    expect(movedPosition(steps, by('b'), 'down')).toBeNull()
   })
 
-  it('下移到下一个后面；已在最后时不可移', () => {
-    const { by } = twoSections()
-    expect(movedPosition(twoSections().steps, by('c'), 'down')).toEqual({ parentId: 'sec2', afterId: 'd' })
-    expect(movedPosition(twoSections().steps, by('d'), 'down')).toBeNull()
+  it('Tab 挂到上一个兄弟下面：兄弟是章节就放进章末，是步骤就成为它的子步骤', () => {
+    const { steps, by } = doc()
+    expect(movedPosition(steps, by('b'), 'indent')).toEqual({ parentId: 'a', afterId: null })
+    expect(movedPosition(steps, by('d'), 'indent')).toEqual({ parentId: 'sub', afterId: 'c' })
+    expect(movedPosition(steps, by('loose'), 'indent')).toEqual({ parentId: 'sec2', afterId: 'd' })
   })
 
-  it('Tab 移进紧邻上面的章节末尾；上面不是章节或自己是章节时不可移', () => {
-    const { by, steps } = twoSections()
-    expect(movedPosition(steps, by('c'), 'indent')).toBeNull() // c 在章首，上面是章节标题（不同层）
-    expect(movedPosition(steps, by('1 准备'), 'indent')).toBeNull()
+  it('Tab：上面没有兄弟、上一个是内容块、或要把章节挂到步骤下，都不行', () => {
+    const { steps, by } = doc()
+    expect(movedPosition(steps, by('a'), 'indent')).toBeNull()
+    const s = [step({ id: 'n', kind: 'note' }), step({ id: 'x', orderKey: 'W' })]
+    expect(movedPosition(s, s[1]!, 'indent')).toBeNull()
+    const t = [step({ id: 'cmd' }), step({ id: 'sec', kind: 'section', orderKey: 'W' })]
+    expect(movedPosition(t, t[1]!, 'indent')).toBeNull()
+    // 章节可以挂进章节
+    expect(movedPosition(steps, by('sec2'), 'indent')).toEqual({ parentId: 'sec1', afterId: 'b' })
   })
 
-  it('Shift+Tab 移出章节、排在自己章节的后面', () => {
-    const { by, steps } = twoSections()
-    expect(movedPosition(steps, by('c'), 'outdent')).toEqual({ parentId: null, afterId: 'sec2' })
-    expect(movedPosition(steps, by('1 准备'), 'outdent')).toBeNull()
+  it('Shift+Tab 移出一层，排在原来的父节点后面', () => {
+    const { steps, by } = doc()
+    expect(movedPosition(steps, by('c'), 'outdent')).toEqual({ parentId: 'sec2', afterId: 'sub' })
+    expect(movedPosition(steps, by('a'), 'outdent')).toEqual({ parentId: null, afterId: 'sec1' })
+    expect(movedPosition(steps, by('sec1'), 'outdent')).toBeNull()
   })
 })
 
 describe('positionOf', () => {
-  it('排在它前面的兄弟就是 afterId；章首是 null', () => {
-    const { by, steps } = twoSections()
+  it('排在它前面的兄弟就是 afterId；第一个是 null', () => {
+    const { steps, by } = doc()
     expect(positionOf(steps, by('b'))).toEqual({ parentId: 'sec1', afterId: 'a' })
     expect(positionOf(steps, by('a'))).toEqual({ parentId: 'sec1', afterId: null })
   })
 })
 
 describe('dropPosition', () => {
-  it('普通步骤拖到章节标题上：放进这一章最前面', () => {
-    const { by, steps } = twoSections()
-    expect(dropPosition(steps, by('1 准备'), by('c'))).toEqual({ parentId: 'sec1', afterId: null })
+  it('拖到章节标题上：放进这一章最前面', () => {
+    const { steps, by } = doc()
+    expect(dropPosition(steps, by('sec1'), by('c'))).toEqual({ parentId: 'sec1', afterId: null })
   })
 
-  it('普通步骤拖到普通步骤上：放在它后面', () => {
-    const { by, steps } = twoSections()
+  it('拖到别的块上：排在它后面（同层）', () => {
+    const { steps, by } = doc()
     expect(dropPosition(steps, by('a'), by('c'))).toEqual({ parentId: 'sec1', afterId: 'a' })
+    expect(dropPosition(steps, by('b1'), by('d'))).toEqual({ parentId: 'b', afterId: 'b1' })
   })
 
-  it('章节拖到章节上：排在目标章节后面，仍是顶层', () => {
-    const { by, steps } = twoSections()
-    expect(dropPosition(steps, by('1 准备'), by('2 启动'))).toEqual({ parentId: null, afterId: 'sec1' })
+  it('章节拖到章节上：排在它后面（同层）', () => {
+    const { steps, by } = doc()
+    expect(dropPosition(steps, by('sec1'), by('sec2'))).toEqual({ parentId: null, afterId: 'sec1' })
   })
 
-  it('章节拖到章内步骤上：排在那个步骤所属章节的后面，不降级成子节点', () => {
-    const { by, steps } = twoSections()
-    expect(dropPosition(steps, by('c'), by('2 启动'))).toEqual({ parentId: null, afterId: 'sec2' })
+  it('章节拖到步骤的子节点上：那一层放不下章节，往外找到放得下的一层', () => {
+    const { steps, by } = doc()
+    expect(dropPosition(steps, by('b1'), by('sub'))).toEqual({ parentId: 'sec1', afterId: 'b' })
   })
 
-  it('章节拖到顶层普通步骤上：排在它后面', () => {
-    const loose = step({ id: 'loose', title: '散步骤', parentId: null })
-    const { by } = twoSections()
-    expect(dropPosition([loose], loose, by('1 准备'))).toEqual({ parentId: null, afterId: 'loose' })
+  it('拖进自己的子树里：不动', () => {
+    const { steps, by } = doc()
+    expect(dropPosition(steps, by('c'), by('sec2'))).toBeNull()
+    expect(dropPosition(steps, by('sec2'), by('sec2'))).toBeNull()
+  })
+})
+
+describe('withSubtrees', () => {
+  it('选中的块连同子树，先序、不重复', () => {
+    const { steps } = doc()
+    expect(withSubtrees(steps, ['sec2', 'c', 'a']).map((s) => s.id)).toEqual(['a', 'sec2', 'sub', 'c', 'd'])
   })
 })

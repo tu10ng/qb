@@ -41,7 +41,7 @@ describe('draftRunbook', () => {
     expect(result.assumptions).toEqual([{ key: '集群', value: 'X', editedByUser: false }])
     // section 还原成章节节点
     expect(result.steps).toHaveLength(1)
-    expect(result.steps[0]!.kind).toBe('note')
+    expect(result.steps[0]!.kind).toBe('section')
     expect(result.steps[0]!.title).toBe('1 准备')
     expect(result.steps[0]!.children).toHaveLength(1)
 

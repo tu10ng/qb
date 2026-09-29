@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { App } from './App.tsx'
 import { RemoteApp } from './remote/RemoteApp.tsx'
 import './styles.css'
+import './manual.css'
 
 const root = document.getElementById('root')
 if (root === null) throw new Error('#root 不存在')

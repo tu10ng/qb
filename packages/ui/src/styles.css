@@ -860,29 +860,6 @@ kbd {
   flex: 1;
 }
 
-/* 单元之间的插入条：平时看不见，悬停时出现 */
-.insert-bar {
-  height: 10px;
-  margin: -3px 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.12s;
-}
-.insert-bar span {
-  font-size: 11px;
-  line-height: 1;
-  color: var(--accent);
-  padding: 0 6px;
-  background: var(--bg);
-}
-.insert-bar:hover {
-  opacity: 1;
-  background: linear-gradient(var(--accent), var(--accent)) center / 100% 1px no-repeat;
-}
-
 .add-step {
   margin-top: 10px;
 }

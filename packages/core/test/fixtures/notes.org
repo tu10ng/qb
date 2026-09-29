@@ -1,0 +1,36 @@
+* TODO vllm
+https://github.com/vllm-project/vllm
+** timeline
+220302 safetensors
+230620 vllm
+** (vllm ref)
+*** (blog) torch_npu的前世今生
+https://example.com/community/postsDetails?postId=abc
+*** HALT https://github.com/bojieli/ai-infra-book -- 别看
+*** huggingface transformers
+https://github.com/huggingface/transformers
+主流模型的最简单实现
+** step
+*** how gpu computing works
+**** compute intensity
+|                   |  a100 | intel xeon 8280 |
+|-------------------+-------+-----------------|
+| fp64 gflops       | 19500 |            2190 |
+| compute intensity |   100 |             134 |
+**** 所以cpu靠减少延迟, gpu靠增加threads
+*** (vllm code) 打断
+#+begin_src flowgraph
+FINISHED_ABORTED
+
+with_cancellation
+#+end_src
+*** 查看显卡
+#+begin_src sh
+npu-smi info
+#+end_src
+#+begin_example
++------------------------------------------------------------------+
+| npu-smi 24.1.rc2                 Version: 24.1.rc2               |
+#+end_example
+*** 要点
+用 =vllm serve= 启动，参数见 [[https://docs.vllm.ai][vllm 文档]]。

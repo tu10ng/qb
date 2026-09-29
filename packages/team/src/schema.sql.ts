@@ -282,4 +282,19 @@ ALTER TABLE task_progress ADD COLUMN worst_alert TEXT;
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 `,
   },
+  {
+    version: 6,
+    name: 'manual-mirror-and-doc-qa',
+    sql: `
+-- 手册：发起人远程也要能读文字、代码语言、参考回显
+ALTER TABLE steps ADD COLUMN body_md TEXT;
+ALTER TABLE steps ADD COLUMN lang TEXT;
+ALTER TABLE steps ADD COLUMN ref_md TEXT;
+-- 文档血缘：挂在整份文档上的问答按它路由
+ALTER TABLE tasks ADD COLUMN doc_lineage TEXT;
+CREATE INDEX idx_tasks_doc_lineage ON tasks(doc_lineage);
+-- 问答挂在哪：step_lineage（某一步/某一章）或 runbook_lineage（整份文档）
+ALTER TABLE lessons ADD COLUMN anchor_kind TEXT NOT NULL DEFAULT 'step_lineage';
+`,
+  },
 ]

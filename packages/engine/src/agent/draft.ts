@@ -7,7 +7,7 @@
  */
 
 import { z } from 'zod'
-import { PARAM_RE, type Environment, type Lesson, type Skill, type Task } from '@qb/core'
+import { normalizeParamName, PARAM_RE, type Environment, type Lesson, type Skill, type Task } from '@qb/core'
 import type { Llm } from '../llm/port.ts'
 import { fillTemplate } from './prompt.ts'
 
@@ -72,7 +72,7 @@ export const DraftSchema = z.object({
 type Flat = z.infer<typeof FlatStep>
 
 export interface StepOut {
-  kind: 'command' | 'check' | 'wait' | 'manual' | 'decision' | 'note'
+  kind: 'command' | 'check' | 'wait' | 'manual' | 'decision' | 'section'
   title: string
   whyMd?: string
   whySource?: string
@@ -106,7 +106,7 @@ export function toTree(flat: Flat[]): StepOut[] {
 
     if (section !== currentSection) {
       currentSection = section
-      currentNode = { kind: 'note', title: section, children: [] }
+      currentNode = { kind: 'section', title: section, children: [] }
       out.push(currentNode)
     }
 
@@ -263,8 +263,8 @@ export function draftParams(
   const seen = new Set<string>()
   for (const p of declared) {
     if (p === null) continue
-    const name = p.name.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_').replace(/^[^A-Z]+/, '')
-    if (name === '' || seen.has(name)) continue
+    const name = normalizeParamName(p.name)
+    if (name === null || seen.has(name)) continue
     seen.add(name)
     out.push({ name, value: p.value, ...(p.description !== undefined && p.description.trim() !== '' ? { description: p.description.trim() } : {}) })
   }

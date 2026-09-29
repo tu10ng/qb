@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { repoRoot } from './lib.mjs'
 
-const ALL = ['phase0', 'm8', 'm9', 'ui-check']
+const ALL = ['phase0', 'm8', 'm9', 'ui-check', 'manual']
 const pick = process.argv.slice(2)
 const scenarios = pick.length > 0 ? ALL.filter((s) => pick.includes(s)) : ALL
 

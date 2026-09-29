@@ -286,6 +286,48 @@ describe('数据库 schema', () => {
     }
   })
 
+  it('v10 的库升级到 v11：顶层 note 变章节，嵌套 note 的标题变正文，runbook 补上文档血缘', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qb-migrate11-'))
+    const path = join(dir, 'old.db')
+    try {
+      const old = new Database(path)
+      old.exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+      for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version).filter((m) => m.version <= 10)) {
+        old.exec(m.sql)
+        m.apply?.(old)
+        old.prepare('INSERT INTO schema_migrations VALUES (?, ?, 1)').run(m.version, m.name)
+      }
+      old.exec(`
+        INSERT INTO users (id, name, display_name, created_at) VALUES ('u1','a','A',1);
+        INSERT INTO tasks (id, title, brief_md, initiator_id, assignee_id, status, created_at)
+          VALUES ('t1','部署','','u1','u1','active',1), ('t2','另一个','','u1','u1','active',1);
+        INSERT INTO runbooks (id, task_id, version, created_by, created_at) VALUES ('r1','t1',1,'u1',1), ('r2','t1',2,'u1',2), ('r3','t2',1,'u1',3);
+        INSERT INTO steps (id, runbook_id, parent_id, order_key, kind, title, why_md)
+          VALUES ('s1','r2',NULL,'V','note','1 启动',NULL),
+                 ('s2','r2','s1','V','command','起 decode',NULL),
+                 ('s3','r2','s1','W','note','注意：先起 decode',NULL);
+      `)
+      old.close()
+
+      const db = openDb({ path })
+      const steps = db.prepare('SELECT id, kind, title, body_md, title_auto FROM steps ORDER BY id').all() as Array<{ id: string; kind: string; title: string; body_md: string | null; title_auto: number }>
+      expect(steps.map((s) => [s.id, s.kind])).toEqual([['s1', 'section'], ['s2', 'command'], ['s3', 'note']])
+      expect(steps[2]).toMatchObject({ body_md: '注意：先起 decode', title_auto: 1 })
+      const rbs = db.prepare('SELECT id, lineage_key FROM runbooks ORDER BY id').all() as Array<{ id: string; lineage_key: string }>
+      // 同一任务的各版本共用一个文档血缘，不同任务各不相同
+      expect(rbs[0]!.lineage_key).toMatch(/^doc_[0-9a-f]{16}$/)
+      expect(rbs[1]!.lineage_key).toBe(rbs[0]!.lineage_key)
+      expect(rbs[2]!.lineage_key).not.toBe(rbs[0]!.lineage_key)
+      db.close()
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      } catch {
+        /* 留给系统清理 */
+      }
+    }
+  })
+
   it('任务可以指向父步骤（递归委派）', () => {
     const db = openDb({ path: ':memory:' })
     db.exec(`

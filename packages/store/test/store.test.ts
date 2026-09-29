@@ -222,7 +222,7 @@ describe('Runbook', () => {
       createdBy: me,
       steps: [
         {
-          kind: 'note',
+          kind: 'section',
           title: '1 准备',
           children: [
             { kind: 'command', title: '1.1' },
@@ -230,7 +230,7 @@ describe('Runbook', () => {
           ],
         },
         {
-          kind: 'note',
+          kind: 'section',
           title: '2 启动',
           children: [
             { kind: 'command', title: '2.1' },
@@ -239,7 +239,7 @@ describe('Runbook', () => {
           ],
         },
         {
-          kind: 'note',
+          kind: 'section',
           title: '3 验证',
           children: [{ kind: 'command', title: '3.1' }],
         },
@@ -270,7 +270,7 @@ describe('Runbook', () => {
       createdBy: me,
       steps: [
         {
-          kind: 'note',
+          kind: 'section',
           title: '2 启动',
           children: [
             { kind: 'command', title: '2.1 decode', command: 'vllm serve' },
@@ -401,7 +401,7 @@ describe('编辑：原地修改', () => {
       origin: 'draft',
       steps: [
         {
-          kind: 'note',
+          kind: 'section',
           title: '1 准备',
           children: [
             { kind: 'command', title: 'a', command: 'echo a' },
@@ -409,7 +409,7 @@ describe('编辑：原地修改', () => {
           ],
         },
         {
-          kind: 'note',
+          kind: 'section',
           title: '2 启动',
           children: [
             { kind: 'command', title: 'c', command: 'echo c' },
@@ -484,7 +484,7 @@ describe('编辑：原地修改', () => {
     })
     expect(x.origin).toBe('human')
     store.insertStep({ runbookId: runbook.id, parentId: section2.id, afterId: null, step: { kind: 'check', title: 'first' } })
-    store.insertStep({ runbookId: runbook.id, parentId: null, afterId: section2.id, step: { kind: 'note', title: '3 验证' } })
+    store.insertStep({ runbookId: runbook.id, parentId: null, afterId: section2.id, step: { kind: 'section', title: '3 验证' } })
 
     expect(titles()).toEqual(['1 准备', 'a', 'x', 'b', '2 启动', 'first', 'c', 'd', '3 验证'])
   })
@@ -621,7 +621,7 @@ describe('M7：参数 / 底稿 / 素材', () => {
       ],
       steps: [
         {
-          kind: 'note',
+          kind: 'section',
           title: '1 启动',
           children: [
             { kind: 'command', title: '起 decode', command: 'ssh {{DECODE_HOST}} vllm serve {{MODEL_PATH}}', sourceRef: 'mat_x#L12' },
@@ -917,5 +917,138 @@ describe('share_output 落库（审查修复回归）', () => {
     // 关掉也生效
     const again = store.updateStep(updated.step.id, { shareOutput: false }, { expectedRev: updated.step.rev, actorId: me })
     expect(store.getStep(step.id)!.shareOutput).toBe(false)
+  })
+})
+
+describe('手册：任务信息、块、文档血缘、挑步骤拼接、问答', () => {
+  it('建完任务再改说明、发起人、预期；没变化不算改动；改了标题能被检索', () => {
+    const t = store.createTask({ title: '部署 qwen', initiatorId: me })
+    const pl = store.ensureUser('laowang')
+    const changes = store.updateTask(t.id, { briefMd: '用 2、3 号卡', initiatorId: pl.id, expectedMinutes: 60 })
+    expect(changes.map((c) => c.field)).toEqual(['briefMd', 'initiatorId', 'expectedMinutes'])
+    expect(store.getTask(t.id)).toMatchObject({ briefMd: '用 2、3 号卡', initiatorId: pl.id, expectedMinutes: 60 })
+    expect(store.updateTask(t.id, { briefMd: '用 2、3 号卡' })).toEqual([])
+    store.updateTask(t.id, { title: '在昇腾上部署千问' })
+    expect(store.searchTasks('千问').map((x) => x.id)).toContain(t.id)
+  })
+
+  it('文字、代码、回显块存取；章节可以任意嵌套', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({
+      taskId: t.id,
+      createdBy: me,
+      steps: [
+        {
+          kind: 'section',
+          title: '参考',
+          children: [
+            { kind: 'note', title: '链接', titleAuto: true, bodyMd: '[文档](https://example.com)' },
+            { kind: 'section', title: '子章节', children: [{ kind: 'code', title: 'cfg', command: '{"a": 1}', lang: 'json' }] },
+          ],
+        },
+        { kind: 'command', title: '看卡', command: 'npu-smi info', lang: 'bash', refMd: '```text\nNPU OK\n```' },
+      ],
+    })
+    const code = steps.find((s) => s.kind === 'code')!
+    expect(store.getStep(code.id)).toMatchObject({ lang: 'json', command: '{"a": 1}' })
+    const note = steps.find((s) => s.kind === 'note')!
+    expect(store.getStep(note.id)).toMatchObject({ bodyMd: '[文档](https://example.com)', titleAuto: true })
+    expect(store.getStep(steps.find((s) => s.title === '看卡')!.id)!.refMd).toBe('```text\nNPU OK\n```')
+    // 三层：参考 → 子章节 → cfg
+    expect(store.listSteps(steps[0]!.runbookId).map((s) => s.title)).toEqual(['参考', '链接', '子章节', 'cfg', '看卡'])
+  })
+
+  it('自动标题：改内容跟着变；人改了标题就不再自动；改回自动时重算', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'note', title: '文字', titleAuto: true, bodyMd: '旧的第一行' }] })
+    const n = steps[0]!
+    const a = store.updateStep(n.id, { bodyMd: '## 新的第一行\n正文' }, { expectedRev: 0, actorId: me })
+    expect(a.step.title).toBe('新的第一行')
+    const b = store.updateStep(n.id, { title: '我起的名字' }, { expectedRev: a.step.rev, actorId: me })
+    expect(b.step.titleAuto).toBe(false)
+    const c = store.updateStep(n.id, { bodyMd: '再改正文' }, { expectedRev: b.step.rev, actorId: me })
+    expect(c.step.title).toBe('我起的名字')
+    const d = store.updateStep(n.id, { titleAuto: true }, { expectedRev: c.step.rev, actorId: me })
+    expect(d.step.title).toBe('再改正文')
+  })
+
+  it('文档血缘：同一任务的各版本共用；复制底稿时沿用底稿的', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const v1 = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: 'a' }] })
+    const v2 = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: 'b' }] })
+    expect(v1.runbook.lineageKey).toMatch(/^doc_/)
+    expect(v2.runbook.lineageKey).toBe(v1.runbook.lineageKey)
+    const t2 = store.createTask({ title: 'y', initiatorId: me })
+    const copy = store.copyRunbook(v2.runbook.id, t2.id, me)
+    expect(copy.runbook.lineageKey).toBe(v1.runbook.lineageKey)
+  })
+
+  it('从别的任务挑几块接过来：连同子树、血缘保留、状态不带、用到的参数一并带上', () => {
+    const src = store.createTask({ title: '源', initiatorId: me })
+    const s = store.createRunbook({
+      taskId: src.id,
+      createdBy: me,
+      params: [
+        { name: '容器名', value: 'vllm_test', source: 'mine', secret: false },
+        { name: 'UNUSED', value: 'x', source: 'mine', secret: false },
+      ],
+      steps: [
+        { kind: 'section', title: '建容器', children: [{ kind: 'command', title: '起', command: 'docker run --name={{容器名}} img' }, { kind: 'note', title: '说明', bodyMd: '一般有人下载过' }] },
+        { kind: 'command', title: '无关', command: 'ls' },
+      ],
+    })
+    const sec = s.steps.find((x) => x.title === '建容器')!
+    const run = s.steps.find((x) => x.title === '起')!
+    store.updateStepStatus(run.id, 'ok')
+
+    const dst = store.createTask({ title: '目标', initiatorId: me })
+    const d = store.createRunbook({ taskId: dst.id, createdBy: me, params: [{ name: '容器名', value: '我的容器', source: 'mine', secret: false }], steps: [{ kind: 'command', title: '已有', command: 'pwd' }] })
+    const r = store.graftSteps({
+      targetRunbookId: d.runbook.id,
+      parentId: null,
+      afterId: d.steps[0]!.id,
+      sourceRunbookId: s.runbook.id,
+      stepIds: [sec.id, run.id],
+      actorId: me,
+    })
+    expect(r.inserted.map((x) => x.title)).toEqual(['建容器'])
+    const after = store.listSteps(d.runbook.id)
+    expect(after.map((x) => x.title)).toEqual(['已有', '建容器', '起', '说明'])
+    const copied = after.find((x) => x.title === '起')!
+    expect(copied.lineageKey).toBe(run.lineageKey)
+    expect(copied.status).toBe('pending')
+    expect(copied.origin).toBe('base')
+    // 同名参数不覆盖这边的值；没用到的不带
+    expect(store.getRunbook(d.runbook.id)!.params.map((p) => [p.name, p.value])).toEqual([['容器名', '我的容器']])
+    expect(r.addedParams).toEqual([])
+  })
+
+  it('问答：挂在整份文档上；问和答可以只填一个；改了已共享的重新排队上传；共享过的删不掉', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { runbook } = store.createRunbook({ taskId: t.id, createdBy: me, steps: [{ kind: 'command', title: 'a' }] })
+    const q = store.createLesson({ anchorKind: 'runbook_lineage', anchorRef: runbook.lineageKey, symptom: '权重放哪？', fixMd: '', authorId: me, sourceTaskId: t.id, scope: 'team' })
+    expect(store.lessonsForDoc(runbook.lineageKey!).map((l) => l.symptom)).toEqual(['权重放哪？'])
+    store.markLessonsUploaded([q.id])
+    const answered = store.updateLesson(q.id, { fixMd: '/home/weight 下面' })
+    expect(answered.fixMd).toBe('/home/weight 下面')
+    expect(store.listLessonsToUpload().map((l) => l.id)).toContain(q.id)
+    expect(() => store.updateLesson(q.id, { symptom: '', fixMd: '' })).toThrow(/至少/)
+    store.markLessonsUploaded([q.id])
+    expect(store.deleteLesson(q.id)).toBe(false)
+    const mine = store.createLesson({ anchorKind: 'free', symptom: '', fixMd: '只记个答案', authorId: me, scope: 'personal' })
+    expect(store.deleteLesson(mine.id)).toBe(true)
+  })
+})
+
+describe('老写法兼容（v11 之前的调用）', () => {
+  it('带子节点的 note 当章节；只有标题的 note 当说明（标题就是正文）', () => {
+    const t = store.createTask({ title: 'x', initiatorId: me })
+    const { steps } = store.createRunbook({
+      taskId: t.id,
+      createdBy: me,
+      steps: [{ kind: 'note', title: '1 准备', children: [{ kind: 'note', title: '注意：先起 decode' }, { kind: 'command', title: 'a', command: 'ls' }] }],
+    })
+    expect(steps.map((s) => s.kind)).toEqual(['section', 'note', 'command'])
+    expect(steps[1]).toMatchObject({ bodyMd: '注意：先起 decode', titleAuto: true })
   })
 })
